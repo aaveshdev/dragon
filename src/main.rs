@@ -1,0 +1,307 @@
+mod engine;
+use engine::*;
+
+use std::sync::{Arc, Mutex};
+use std::collections::{HashMap};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::io::{Write, Read};
+use std::env;
+
+
+const DGN_VERSION: &str = "Dragon Programming Language v1.0.0";
+const DGN_BUILD: &str = "Build 2026-01-26"; 
+const DGN_AUTHOR: &str = "Aavesh Jilani";
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("dragon"));
+    if let Some(payload) = check_for_bundle(&exe_path) {
+        let env = Arc::new(Mutex::new(Env::new(None, Some(exe_path.clone()))));
+        env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
+        populate_builtins(env.clone());
+        
+        let sources: HashMap<String, String> = serde_json::from_str(&payload).unwrap_or_else(|_| {
+            let mut m = HashMap::new(); m.insert("__entry__".to_string(), payload); m
+        });
+        
+        let mut bundle_map = HashMap::new();
+        for (k, v) in &sources { if k != "__entry__" { bundle_map.insert(k.clone(), DgnValue::String(v.clone())); } }
+        env.lock().unwrap().store.insert("__bundled_sources__".to_string(), DgnValue::Map(Arc::new(Mutex::new(bundle_map))));
+        let mut argv_list = Vec::new();
+        for a in args.iter().skip(1) { argv_list.push(DgnValue::String(a.clone())); }
+        let _ = env.lock().unwrap().set("argv", DgnValue::List(Arc::new(Mutex::new(argv_list))));
+
+        let entry = sources.get("__entry__").unwrap();
+        let tokens = lex(entry);
+        let mut parser = Parser::new(tokens);
+        match parser.parse() {
+            Ok(ast) => { if let Err(e) = eval_stmt(&ast, env) { eprintln!("Runtime Error: {} at line {}", e.msg, e.line); std::process::exit(1); } },
+            Err(e) => { eprintln!("Bundle Parse Error: {}", e); std::process::exit(1); }
+        }
+        return;
+    }
+
+    if args.len() < 2 {
+        println!("\n==============================================");
+        println!("          Dragon Programming Language");
+        println!("==============================================");
+        println!("Version:   {}", DGN_VERSION);
+        println!("Build:     {}", DGN_BUILD);
+        println!("Author:    {}", DGN_AUTHOR);
+        println!("----------------------------------------------");
+        println!("Platform:  {}", std::env::consts::OS);
+        println!("Arch:      {}", std::env::consts::ARCH);
+        println!("==============================================");
+        println!("USAGE:");
+        println!("  dragon <file.dgn> [args...]       Run a script file");
+        println!("  dragon --repl                     Start the interactive shell");
+        println!("  dragon -c <in> -o <out>           Compile script to Executable");
+        println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
+        println!("");
+        return;
+    }
+
+    let command = &args[1];
+
+    if command == "-c" {
+        if args.len() < 5 || args[3] != "-o" {
+            println!("Error: Invalid compilation arguments.");
+            println!("Usage: dragon -c <input.dgn> -o <output.exe> [--lib]");
+            return;
+        }
+
+        let input_path = Path::new(&args[2]);
+        let output_path = Path::new(&args[4]);
+        let is_lib_mode = args.contains(&"--lib".to_string());
+        let is_web_mode = args.contains(&"--web".to_string());
+        println!("Compiling {}...", input_path.display());
+
+
+       let mut sources = HashMap::new();
+        
+        if let Err(e) = gather_sources(input_path, &mut sources, true) {
+            eprintln!("Compilation Error: {}", e);
+            std::process::exit(1);
+        }
+        
+       let payload = serde_json::to_string(&sources).expect("Failed to serialize bundle");
+        
+        let mut payload_bytes = payload.into_bytes();
+        let payload_len = payload_bytes.len() as u64;
+
+        let key = get_key();
+        println!("Encrypting {} bytes...", payload_len);
+        for (i, b) in payload_bytes.iter_mut().enumerate() {
+            *b ^= key[i % key.len()];
+        }
+
+        if is_lib_mode {
+            let mut template_dir = exe_path.parent().unwrap().to_path_buf();
+
+            let out_name = output_path.file_name().unwrap().to_string_lossy();
+            
+            let template_name = if out_name.ends_with(".so") {
+                "libdragon_lib.so"
+            } else if out_name.ends_with(".dylib") {
+                "libdragon_lib.dylib"
+            } else {
+                "dragon_lib.dll" 
+            };
+
+            let template = template_dir.join(template_name);
+
+            if !template.exists() {
+                println!("Error: Library template '{}' not found.", template_name);
+                println!("Copy the platform-specific template to: {:?}", template_dir);
+                return;
+            }
+            fs::copy(&template, output_path).expect("Copy failed");
+            println!("Created Shared Library: {:?}", output_path);
+        } 
+       else if is_web_mode {
+        println!("Compiling for Web Assembly...");
+
+
+        let template_dir = exe_path.parent().unwrap();
+        let wasm_file = template_dir.join("dragon_lib_bg.wasm");
+        let js_file = template_dir.join("dragon_lib.js");
+
+        if !wasm_file.exists() || !js_file.exists() {
+             println!("Error: WASM templates not found.");
+             println!("Please build 'dragon_template' target wasm32-unknown-unknown and place .wasm and .js here.");
+             return;
+        }
+
+        let out_dir = output_path.with_extension(""); 
+        fs::create_dir_all(&out_dir).expect("Failed to create output dir");
+
+        fs::copy(&wasm_file, out_dir.join("dragon_lib_bg.wasm")).unwrap();
+        fs::copy(&js_file, out_dir.join("dragon.js")).unwrap();
+
+        let mut sources = HashMap::new();
+        gather_sources(input_path, &mut sources, true).unwrap();
+        let full_source = sources.get("__entry__").unwrap(); 
+
+        let html_content = format!(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Dragon App</title>
+    <style>
+        body {{ font-family: monospace; background: #222; color: #eee; padding: 20px; }}
+        #console {{ white-space: pre-wrap; }}
+    </style>
+</head>
+<body>
+    <h1>Dragon Output</h1>
+    <div id="console">Initializing...</div>
+    <script type="module">
+        import init, {{ dragon_run_wasm }} from './dragon.js';
+
+        async function run() {{
+            await init();
+            const outputDiv = document.getElementById("console");
+            
+            // Override console.log to print to div
+            const oldLog = console.log;
+            console.log = (msg) => {{
+                outputDiv.innerText += msg + "\n";
+                oldLog(msg);
+            }};
+
+            // The Dragon Source Code
+            const code = `{}`;
+
+            outputDiv.innerText = "> Running...\n";
+            try {{
+                const result = dragon_run_wasm(code);
+                outputDiv.innerText += "\n[Program Finished: " + result + "]";
+            }} catch(e) {{
+                outputDiv.innerText += "\n[WASM Error: " + e + "]";
+            }}
+        }}
+        run();
+    </script>
+</body>
+</html>
+"#, full_source.replace("`", "\\`").replace("${", "\\${")); // Escape JS template literals
+
+        fs::write(out_dir.join("index.html"), html_content).unwrap();
+        println!("Success! Web bundle created at: {:?}", out_dir);
+        return;
+    }
+        else {
+            fs::copy(&exe_path, output_path).expect("Copy failed");
+            println!("Created Executable: {:?}", output_path);
+        }
+
+        let mut outfile = fs::OpenOptions::new().append(true).open(output_path).unwrap();
+        outfile.write_all(&payload_bytes).unwrap();
+        outfile.write_all(&payload_len.to_le_bytes()).unwrap();
+        outfile.write_all(BUNDLE_SIGNATURE).unwrap();
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(output_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(output_path, perms).unwrap();
+            }
+        }
+
+        println!("Success! Bundled {} files.", sources.len());
+        return;
+    }
+
+    if command == "--repl" {
+        println!("Dragon v1.0.0");
+        println!("Type 'exit' to quit.");
+        
+        let env = Arc::new(Mutex::new(Env::new(None, None)));
+        env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
+        populate_builtins(env.clone());
+        
+        loop {
+            print!("> ");
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).unwrap() == 0 { break; }
+            if line.trim() == "exit" { break; }
+            
+            let tokens = lex(&line);
+            let mut parser = Parser::new(tokens);
+            if let Ok(ast) = parser.parse_stmt() {
+                match eval_stmt(&ast, env.clone()) {
+                    Ok(EvalResult::Val(v)) | Ok(EvalResult::Return(v)) => println!("{}", val_to_string(&v)),
+                    Err(e) => println!("Error: {} at line {}", e.msg, e.line),
+                    _ => {}
+                }
+            } else {
+                println!("Syntax Error");
+            }
+        }
+        return;
+    }
+
+    let filename = command;
+    match fs::read_to_string(filename) {
+        Ok(src) => {
+            let abs_path = fs::canonicalize(filename).unwrap_or(PathBuf::from(filename));
+            let env = Arc::new(Mutex::new(Env::new(None, Some(abs_path))));
+            env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
+            populate_builtins(env.clone());
+            
+            let mut argv_list = Vec::new();
+            for a in args.iter().skip(2) { argv_list.push(DgnValue::String(a.clone())); }
+            let _ = env.lock().unwrap().set("argv", DgnValue::List(Arc::new(Mutex::new(argv_list))));
+
+            let tokens = lex(&src);
+            let mut parser = Parser::new(tokens);
+            match parser.parse() {
+                Ok(ast) => {
+                    let report = lint_ast(&ast);
+                    if !report.is_clean() {
+                        report.print();
+                        if !report.errors.is_empty() {
+                            std::process::exit(1);
+                        }
+                    }
+
+
+                    if let Err(e) = eval_stmt(&ast, env) {
+                        eprintln!("Runtime Error: {} at line {}", e.msg, e.line);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => { eprintln!("Parse Error: {}", e); std::process::exit(1); },
+            }
+        },
+        Err(e) => {
+            eprintln!("Could not read file '{}': {}", filename, e);
+            std::process::exit(1);
+        },
+    }
+}
+
+fn get_key() -> Vec<u8> {
+
+    let mut key = Vec::new();
+
+    key.push(68);  
+    key.push(82);  
+    key.push(65);  
+    key.push(71); 
+    key.push(79); 
+    key.push(78); 
+    key.push(95); 
+    key.push(50);  
+    key.push(48);  
+    key.push(50);  
+    key.push(54); 
+    
+    key.push(10+20);
+
+    key
+}
