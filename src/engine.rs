@@ -10,13 +10,15 @@ use std::env;
 use std::fmt;
 use std::ffi::{CString, CStr};
 use chrono::{DateTime, Local, Datelike, Timelike};
+use std::os::raw::c_char;
 
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::io::{BufReader, BufRead};
 
 use regex::Regex;
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use tiny_http::{Server, Response, Header, Method};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use libloading::{Library, Symbol};
 use lazy_static::lazy_static;
 
@@ -115,11 +117,11 @@ pub enum DgnValue {
     Func(DgnFunc),
     Class(Arc<Mutex<Env>>),
     Instance(Arc<Mutex<HashMap<String, DgnValue>>>),
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     NativeLib(Arc<Mutex<Library>>),
     Regex(Arc<Regex>),
     Thread(Arc<thread::JoinHandle<()>>), 
-    #[cfg(not(target_arch = "wasm32"))]
+   #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     Socket(Arc<Mutex<TcpStream>>),
 }
 
@@ -313,6 +315,8 @@ pub struct Env {
 }
 
 impl Env {
+    
+
     pub fn new(parent: Option<Arc<Mutex<Env>>>, path: Option<PathBuf>) -> Self {
         let p = path.or_else(|| {
             parent.as_ref().map(|par| par.lock().unwrap().current_path.clone())
@@ -331,8 +335,13 @@ impl Env {
         None
     }
 
+    pub fn define(&mut self, name: String, val: DgnValue) {
+        self.store.insert(name, val);
+    }
+
     pub fn set(&mut self, name: impl Into<String>, val: DgnValue) -> Result<(), String> {
         let name = name.into();
+
         if self.constants.contains(&name) {
             return Err(format!("Cannot reassign constant '{}'", name));
         }
@@ -396,7 +405,7 @@ pub fn lex(src: &str) -> Vec<Token> {
         ("COMMENT_ML", r"(?s)^/\*.*?\*/"), 
         
         ("COMMENT_SL", r"^//[^\n]*"), 
-    
+        ("HEX", r"^0x[0-9a-fA-F]+"),
         ("NUMBER", r"^[0-9]+(\.[0-9]+)?"), 
         
         ("STRING", r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)*'"#), 
@@ -423,6 +432,12 @@ pub fn lex(src: &str) -> Vec<Token> {
                 let token_col = col + 1;
 
                 match *name {
+                    "HEX" => {
+                        // Strip '0x' and parse as base-16 integer, then cast to f64
+                        let clean = val.trim_start_matches("0x");
+                        let n = u64::from_str_radix(clean, 16).unwrap_or(0) as f64;
+                        tokens.push(Token{typ: TokenType::Number, value: val.to_string(), line, col: token_col, num_val: Some(n)});
+                    },
                     "NUMBER" => {
                         let n : f64 = val.parse().unwrap_or(0.0);
                         tokens.push(Token{typ: TokenType::Number, value: val.to_string(), line, col: token_col, num_val: Some(n)});
@@ -1005,7 +1020,8 @@ impl Parser {
         loop {
             if self.match_token("(") {
                 let mut args = Vec::new();
-                if self.current().value != ")" {
+                let is_end = self.current().typ == TokenType::Op && self.current().value == ")";
+                if !is_end {
                     loop {
                         args.push(self.parse_expr()?);
                         if !self.match_token(",") { break; }
@@ -1082,7 +1098,8 @@ impl Parser {
                 } else if t.value == "[" {
                     self.advance();
                     let mut list = Vec::new();
-                    if self.current().value != "]" {
+                    let is_end = self.current().typ == TokenType::Op && self.current().value == "]";
+                    if !is_end {
                         loop {
                             list.push(self.parse_expr()?);
                             if !self.match_token(",") { break; }
@@ -1093,7 +1110,8 @@ impl Parser {
                 } else if t.value == "{" {
                     self.advance();
                     let mut obj = Vec::new();
-                    if self.current().value != "}" {
+                    let is_end = self.current().typ == TokenType::Op && self.current().value == "}";
+                    if !is_end {
                         loop {
                             let k = if self.current().typ == TokenType::String {
                                 self.advance().value
@@ -1151,9 +1169,9 @@ pub fn val_to_string(v: &DgnValue) -> String {
         DgnValue::Class(_) => "<class>".to_string(),
         DgnValue::Instance(_) => "<instance>".to_string(),
         DgnValue::ByteArray(b) => format!("<ByteArray len={}>", b.lock().unwrap().len()),
-        #[cfg(not(target_arch = "wasm32"))]
+       #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         DgnValue::NativeLib(_) => "<NativeLib>".to_string(),
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         DgnValue::Socket(_) => "<Socket>".to_string(),
         DgnValue::Regex(r) => format!("<Regex {}>", r.as_str()),
         DgnValue::Thread(_) => "<Thread>".to_string(),
@@ -1172,9 +1190,10 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             Ok(EvalResult::None)
         },
         StmtNode::Block(stmts) => {
-            gc_check_auto(env.clone());
+            let block_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
+            gc_check_auto(block_env.clone());
             for s in stmts {
-                let r = eval_stmt(s, env.clone())?;
+                let r = eval_stmt(s, block_env.clone())?;
                 match r {
                     EvalResult::None => continue,
                     _ => return Ok(r),
@@ -1355,7 +1374,13 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                 class_env.lock().unwrap().store.insert("__parent_class__".into(), DgnValue::Class(pe));
             }
             
-            eval_stmt(body, class_env.clone())?;
+            if let StmtNode::Block(stmts) = &body.node {
+                for s in stmts {
+                    eval_stmt(s, class_env.clone())?;
+                }
+            } else {
+                eval_stmt(body, class_env.clone())?;
+            }
             env.lock().unwrap().set(name.clone(), DgnValue::Class(class_env)).map_err(|e| DgnError::new(&e, 0))?;
             Ok(EvalResult::None)
         },
@@ -1803,23 +1828,31 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                         let vals: Vec<DgnValue> = m.lock().unwrap().values().cloned().collect();
                         Ok(DgnValue::List(Arc::new(Mutex::new(vals))))
                     })),
+                    "contains" => Ok(native_method(m, |m, args| {
+                        let key = args.get(0).map(val_to_string).unwrap_or_default();
+                        Ok(DgnValue::Bool(m.lock().unwrap().contains_key(&key)))
+                     })),
                      "set" => Ok(native_method(m, |m, args| {
                          if args.len() == 2 {
                              if let DgnValue::String(k) = &args[0] {
                                  m.lock().unwrap().insert(k.clone(), args[1].clone());
                              }
                          }
-                         Ok(DgnValue::Null)
+                         Ok(DgnValue::Map(m))
                      })),
+                     "get" => Ok(native_method(m, |m, args| {
+                            let key = args.get(0).map(val_to_string).unwrap_or_default();
+                            Ok(m.lock().unwrap().get(&key).cloned().unwrap_or(DgnValue::Null))
+                        })),
                      "remove" => Ok(native_method(m, |m, args| {
                         if let Some(DgnValue::String(k)) = args.get(0) {
                             m.lock().unwrap().remove(k);
                         }
-                        Ok(DgnValue::Null)
+                        Ok(DgnValue::Map(m))
                     })),
                      "clear" => Ok(native_method(m, |m, _| {
                         m.lock().unwrap().clear();
-                        Ok(DgnValue::Null)
+                        Ok(DgnValue::Map(m))
                      })),
                      "length" => Ok(DgnValue::Number(m.lock().unwrap().len() as f64)),
                      _ => Ok(DgnValue::Null)
@@ -1862,7 +1895,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
         DgnValue::List(l) => {
             match name {
                 "push" => Ok(native_method(l, |l, args| { 
-                    l.lock().unwrap().push(args.get(0).unwrap_or(&DgnValue::Null).clone()); Ok(DgnValue::Null) 
+                    l.lock().unwrap().push(args.get(0).unwrap_or(&DgnValue::Null).clone()); Ok(DgnValue::List(l))
                 })),
                 "pop" => Ok(native_method(l, |l, _| { 
                     Ok(l.lock().unwrap().pop().unwrap_or(DgnValue::Null)) 
@@ -1992,6 +2025,66 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                 })),
                  _ => Ok(DgnValue::Null)
             }
+        },
+       #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        DgnValue::NativeLib(lib) => {
+            let lib_ref = lib.clone();
+            let func_name = CString::new(name).unwrap();
+
+            Ok(native_fn(move |args| {
+                let l = lib_ref.lock().unwrap();
+                
+                // 1. Prepare Arguments
+                let mut raw_args: Vec<usize> = Vec::new();
+                let mut keep_alive_strs = Vec::new(); // Keeps C-Strings valid in memory
+
+                for arg in args {
+                    match arg {
+                        DgnValue::Number(n) => raw_args.push(n as usize),
+                        DgnValue::Bool(b) => raw_args.push(if b { 1 } else { 0 }),
+                        DgnValue::String(s) => {
+                            let c = CString::new(s).unwrap();
+                            raw_args.push(c.as_ptr() as usize);
+                            keep_alive_strs.push(c);
+                        },
+                        DgnValue::ByteArray(b) => {
+                             let ptr = b.lock().unwrap().as_ptr() as usize;
+                             raw_args.push(ptr);
+                        },
+                        DgnValue::Null => raw_args.push(0),
+                        _ => raw_args.push(0),
+                    }
+                }
+
+                // 2. Pad to 8 arguments (The Magic Fix)
+                // This ensures we can call functions with 0 to 8 arguments safely
+                while raw_args.len() < 8 { raw_args.push(0); }
+
+                unsafe {
+                    // Define a generic function pointer that takes 8 usize args
+                    type GenericFn = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+
+                    let symbol: Symbol<GenericFn> = match l.get(func_name.as_bytes()) {
+                        Ok(s) => s,
+                        Err(e) => return Err(DgnError::new(&format!("FFI Error: Symbol '{}' not found", func_name.to_str().unwrap()), 0))
+                    };
+
+                    // 3. Call the C function
+                    let res = symbol(
+                        raw_args[0], raw_args[1], raw_args[2], raw_args[3],
+                        raw_args[4], raw_args[5], raw_args[6], raw_args[7]
+                    );
+
+                    // 4. Return Result
+                    // Heuristic: If it looks like a boolean (0 or 1), return Bool, otherwise Number.
+                    // You can adjust this logic if needed.
+                    if res == 0 || res == 1 {
+                        Ok(DgnValue::Bool(res != 0))
+                    } else {
+                        Ok(DgnValue::Number(res as f64))
+                    }
+                }
+            }))
         },
         DgnValue::Regex(r) => {
             match name {
@@ -2201,7 +2294,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
          let v = a.get(0).unwrap_or(&DgnValue::Null);
          Ok(DgnValue::String(serde_json::to_string(&val_to_string(v)).unwrap()))
     }));
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
     e.set("start_server", native_fn(|args| {
         let port = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u16 } else { 8080 };
@@ -2310,7 +2403,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         if let DgnValue::NativeLib(lib) = lib_val {
             let l = lib.lock().unwrap();
             unsafe {
-                type DragonFunc = unsafe extern "C" fn(*const i8) -> *mut i8;
+                type DragonFunc = unsafe extern "C" fn(*const c_char) -> *mut c_char;
                 let func: Symbol<DragonFunc> = l.get(symbol_name.as_bytes()).map_err(|e| DgnError::new(&e.to_string(), 0))?;
                 
                 let c_input = CString::new(input_arg).unwrap();
@@ -2342,9 +2435,9 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
             DgnValue::Func(_) => "function",
             DgnValue::Class(_) => "class", 
             DgnValue::Instance(_) => "instance",
-            #[cfg(not(target_arch = "wasm32"))] 
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             DgnValue::NativeLib(_) => "nativelib",
-            #[cfg(not(target_arch = "wasm32"))] 
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             DgnValue::Socket(_) => "socket",
             DgnValue::Regex(_) => "regex",
             DgnValue::Thread(_) => "thread",
@@ -2522,7 +2615,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         map.insert("str".to_string(), DgnValue::String(now.format("%Y-%m-%d %H:%M:%S").to_string()));
         Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
     }));
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
     e.set("os_name", native_fn(|_| {
         Ok(DgnValue::String(std::env::consts::OS.to_string()))
@@ -2591,7 +2684,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         if ptr == 0 { return Ok(DgnValue::Null); }
 
         unsafe {
-            let c_str = std::ffi::CStr::from_ptr(ptr as *const i8);
+            let c_str = std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char);
             Ok(DgnValue::String(c_str.to_string_lossy().into_owned()))
         }
     }));
@@ -3108,7 +3201,7 @@ pub fn lint_ast(ast: &Stmt) -> LintReport {
     linter.report
 }
 
-fn get_key() -> Vec<u8> {
+pub fn get_key() -> Vec<u8> {
 
     let mut key = Vec::new();
 

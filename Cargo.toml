@@ -11,10 +11,14 @@ panic = "abort"     # Removes heavy stack unwinding code
 strip = true        # Automatically strip debug symbols (Crucial!)
 
 # The DLL Template (built as dragon_lib.dll / libdragon_lib.so)
+#[lib]
+#name = "dragon_lib"
+#path = "src/lib.rs"
+#crate-type = ["cdylib", "rlib"] 
+
 [lib]
-name = "dragon_lib"
-path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"] 
+name = "dragon_android"
+crate-type = ["cdylib"]
 
 # The CLI Tool (built as dragon_lang.exe)
 [[bin]]
@@ -25,19 +29,26 @@ path = "src/main.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
-ureq = { version = "2.9", default-features = false, features = ["json", "native-tls"] }
-tiny_http = "0.12"
-libloading = "0.8"
+
 rand = "0.8"
 chrono = "0.4"
 lazy_static = "1.4" # Needed for global state in the DLL
 libc = "0.2"
+
 
 wasm-bindgen = "0.2"
 getrandom = { version = "0.2", features = ["js"] }
 console_error_panic_hook = "0.1"
 
 base64 = "0.21"
+
+[target.aarch64-unknown-linux-gnu.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
+ureq = { version = "2.9", default-features = false, features = ["json", "tls"] }
+tiny_http = "0.12"
+libloading = "0.8"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -48,3 +59,7 @@ features = [
   "Element",
   "HtmlElement"
 ]
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk = { version = "0.7" }

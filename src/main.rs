@@ -3,14 +3,14 @@ use engine::*;
 
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File,OpenOptions};
 use std::path::{Path, PathBuf};
 use std::io::{Write, Read};
 use std::env;
 
 
-const DGN_VERSION: &str = "Dragon Programming Language v1.0.0";
-const DGN_BUILD: &str = "Build 2026-01-26"; 
+const DGN_VERSION: &str = "Dragon Programming Language v1.0.1";
+const DGN_BUILD: &str = "Build 2026-02-07"; 
 const DGN_AUTHOR: &str = "Aavesh Jilani";
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -57,11 +57,85 @@ fn main() {
         println!("  dragon --repl                     Start the interactive shell");
         println!("  dragon -c <in> -o <out>           Compile script to Executable");
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
+        println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("");
         return;
     }
 
     let command = &args[1];
+
+
+    if command == "-build" {
+       println!("Dragon Build System");
+        println!("-------------------------------------");
+
+        let input_path = Path::new("lib/main.dgn");
+        
+        // FIX: Target 'arm64-v8a' (Standard for Phones) inside the 'android' project folder
+        let jni_dir = Path::new("app/src/main/jniLibs/x86_64");
+        let output_so = jni_dir.join("libdragon_android.so");
+
+        if !input_path.exists() {
+            println!("Error: 'lib/main.dgn' not found.");
+            return;
+        }
+
+        // FIX: Look for template in CURRENT DIRECTORY (where user runs command)
+        let template_path = Path::new("libdragon_android.so");
+        
+        if !template_path.exists() {
+            println!("Error: Template 'libdragon_android.so' not found in current directory.");
+            println!("Please ensure the pre-compiled Android library is in: {:?}", env::current_dir().unwrap());
+            return;
+        }
+
+        if !jni_dir.exists() {
+            println!("Creating JNI directory: {:?}", jni_dir);
+            fs::create_dir_all(jni_dir).expect("Failed to create JNI dir");
+        }
+
+        println!("Compiling Script: {}", input_path.display());
+
+        // 2. Gather & Encrypt Sources
+        let mut sources = HashMap::new();
+        if let Err(e) = gather_sources(input_path, &mut sources, true) {
+            eprintln!("Build Failed: {}", e);
+            std::process::exit(1);
+        }
+
+        let payload = serde_json::to_string(&sources).expect("Serialization failed");
+        let mut payload_bytes = payload.into_bytes();
+        let payload_len = payload_bytes.len() as u64;
+
+        let key = get_key();
+        for (i, b) in payload_bytes.iter_mut().enumerate() {
+            *b ^= key[i % key.len()];
+        }
+
+        // 3. Copy Template -> Destination
+        println!("Installing Engine to: {:?}", output_so);
+        fs::copy(&template_path, &output_so).expect("Failed to copy library template");
+
+        // 4. Inject Code into the Binary (Append Mode)
+        println!("Injecting Encrypted Bytecode...");
+        
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&output_so)
+            .expect("Failed to open .so for writing");
+        
+        // Write Data
+        file.write_all(&payload_bytes).expect("Write failed");
+        // Write Length (8 bytes)
+        file.write_all(&payload_len.to_le_bytes()).expect("Write len failed");
+        // Write Signature (16 bytes)
+        file.write_all(BUNDLE_SIGNATURE).expect("Write sig failed");
+
+        println!("Success! App compiled and embedded into native library.");
+        println!("Ready to run on Android.");
+        return;
+    }
 
     if command == "-c" {
         if args.len() < 5 || args[3] != "-o" {
@@ -118,9 +192,8 @@ fn main() {
             fs::copy(&template, output_path).expect("Copy failed");
             println!("Created Shared Library: {:?}", output_path);
         } 
-       else if is_web_mode {
-        println!("Compiling for Web Assembly...");
-
+      else if is_web_mode {
+        println!("Compiling for Web Assembly (Protected Mode)...");
 
         let template_dir = exe_path.parent().unwrap();
         let wasm_file = template_dir.join("dragon_lib_bg.wasm");
@@ -138,10 +211,29 @@ fn main() {
         fs::copy(&wasm_file, out_dir.join("dragon_lib_bg.wasm")).unwrap();
         fs::copy(&js_file, out_dir.join("dragon.js")).unwrap();
 
+        // 1. Gather Sources
         let mut sources = HashMap::new();
-        gather_sources(input_path, &mut sources, true).unwrap();
-        let full_source = sources.get("__entry__").unwrap(); 
+        if let Err(e) = gather_sources(input_path, &mut sources, true) {
+             eprintln!("Error gathering sources: {}", e);
+             return;
+        }
 
+        // 2. Serialize to JSON
+        let payload_json = serde_json::to_string(&sources).expect("Failed to serialize");
+        let mut payload_bytes = payload_json.into_bytes();
+
+        // 3. Encrypt (XOR) - Same logic as Native
+        let key = get_key();
+        for (i, b) in payload_bytes.iter_mut().enumerate() {
+            *b ^= key[i % key.len()];
+        }
+
+        // 4. Encode to Base64 (Safe for embedding in HTML string)
+        use base64::{Engine as _, engine::general_purpose};
+        let protected_payload = general_purpose::STANDARD.encode(&payload_bytes);
+
+        // 5. Generate HTML with Protected Payload
+        // Note: We now import `dragon_run_encrypted` instead of `dragon_run_wasm`
         let html_content = format!(r#"
 <!DOCTYPE html>
 <html>
@@ -155,7 +247,7 @@ fn main() {
 </head>
 <body>
     <h1>Dragon Output</h1>
-    <div id="console">Initializing...</div>
+    <div id="console">Initializing System...</div>
     <script type="module">
         import init, {{ dragon_run_wasm }} from './dragon.js';
 
@@ -163,20 +255,18 @@ fn main() {
             await init();
             const outputDiv = document.getElementById("console");
             
-            // Override console.log to print to div
             const oldLog = console.log;
             console.log = (msg) => {{
                 outputDiv.innerText += msg + "\n";
                 oldLog(msg);
             }};
 
-            // The Dragon Source Code
-            const code = `{}`;
+            const payload = "{}";
 
-            outputDiv.innerText = "> Running...\n";
+            outputDiv.innerText = "> System Ready. Executing...\n";
             try {{
-                const result = dragon_run_wasm(code);
-                outputDiv.innerText += "\n[Program Finished: " + result + "]";
+                const result = dragon_run_wasm(payload);
+                outputDiv.innerText += "\n[" + result + "]";
             }} catch(e) {{
                 outputDiv.innerText += "\n[WASM Error: " + e + "]";
             }}
@@ -185,10 +275,10 @@ fn main() {
     </script>
 </body>
 </html>
-"#, full_source.replace("`", "\\`").replace("${", "\\${")); // Escape JS template literals
+"#, protected_payload);
 
         fs::write(out_dir.join("index.html"), html_content).unwrap();
-        println!("Success! Web bundle created at: {:?}", out_dir);
+        println!("Success! Protected Web bundle created at: {:?}", out_dir);
         return;
     }
         else {
