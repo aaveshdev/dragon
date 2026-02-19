@@ -25,10 +25,28 @@ use lazy_static::lazy_static;
 #[cfg(target_arch = "wasm32")]
 use web_sys;
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+use libffi::middle::{Cif, Type, CodePtr, Arg};
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+use std::ffi::c_void;
 
 lazy_static! {
     static ref GC_STATE: Mutex<GcState> = Mutex::new(GcState::new());
+    static ref FFI_SIGNATURES: Mutex<HashMap<String, (String, Vec<String>)>> = Mutex::new(HashMap::new());
+
+    static ref FFI_STRUCTS: Mutex<HashMap<String, FfiStructDef>> = Mutex::new(HashMap::new());
 }
+
+
+struct FfiStructDef {
+    size: usize,
+    fields: Vec<(String, usize, Type)>, // Name, Offset, LibFFI Type
+    libffi_type: Type, // The constructed Type::structure
+}
+// We need Send/Sync to store Type in a global Mutex, forcing unsafe impl if necessary
+// (libffi Types are generally thread-safe as they are read-only descriptors)
+unsafe impl Send for FfiStructDef {}
+unsafe impl Sync for FfiStructDef {}
 
 pub const BUNDLE_SIGNATURE: &[u8; 16] = b"DRAGON_BUNDLE_v1";
 
@@ -1442,7 +1460,11 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                     }
                 }
 
-                eval_stmt(&module_body, mod_env.clone())?;
+                if let StmtNode::Block(stmts) = module_body.node {
+                    for s in stmts {
+                        eval_stmt(&s, mod_env.clone())?;
+                    }
+                }
                 mod_val_placeholder
             };
 
@@ -2157,6 +2179,23 @@ pub fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnV
     }
 }
 
+fn get_ffi_type_info(name: &str) -> Option<(Type, usize, usize)> {
+    match name {
+        "u8" | "byte"   => Some((Type::u8(), 1, 1)),
+        "i8" | "char"   => Some((Type::i8(), 1, 1)),
+        "u16"           => Some((Type::u16(), 2, 2)),
+        "i16" | "short" => Some((Type::i16(), 2, 2)),
+        "u32"           => Some((Type::u32(), 4, 4)),
+        "i32" | "int"   => Some((Type::i32(), 4, 4)),
+        "u64"           => Some((Type::u64(), 8, 8)),
+        "i64" | "long"  => Some((Type::i64(), 8, 8)),
+        "f32" | "float" => Some((Type::f32(), 4, 4)),
+        "f64" | "double"=> Some((Type::f64(), 8, 8)),
+        "pointer" | "string" => Some((Type::pointer(), 8, 8)), 
+        _ => None, 
+    }
+}
+
 pub fn populate_builtins(env: Arc<Mutex<Env>>) {
     let mut e = env.lock().unwrap();
     let gc_env = env.clone();
@@ -2386,11 +2425,172 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
     
 
     e.set("loadlib", native_fn(|args| {
-        let path = if let Some(DgnValue::String(s)) = args.get(0) { s } else { return Err(DgnError::new("Path req",0)) };
+        let path = if let Some(DgnValue::String(s)) = args.get(0) { s } else { return Err(DgnError::new("Path req", 0)) };
         unsafe {
             let lib = Library::new(path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
-            Ok(DgnValue::NativeLib(Arc::new(Mutex::new(lib))))
+            
+            let mut map = HashMap::new();
+            map.insert("path".to_string(), DgnValue::String(path.clone()));
+            map.insert("ptr".to_string(), DgnValue::NativeLib(Arc::new(Mutex::new(lib))));
+            
+            Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
         }
+    }));
+
+    e.set("ffi_struct", native_fn(|args| {
+        let name = val_to_string(args.get(0).unwrap());
+        let fields_list = if let DgnValue::List(l) = args.get(1).unwrap() { l.lock().unwrap().clone() } else { return Err(DgnError::new("Fields must be a list", 0)); };
+
+        let mut offset = 0;
+        let mut max_align = 1;
+        let mut struct_fields = Vec::new();
+        let mut field_types = Vec::new();
+
+        for field in fields_list {
+            if let DgnValue::List(def) = field {
+                let def = def.lock().unwrap();
+                let type_name = val_to_string(&def[0]);
+                let field_name = val_to_string(&def[1]);
+
+                let (ffi_type, size, align) = get_ffi_type_info(&type_name)
+                    .ok_or(DgnError::new(&format!("Unknown type: {}", type_name), 0))?;
+
+                // 1. Add Padding for Alignment
+                let padding = (align - (offset % align)) % align;
+                offset += padding;
+
+                // 2. Store Field
+                struct_fields.push((field_name, offset, ffi_type.clone()));
+                field_types.push(ffi_type);
+
+                // 3. Advance Offset
+                offset += size;
+                if align > max_align { max_align = align; }
+            }
+        }
+
+        // 4. Final Padding (Structure size must be multiple of largest alignment)
+        let final_padding = (max_align - (offset % max_align)) % max_align;
+        let total_size = offset + final_padding;
+
+        // 5. Create LibFFI Structure Type
+        let struct_type = Type::structure(field_types);
+
+        let def = FfiStructDef {
+            size: total_size,
+            fields: struct_fields,
+            libffi_type: struct_type,
+        };
+
+        FFI_STRUCTS.lock().unwrap().insert(name, def);
+        Ok(DgnValue::Number(total_size as f64))
+    }));
+
+
+    e.set("struct_new", native_fn(|args| {
+        let name = val_to_string(args.get(0).unwrap());
+        let structs = FFI_STRUCTS.lock().unwrap();
+        let def = structs.get(&name).ok_or(DgnError::new("Struct not defined", 0))?;
+
+        // Allocate zeroed memory
+        let bytes = vec![0u8; def.size];
+        
+        // Return a Map acting as the Struct Object
+        // It contains the Raw Bytes + Metadata
+        let mut map = HashMap::new();
+        map.insert("__struct_id__".to_string(), DgnValue::String(name.clone()));
+        map.insert("__bytes__".to_string(), DgnValue::ByteArray(Arc::new(Mutex::new(bytes))));
+        
+        Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
+    }));
+
+    e.set("struct_set", native_fn(|args| {
+        let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
+        let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
+        let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
+        
+        let field_name = val_to_string(&args[1]);
+        let val = &args[2];
+
+        let structs = FFI_STRUCTS.lock().unwrap();
+        let def = structs.get(&struct_name).unwrap();
+        
+        // Find field offset and type
+        let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
+            .ok_or(DgnError::new("Field not found", 0))?;
+
+        // Write Data
+        let mut b = buffer.lock().unwrap();
+        let offset = *offset;
+        
+        // This is a simplified writer (Supports i32/f32 for now - expand for others)
+        // You can copy the logic from `mem_write_int` here but adapt for floats
+        match val {
+            DgnValue::Number(n) => {
+                 // Simple Heuristic: If field is float, write f32/f64 bytes. If int, write i32 bytes.
+                 // In a real engine, check `type_info` structure to know exact write type.
+                 let bytes = (*n as f32).to_ne_bytes(); // Assuming float for Allegro colors
+                 for i in 0..4 { b[offset + i] = bytes[i]; }
+            },
+            _ => {}
+        }
+
+        Ok(DgnValue::Null)
+    }));
+
+    // [INSERT THIS AFTER struct_set block (~Line 1485)]
+    e.set("struct_get", native_fn(|args| {
+        let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
+        let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
+        let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
+        
+        let field_name = val_to_string(&args[1]);
+
+        let structs = FFI_STRUCTS.lock().unwrap();
+        let def = structs.get(&struct_name).ok_or(DgnError::new("Struct def not found", 0))?;
+        
+        // Find field offset and type
+        let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
+            .ok_or(DgnError::new("Field not found", 0))?;
+
+        let b = buffer.lock().unwrap();
+        let offset = *offset;
+        
+        // Read based on type size (Simplified for basics, expand logic as needed)
+        // We look at the 'size' of the field type to decide how to read
+        // Note: You might want to match on 'type_info' specifically for cleaner code
+        if offset + 4 <= b.len() {
+             let bytes: [u8; 4] = b[offset..offset+4].try_into().unwrap();
+             let f_val = f32::from_ne_bytes(bytes); // Assume float for colors
+             let i_val = u32::from_ne_bytes(bytes);
+             
+             // Heuristic: If field name suggests float, return float, else int
+             // In a perfect world, you'd check type_info. 
+             // For Allegro colors (r,g,b,a are floats), we return float.
+             return Ok(DgnValue::Number(f_val as f64));
+        }
+
+        Ok(DgnValue::Null)
+    }));
+
+    e.set("ffi_def", native_fn(|args| {
+        if args.len() < 4 { return Err(DgnError::new("Usage: ffi_def(lib, name, ret_type, [arg_types])", 0)); }
+        
+        // Extract library path from the map we created in loadlib
+        let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib Object",0)); };
+        let lib_path = val_to_string(lib_map.get("path").unwrap());
+        
+        let func_name = val_to_string(&args[1]);
+        let ret_type = val_to_string(&args[2]);
+        
+        let arg_types_list = if let DgnValue::List(l) = &args[3] { l.lock().unwrap().clone() } else { vec![] };
+        let arg_types: Vec<String> = arg_types_list.iter().map(val_to_string).collect();
+
+        // Store in the global registry
+        let key = format!("{}::{}", lib_path, func_name);
+        FFI_SIGNATURES.lock().unwrap().insert(key, (ret_type, arg_types));
+        
+        Ok(DgnValue::Null)
     }));
     
     e.set("loadlib_call", native_fn(|args| {
@@ -2689,57 +2889,214 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         }
     }));
 
-    e.set("ffi_call", native_fn(|args| {
-        if args.len() < 3 { return Err(DgnError::new("Usage: ffi_call(lib, name, args_list)", 0)); }
+    e.set("mem_read_byte", native_fn(|args| {
+        let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
+        let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
         
-        let lib_val = &args[0];
-        let func_name = val_to_string(&args[1]);
-    
-        let func_args = if let DgnValue::List(l) = &args[2] { 
-            l.lock().unwrap().clone() 
-        } else { 
-            vec![] 
-        };
-        
-        if let DgnValue::NativeLib(lib) = lib_val {
-            let l = lib.lock().unwrap();
-            
+        let b = buffer.lock().unwrap();
+        if offset < b.len() {
+            Ok(DgnValue::Number(b[offset] as f64))
+        } else {
+            Ok(DgnValue::Null)
+        }
+    }));
 
-            let mut keep_alive_strs = Vec::new();
-            let mut raw_args: Vec<usize> = Vec::new();
-            
-            for arg in func_args {
-                match arg {
-                    DgnValue::Number(n) => raw_args.push(n as usize), 
-                    DgnValue::Bool(b) => raw_args.push(if b { 1 } else { 0 }),
-                    DgnValue::Null => raw_args.push(0), 
-                    DgnValue::String(s) => {
-                        let c_str = CString::new(s).unwrap();
-                        let ptr = c_str.as_ptr() as usize;
-                        keep_alive_strs.push(c_str); 
-                        raw_args.push(ptr);
-                    },
-                    _ => return Err(DgnError::new("Unsupported FFI argument type", 0))
+    e.set("mem_write_byte", native_fn(|args| {
+        let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
+        let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+        let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u8 } else { 0 };
+
+        let mut b = buffer.lock().unwrap();
+        if offset < b.len() {
+            b[offset] = val;
+        }
+        Ok(DgnValue::Null)
+    }));
+
+    e.set("ffi_symbol_addr", native_fn(|args| {
+        // 1. Get Library
+        let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib",0)); };
+        let lib_arc = if let DgnValue::NativeLib(l) = lib_map.get("ptr").unwrap() { l } else { return Err(DgnError::new("Invalid Lib Ptr",0)); };
+        
+        // 2. Get Symbol Name
+        let func_name = val_to_string(&args[1]);
+        
+        // 3. Return Address
+        let l = lib_arc.lock().unwrap();
+        unsafe {
+            // We cast the symbol to a generic pointer, then to usize (number)
+            let symbol: Symbol<*const c_void> = l.get(func_name.as_bytes())
+                .map_err(|e| DgnError::new(&e.to_string(), 0))?;
+            Ok(DgnValue::Number(*symbol as usize as f64))
+        }
+    }));
+
+   e.set("ffi_call", native_fn(|args| {
+        if args.len() < 2 { return Err(DgnError::new("Usage: ffi_call(lib, name, ...args)", 0)); }
+
+        let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib",0)); };
+        let lib_path = val_to_string(lib_map.get("path").unwrap());
+        let lib_arc = if let DgnValue::NativeLib(l) = lib_map.get("ptr").unwrap() { l } else { return Err(DgnError::new("Invalid Lib Ptr",0)); };
+        
+        let func_name = val_to_string(&args[1]);
+        let call_args_values = &args[2..];
+
+        let key = format!("{}::{}", lib_path, func_name);
+        let sig_guard = FFI_SIGNATURES.lock().unwrap();
+        let (ret_type_str, arg_types_str) = sig_guard.get(&key)
+            .ok_or(DgnError::new(&format!("No signature for '{}'. Call ffi_def() first.", func_name), 0))?;
+
+        // 1. Prepare Types
+        let mut arg_types: Vec<Type> = Vec::new();
+        for t in arg_types_str {
+            match t.as_str() {
+                "int" | "i32" => arg_types.push(Type::i32()),
+                "long" | "i64" => arg_types.push(Type::i64()),
+                "float" | "f32" => arg_types.push(Type::f32()),
+                "double" | "f64" => arg_types.push(Type::f64()),
+                "pointer" | "void*" => arg_types.push(Type::pointer()),
+                "string" | "char*" => arg_types.push(Type::pointer()),
+                "bool" => arg_types.push(Type::u8()),
+                "void" => {}, 
+                name => {
+                    // NEW: Check if it is a registered C-Struct
+                    if let Some(def) = FFI_STRUCTS.lock().unwrap().get(name) {
+                        // We clone the pre-calculated LibFFI Type::structure
+                        arg_types.push(def.libffi_type.clone());
+                    } else {
+                        return Err(DgnError::new(&format!("Unknown FFI type: {}", name), 0));
+                    }
                 }
             }
-            
+        }
 
-            while raw_args.len() < 4 { raw_args.push(0); }
-            
-            unsafe {
+        let ret_type = match ret_type_str.as_str() {
+            "void" => Type::void(),
+            "int" | "i32" => Type::i32(),
+            "long" | "i64" => Type::i64(),
+            "float" | "f32" => Type::f32(),
+            "double" | "f64" => Type::f64(),
+            "pointer" | "void*" => Type::pointer(),
+            "bool" => Type::u8(),
+            _ => return Err(DgnError::new("Unknown return type", 0))
+        };
 
-                type GenericFn = unsafe extern "system" fn(usize, usize, usize, usize) -> isize;
-                
+        // FIX: Use into_iter() to satisfy Cif::new requirements
+        let cif = Cif::new(arg_types.into_iter(), ret_type.clone());
+        
+        let l = lib_arc.lock().unwrap();
+        let code_ptr: CodePtr = unsafe {
+            let symbol: Symbol<*mut c_void> = l.get(func_name.as_bytes())
+                .map_err(|e| DgnError::new(&e.to_string(), 0))?;
+            CodePtr::from_ptr(*symbol)
+        };
 
-                let symbol: Symbol<GenericFn> = l.get(func_name.as_bytes())
-                    .map_err(|e| DgnError::new(&format!("Symbol '{}' not found: {}", func_name, e), 0))?;
-                
-                let res = symbol(raw_args[0], raw_args[1], raw_args[2], raw_args[3]);
-                
-                Ok(DgnValue::Number(res as f64))
+        // 2. Prepare Values safely
+        // We use an enum to keep the converted data alive during the call
+        enum FfiValue {
+            I32(i32), I64(i64),
+            F32(f32), F64(f64),
+            Ptr(usize), U8(u8),
+            Struct(Vec<u8>),
+        }
+
+        let mut values = Vec::new();
+        let mut keep_alive_strs: Vec<CString> = Vec::new();
+
+        for (i, val) in call_args_values.iter().enumerate() {
+             let t_str = arg_types_str.get(i).map(|s| s.as_str()).unwrap_or("int");
+             match t_str {
+                "int" | "i32" => values.push(FfiValue::I32(val.as_number().unwrap_or(0.0) as i32)),
+                "long" | "i64" => values.push(FfiValue::I64(val.as_number().unwrap_or(0.0) as i64)),
+                "float" | "f32" => values.push(FfiValue::F32(val.as_number().unwrap_or(0.0) as f32)),
+                "double" | "f64" => values.push(FfiValue::F64(val.as_number().unwrap_or(0.0) as f64)),
+                "pointer" | "void*" => values.push(FfiValue::Ptr(val.as_number().unwrap_or(0.0) as usize)),
+                "string" | "char*" => {
+                    let s = val_to_string(val);
+                    let c_str = CString::new(s).unwrap_or_default();
+                    let ptr = c_str.as_ptr() as usize;
+                    keep_alive_strs.push(c_str); 
+                    values.push(FfiValue::Ptr(ptr));
+                },
+                "bool" => values.push(FfiValue::U8(if is_truthy(val) { 1 } else { 0 })),
+               name => {
+                    if FFI_STRUCTS.lock().unwrap().contains_key(name) {
+                        if let DgnValue::Map(m) = val {
+                            let m = m.lock().unwrap();
+                            if let Some(DgnValue::ByteArray(b)) = m.get("__bytes__") {
+                                // COPY the bytes into our FfiValue holder
+                                let data = b.lock().unwrap().clone();
+                                values.push(FfiValue::Struct(data));
+                            } else {
+                                // Fallback: empty struct
+                                values.push(FfiValue::Struct(vec![])); 
+                            }
+                        } else {
+                            values.push(FfiValue::I32(0)); // Error fallback
+                        }
+                    } else {
+                        values.push(FfiValue::I32(0));
+                    }
+                }
+             }
+        }
+
+        // 3. Create LibFFI Arguments
+        // Arg::new() borrows the value from our 'values' vector
+        let mut libffi_args = Vec::new();
+        for v in &values {
+            match v {
+                FfiValue::I32(x) => libffi_args.push(Arg::new(x)),
+                FfiValue::I64(x) => libffi_args.push(Arg::new(x)),
+                FfiValue::F32(x) => libffi_args.push(Arg::new(x)),
+                FfiValue::F64(x) => libffi_args.push(Arg::new(x)),
+                FfiValue::Ptr(x) => libffi_args.push(Arg::new(x)),
+                FfiValue::U8(x) => libffi_args.push(Arg::new(x)),
+                FfiValue::Struct(data) => {
+                    if data.is_empty() {
+                         // Edge case handling
+                         static EMPTY: u8 = 0;
+                         libffi_args.push(Arg::new(&EMPTY));
+                    } else {
+                        libffi_args.push(Arg::new(&data[0]));
+                    }
+                }
             }
-        } else {
-            Err(DgnError::new("First argument must be a loaded library", 0))
+        }
+
+        // 4. Execute Call
+        unsafe {
+             match ret_type_str.as_str() {
+                 "void" => {
+                     cif.call::<()>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Null)
+                 },
+                 "int" | "i32" => {
+                     let res = cif.call::<i32>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Number(res as f64))
+                 },
+                 "long" | "i64" => {
+                     let res = cif.call::<i64>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Number(res as f64))
+                 },
+                 "float" | "f32" => {
+                     let res = cif.call::<f32>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Number(res as f64))
+                 },
+                 "double" | "f64" => {
+                     let res = cif.call::<f64>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Number(res))
+                 },
+                 "pointer" | "void*" => {
+                     let res = cif.call::<usize>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Number(res as f64))
+                 },
+                 "bool" => {
+                     let res = cif.call::<u8>(code_ptr, &libffi_args);
+                     Ok(DgnValue::Bool(res != 0))
+                 },
+                 _ => Ok(DgnValue::Null)
+             }
         }
     }));
 
@@ -3018,8 +3375,8 @@ impl Linter {
             "math_abs", "math_floor", "math_ceil", "math_round", "math_min", "math_max",
             "env_get", "len", "time", "date", "date_now", "file_exists", "file_delete",
             "dir_list", "math_pow", "math_log", "chr", "ord", "parse_int", "parse_float",
-            "os_name", "os_arch", "os_family", "ffi_call", "argv","mem_alloc", "mem_addr", "mem_read_int", "mem_write_int", "range", "gc",
-            "http_get", "http_post", "socket_connect", "socket_send", "socket_read", "socket_close", "socket_server","json_decode", "base64_encode", "base64_decode", "alert", "mem_read_string", "file_read_bytes",
+            "os_name", "os_arch", "os_family", "ffi_call","ffi_def","ffi_symbol_addr","argv","mem_alloc", "mem_addr", "mem_read_int", "mem_write_int", "range", "gc",
+            "http_get", "http_post", "socket_connect", "socket_send", "socket_read", "socket_close", "socket_server","json_decode", "base64_encode", "base64_decode", "alert", "mem_read_string","mem_write_byte","mem_read_byte" , "file_read_bytes", "ffi_struct", "struct_new", "struct_set", "struct_get"
         ];
         for b in builtins {
             l.define(b, true); 

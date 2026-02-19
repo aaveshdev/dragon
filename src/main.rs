@@ -9,8 +9,8 @@ use std::io::{Write, Read};
 use std::env;
 
 
-const DGN_VERSION: &str = "Dragon Programming Language v1.0.1";
-const DGN_BUILD: &str = "Build 2026-02-07"; 
+const DGN_VERSION: &str = "Dragon Programming Language v1.0.2";
+const DGN_BUILD: &str = "Build 2026-02-14"; 
 const DGN_AUTHOR: &str = "Aavesh Jilani";
 fn main() {
     let args: Vec<String> = env::args().collect();
