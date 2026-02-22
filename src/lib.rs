@@ -152,27 +152,6 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
         Ok(DgnValue::Null)
     })).unwrap();
 
-    // Valid JSON Encoding Helper
-    fn dgn_to_json(v: &DgnValue) -> serde_json::Value {
-        match v {
-            DgnValue::Null => serde_json::Value::Null,
-            DgnValue::Bool(b) => serde_json::Value::Bool(*b),
-            DgnValue::Number(n) => serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
-            DgnValue::String(s) => serde_json::Value::String(s.clone()),
-            DgnValue::List(l) => serde_json::Value::Array(l.lock().unwrap().iter().map(dgn_to_json).collect()),
-            DgnValue::Map(m) | DgnValue::Instance(m) => {
-                let mut map = serde_json::Map::new();
-                for (k, v) in m.lock().unwrap().iter() { map.insert(k.clone(), dgn_to_json(v)); }
-                serde_json::Value::Object(map)
-            },
-            _ => serde_json::Value::String(val_to_string(v)),
-        }
-    }
-
-    e.set("json_encode", native_fn(|args| {
-        let v = args.get(0).unwrap_or(&DgnValue::Null);
-        Ok(DgnValue::String(dgn_to_json(v).to_string()))
-    })).unwrap();
 
     // Render UI Logic
     e.set("render_ui", native_fn(|args| {
@@ -378,19 +357,33 @@ fn get_dll_path() -> Option<PathBuf> {
     None 
 }
 
+fn dgn_to_json_str(v: &DgnValue) -> String {
+    match v {
+        DgnValue::Null => "null".to_string(),
+        DgnValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+        DgnValue::Number(n) => n.to_string(),
+        DgnValue::String(s) => format!("\"{}\"", s.replace("\"", "\\\"")),
+        DgnValue::List(l) => {
+            let items: Vec<String> = l.lock().unwrap().iter().map(dgn_to_json_str).collect();
+            format!("[{}]", items.join(","))
+        },
+        DgnValue::Map(m) | DgnValue::Instance(m) => {
+            let items: Vec<String> = m.lock().unwrap().iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, dgn_to_json_str(v))).collect();
+            format!("{{{}}}", items.join(","))
+        },
+        _ => format!("\"{}\"", val_to_string(v).replace("\"", "\\\""))
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn Dragon_Init() -> c_int {
-    let path = match get_dll_path() { Some(p) => p, None => return -1 };
-    
-
-    let payload = match check_for_bundle(&path) {
-        Some(s) => s,
-        None => return -2 
+    let path = match get_dll_path() { 
+        Some(p) => p, 
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")) 
     };
 
     let env = GLOBAL_ENV.clone();
-    
 
     {
         let mut e = env.lock().unwrap();
@@ -399,9 +392,28 @@ pub extern "C" fn Dragon_Init() -> c_int {
     }
     populate_builtins(env.clone());
 
+    // 1. Try to load from an embedded bundle
+    let mut payload = check_for_bundle(&path);
 
-    let sources: HashMap<String, String> = serde_json::from_str(&payload).unwrap_or_else(|_| {
-        let mut m = HashMap::new(); m.insert("__entry__".to_string(), payload); m
+    // 2. FALLBACK: Try to load 'mylib.dgn' from the disk if not bundled
+    if payload.is_none() {
+        let fallback_path = path.parent().unwrap_or(&path).join("mylib.dgn");
+        if let Ok(content) = std::fs::read_to_string(&fallback_path) {
+            payload = Some(content);
+        } else if let Ok(content) = std::fs::read_to_string("mylib.dgn") {
+            // Try current working directory as a last resort
+            payload = Some(content);
+        } else {
+            return -2; // Initialization failed: No bundle and no mylib.dgn found
+        }
+    }
+
+    let payload_str = payload.unwrap();
+
+    let sources: HashMap<String, String> = serde_json::from_str(&payload_str).unwrap_or_else(|_| {
+        let mut m = HashMap::new(); 
+        m.insert("__entry__".to_string(), payload_str); 
+        m
     });
 
     let mut bundle_map = HashMap::new();
@@ -410,13 +422,20 @@ pub extern "C" fn Dragon_Init() -> c_int {
     }
     env.lock().unwrap().store.insert("__bundled_sources__".to_string(), DgnValue::Map(Arc::new(Mutex::new(bundle_map))));
 
+if let Some(entry_code) = sources.get("__entry__") {
+        let tokens = lex(entry_code);
+        let mut parser = Parser::new(tokens);
+        if let Ok(ast) = parser.parse() {
 
-    let entry_code = sources.get("__entry__").unwrap();
-    let tokens = lex(entry_code);
-    let mut parser = Parser::new(tokens);
-    if let Ok(ast) = parser.parse() {
-        if eval_stmt(&ast, env).is_err() { return -3; }
-    } else { return -4; }
+            if let StmtNode::Block(stmts) = ast.node {
+                for s in stmts {
+                    if eval_stmt(&s, env.clone()).is_err() { return -3; }
+                }
+            } else {
+                if eval_stmt(&ast, env.clone()).is_err() { return -3; }
+            }
+        } else { return -4; }
+    }
 
     *IS_INIT.lock().unwrap() = true;
     0
@@ -425,10 +444,25 @@ pub extern "C" fn Dragon_Init() -> c_int {
 
 #[no_mangle]
 pub extern "C" fn Dragon_Call(func_name: *const c_char, json_args: *const c_char) -> *mut c_char {
-    if !*IS_INIT.lock().unwrap() { return CString::new("Error: Not Initialized").unwrap().into_raw(); }
+    // 1. Null Pointer Protection (Prevents panics that cause 'null' returns)
+    if func_name.is_null() {
+        return CString::new("Error: func_name is a null pointer").unwrap().into_raw();
+    }
+    
+    // 2. Initialization Check
+    if !*IS_INIT.lock().unwrap() { 
+        return CString::new("Error: Not Initialized (Dragon_Init failed)").unwrap().into_raw(); 
+    }
 
     let name = unsafe { CStr::from_ptr(func_name).to_str().unwrap_or("") };
-    let args_str = unsafe { CStr::from_ptr(json_args).to_str().unwrap_or("[]") };
+    
+    // Allow empty arguments by defaulting to "[]" if null is passed
+    let args_str = if json_args.is_null() {
+        "[]"
+    } else {
+        unsafe { CStr::from_ptr(json_args).to_str().unwrap_or("[]") }
+    };
+
     let json_vals: Vec<serde_json::Value> = serde_json::from_str(args_str).unwrap_or_default();
 
     let mut dgn_args = Vec::new();
@@ -443,12 +477,12 @@ pub extern "C" fn Dragon_Call(func_name: *const c_char, json_args: *const c_char
     let env = GLOBAL_ENV.clone();
     let func = env.lock().unwrap().get(name);
 
-    if let Some(f) = func {
+if let Some(f) = func {
         match call_dgn_func(f, dgn_args) {
-            Ok(res) => CString::new(val_to_string(&res)).unwrap().into_raw(),
-            Err(e) => CString::new(format!("Error: {}", e.msg)).unwrap().into_raw(),
+            Ok(res) => CString::new(dgn_to_json_str(&res)).unwrap().into_raw(),
+            Err(e) => CString::new(format!("{{\"error\": \"{}\"}}", e.msg)).unwrap().into_raw(),
         }
     } else {
-        CString::new("Error: Function not found").unwrap().into_raw()
+        CString::new(format!("{{\"error\": \"Function '{}' not found\"}}", name)).unwrap().into_raw()
     }
 }

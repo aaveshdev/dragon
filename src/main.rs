@@ -7,12 +7,27 @@ use std::fs::{self, File,OpenOptions};
 use std::path::{Path, PathBuf};
 use std::io::{Write, Read};
 use std::env;
+use std::panic;
 
-
-const DGN_VERSION: &str = "Dragon Programming Language v1.0.2";
-const DGN_BUILD: &str = "Build 2026-02-14"; 
+const DGN_VERSION: &str = "Dragon Programming Language v1.0.3";
+const DGN_BUILD: &str = "Build 2026-02-20"; 
 const DGN_AUTHOR: &str = "Aavesh Jilani";
 fn main() {
+    panic::set_hook(Box::new(|info| {
+        println!("--------------------------------------------------");
+        println!("  DRAGON CRITICAL ERROR");
+        println!("--------------------------------------------------");
+        if let Some(s) = info.payload().downcast_ref::<&str>() {
+            println!("  Reason: {}", s);
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            println!("  Reason: {}", s);
+        } else {
+            println!("  An unhandled internal state error occurred.");
+        }
+        println!("--------------------------------------------------");
+        std::process::exit(1);
+    }));
+
     let args: Vec<String> = env::args().collect();
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("dragon"));
     if let Some(payload) = check_for_bundle(&exe_path) {
@@ -335,10 +350,36 @@ fn main() {
         return;
     }
 
-    let filename = command;
-    match fs::read_to_string(filename) {
+    let mut filename = command.to_string();
+
+    if command == "run" {
+        let pkg_path = Path::new("package.json");
+        if !pkg_path.exists() {
+            eprintln!("Error: 'package.json' not found. Are you inside a Dragon project?");
+            std::process::exit(1);
+        }
+
+        let pkg_data = fs::read_to_string(pkg_path).unwrap_or_else(|_| {
+            eprintln!("Error: Could not read 'package.json'.");
+            std::process::exit(1);
+        });
+
+        let pkg_json: serde_json::Value = serde_json::from_str(&pkg_data).unwrap_or_else(|_| {
+            eprintln!("Error: 'package.json' contains invalid JSON.");
+            std::process::exit(1);
+        });
+
+        if let Some(entry) = pkg_json.get("main").or_else(|| pkg_json.get("entry")).and_then(|v| v.as_str()) {
+            filename = entry.to_string();
+        } else {
+            eprintln!("Error: 'package.json' must contain a \"main\" field (e.g., \"main\": \"src/main.dgn\").");
+            std::process::exit(1);
+        }
+    }
+
+    match fs::read_to_string(&filename) {
         Ok(src) => {
-            let abs_path = fs::canonicalize(filename).unwrap_or(PathBuf::from(filename));
+            let abs_path = fs::canonicalize(&filename).unwrap_or(PathBuf::from(filename));
             let env = Arc::new(Mutex::new(Env::new(None, Some(abs_path))));
             env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
             populate_builtins(env.clone());

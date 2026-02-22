@@ -35,6 +35,21 @@ lazy_static! {
     static ref FFI_SIGNATURES: Mutex<HashMap<String, (String, Vec<String>)>> = Mutex::new(HashMap::new());
 
     static ref FFI_STRUCTS: Mutex<HashMap<String, FfiStructDef>> = Mutex::new(HashMap::new());
+
+    static ref TOKEN_REGEXES: Vec<(&'static str, Regex)> = vec![
+        ("INC", Regex::new(r"^\+\+").unwrap()), 
+        ("DEC", Regex::new(r"^--").unwrap()), 
+        ("COMMENT_ML", Regex::new(r"(?s)^/\*.*?\*/").unwrap()), 
+        ("COMMENT_SL", Regex::new(r"^//[^\n]*").unwrap()), 
+        ("HEX", Regex::new(r"^0x[0-9a-fA-F]+").unwrap()),
+        ("NUMBER", Regex::new(r"^[0-9]+(\.[0-9]+)?").unwrap()), 
+        ("STRING", Regex::new(r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)+'"#).unwrap()), 
+        ("NAME", Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*").unwrap()),
+        ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
+        ("NEWLINE", Regex::new(r"^\n").unwrap()),
+        ("SKIP", Regex::new(r"^[ \t\r\u{FEFF}\x00]+").unwrap()), 
+        ("MISMATCH", Regex::new(r"^.").unwrap()),
+    ];
 }
 
 
@@ -416,23 +431,6 @@ pub const KEYWORDS: &[&str] = &[
 
 pub fn lex(src: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
-  let token_spec = vec![
-        ("INC", r"^\+\+"), 
-        ("DEC", r"^--"), 
-        
-        ("COMMENT_ML", r"(?s)^/\*.*?\*/"), 
-        
-        ("COMMENT_SL", r"^//[^\n]*"), 
-        ("HEX", r"^0x[0-9a-fA-F]+"),
-        ("NUMBER", r"^[0-9]+(\.[0-9]+)?"), 
-        
-        ("STRING", r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)*'"#), 
-        ("NAME", r"^[A-Za-z_][A-Za-z0-9_]*"),
-        ("OP", r"^(==|!=|<=|>=|=>|<<|>>|[!+\-*/%<>=?:;,&|^~(){}\[\].])"),
-        ("NEWLINE", r"^\n"),
-        ("SKIP", r"^[ \t\r\u{FEFF}\x00]+"), 
-        ("MISMATCH", r"^."),
-    ];
     
     let mut pos = 0;
     let mut line = 1;
@@ -442,8 +440,7 @@ pub fn lex(src: &str) -> Vec<Token> {
         let remainder = &src[pos..];
         let mut matched = false;
 
-        for (name, pat) in &token_spec {
-            let re = Regex::new(pat).unwrap();
+        for (name, re) in TOKEN_REGEXES.iter() {
             if let Some(mat) = re.find(remainder) {
                 let val = mat.as_str();
                 let len = val.len();
@@ -530,6 +527,20 @@ impl Parser {
             &self.tokens[self.pos + offset]
         } else {
             &self.tokens[self.tokens.len() - 1]
+        }
+    }
+
+    fn is_lambda_start(&self) -> bool {
+        if self.current().value != "(" { return false; }
+        let mut i = 1;
+        loop {
+            let t = self.peek(i);
+            // Stop looking if we hit EOF, a newline, or a block start
+            if t.typ == TokenType::Eof || t.typ == TokenType::Newline || t.value == "{" { return false; }
+            if t.value == ")" {
+                return self.peek(i + 1).value == "=>";
+            }
+            i += 1;
         }
     }
 
@@ -1109,6 +1120,29 @@ impl Parser {
             TokenType::Name => { self.advance(); Ok(Expr { node: ExprNode::Var(t.value), line }) },
             TokenType::Op => {
                 if t.value == "(" {
+
+                    if self.is_lambda_start() {
+                        self.advance(); // consume '('
+                        let mut params = Vec::new();
+                        if self.current().value != ")" {
+                            loop {
+                                params.push(self.expect("NAME")?.value);
+                                if !self.match_token(",") { break; }
+                            }
+                        }
+                        self.expect(")")?;
+                        self.expect("=>")?;
+
+                        // Support both block bodies `() => { ... }` and expression bodies `() => expr`
+                        let body = if self.current().value == "{" {
+                            self.parse_block()?
+                        } else {
+                            let expr = self.parse_expr()?;
+                            Stmt { node: StmtNode::Return(Some(expr)), line: self.current().line }
+                        };
+                        return Ok(Expr { node: ExprNode::FuncExpr(params, Box::new(body)), line });
+                    }
+
                     self.advance();
                     let e = self.parse_expr()?;
                     self.expect(")")?;
@@ -1403,6 +1437,15 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             Ok(EvalResult::None)
         },
           StmtNode::Import(path, as_name) => {
+            let bind = as_name.clone().unwrap_or_else(|| {
+                 Path::new(&path).file_stem().unwrap().to_str().unwrap().to_string()
+                });
+
+                // --- NEW: Intercept Built-in Modules ---
+                if let Some(module_val) = get_builtin_module(path) {
+                    env.lock().unwrap().set(bind, module_val).map_err(|msg| DgnError::new(&msg, stmt.line))?;
+                    return Ok(EvalResult::None);
+                }
             let root = Env::get_root(env.clone());
             let bundled_src = {
                 let r = root.lock().unwrap();
@@ -1421,12 +1464,44 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                 (src, PathBuf::from(format!("bundle:///{}", path)))
             } else {
                 let current_dir = env.lock().unwrap().current_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-                let mut full_path = current_dir.join(path);
-                if full_path.extension().is_none() {
-                    full_path.set_extension("dgn");
+
+                let mut search_dirs = vec![
+                    current_dir.clone(),                 
+                    current_dir.join("dgn_modules"),     
+                ];
+                if let Ok(dp) = std::env::var("DRAGON_PATH") {
+                    for p in std::env::split_paths(&dp) { search_dirs.push(p); }
                 }
-                let canon = full_path.canonicalize()
-                    .map_err(|e| DgnError::new(&format!("Import not found: {:?} ({})", full_path, e), stmt.line))?;
+
+                let mut target_files = Vec::new();
+                let path_obj = Path::new(&path);
+
+                if path_obj.extension().is_some() {
+                    target_files.push(path_obj.to_path_buf());
+                } else {
+                    target_files.push(PathBuf::from(format!("{}.dgn", path))); 
+                    if let Some(name) = path_obj.file_name() {
+                        let n = name.to_string_lossy();
+                        target_files.push(PathBuf::from(&path).join(format!("{}.dgn", n))); 
+                        target_files.push(PathBuf::from(&path).join("index.dgn"));   
+                    }
+                }
+
+                let mut found_path = None;
+                for dir in &search_dirs {
+                    for target in &target_files {
+                        let candidate = dir.join(target);
+                        if candidate.exists() && candidate.is_file() {
+                            found_path = Some(candidate.canonicalize().unwrap_or(candidate));
+                            break;
+                        }
+                    }
+                    if found_path.is_some() { break; }
+                }
+
+                let canon = found_path.ok_or_else(|| {
+                    DgnError::new(&format!("Import not found: '{}'", path), stmt.line)
+                })?;
                 
                 let c = fs::read_to_string(&canon).map_err(|e| DgnError::new(&e.to_string(), stmt.line))?;
                 (c, canon)
@@ -1442,6 +1517,14 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             };
 
             let mod_val = if let Some(m) = cached_mod {
+                if let DgnValue::Class(mod_env) = &m {
+                    if mod_env.lock().unwrap().store.contains_key("__loading__") {
+                        return Err(DgnError::new(
+                            &format!("Cyclic import detected: '{}' is already loading.", path), 
+                            stmt.line
+                        ));
+                    }
+                }
                 m
             } else {
                 let tokens = lex(&code);
@@ -1451,6 +1534,8 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                 let mod_env = Arc::new(Mutex::new(Env::new(None, Some(new_env_path))));
                 populate_builtins(mod_env.clone());
                 
+                mod_env.lock().unwrap().store.insert("__loading__".to_string(), DgnValue::Bool(true));
+
                 let mod_val_placeholder = DgnValue::Class(mod_env.clone());
                 
                 {
@@ -1465,6 +1550,8 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                         eval_stmt(&s, mod_env.clone())?;
                     }
                 }
+                mod_env.lock().unwrap().store.remove("__loading__");
+
                 mod_val_placeholder
             };
 
@@ -1628,12 +1715,14 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
                 "==" => match (l, r) {
                     (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() < f64::EPSILON)),
                     (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a==b)),
+                    (DgnValue::Bool(a), DgnValue::Bool(b)) => Ok(DgnValue::Bool(a==b)),
                     (DgnValue::Null, DgnValue::Null) => Ok(DgnValue::Bool(true)),
                     _ => Ok(DgnValue::Bool(false)),
                 },
                 "!=" => match (l, r) { 
                     (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() >= f64::EPSILON)),
                     (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a!=b)),
+                    (DgnValue::Bool(a), DgnValue::Bool(b)) => Ok(DgnValue::Bool(a!=b)),
                     (DgnValue::Null, DgnValue::Null) => Ok(DgnValue::Bool(false)),
                     _ => Ok(DgnValue::Bool(true)),
                 },
@@ -2196,6 +2285,1103 @@ fn get_ffi_type_info(name: &str) -> Option<(Type, usize, usize)> {
     }
 }
 
+pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
+    match name {
+        "math" => {
+            let mut map = HashMap::new();
+            map.insert("sin".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.sin() } else { 0.0 }))));
+            map.insert("cos".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.cos() } else { 0.0 }))));
+            map.insert("sqrt".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.sqrt() } else { 0.0 }))));
+            map.insert("abs".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.abs() } else { 0.0 }))));
+            map.insert("floor".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.floor() } else { 0.0 }))));
+            map.insert("ceil".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.ceil() } else { 0.0 }))));
+            map.insert("round".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.round() } else { 0.0 }))));
+            map.insert("pow".to_string(), native_fn(|args| {
+                let base = if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 };
+                let exp = if let Some(DgnValue::Number(n)) = args.get(1) { *n } else { 1.0 };
+                Ok(DgnValue::Number(base.powf(exp)))
+            }));
+            map.insert("log".to_string(), native_fn(|args| {
+                let n = if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 };
+                Ok(DgnValue::Number(n.ln()))
+            }));
+            map.insert("min".to_string(), native_fn(|args| {
+                let mut min = std::f64::INFINITY;
+                for arg in args { if let DgnValue::Number(n) = arg { if n < min { min = n; } } }
+                Ok(DgnValue::Number(min))
+            }));
+            map.insert("max".to_string(), native_fn(|args| {
+                let mut max = std::f64::NEG_INFINITY;
+                for arg in args { if let DgnValue::Number(n) = arg { if n > max { max = n; } } }
+                Ok(DgnValue::Number(max))
+            }));
+
+             map.insert("range".to_string(), native_fn(|args| {
+                let (start, stop, step) = match args.len() {
+                    1 => (0.0, args[0].as_number().unwrap_or(0.0), 1.0),
+                    2 => (args[0].as_number().unwrap_or(0.0), args[1].as_number().unwrap_or(0.0), 1.0),
+                    3 => (args[0].as_number().unwrap_or(0.0), args[1].as_number().unwrap_or(0.0), args[2].as_number().unwrap_or(1.0)),
+                    _ => return Err(DgnError::new("range() expects 1 to 3 arguments", 0)),
+                };
+
+                let mut nums = Vec::new();
+                let mut curr = start;
+
+                if step > 0.0 {
+                    while curr < stop {
+                        nums.push(DgnValue::Number(curr));
+                        curr += step;
+                    }
+                } else if step < 0.0 {
+                    while curr > stop {
+                        nums.push(DgnValue::Number(curr));
+                        curr += step;
+                    }
+                }
+
+                Ok(DgnValue::List(Arc::new(Mutex::new(nums))))
+            }));
+            map.insert("random".to_string(), native_fn(|_| Ok(DgnValue::Number(rand::random::<f64>()))));
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "json" => {
+            let mut map = HashMap::new();
+            fn dgn_to_json(v: &DgnValue) -> serde_json::Value {
+                match v {
+                    DgnValue::Null => serde_json::Value::Null,
+                    DgnValue::Bool(b) => serde_json::Value::Bool(*b),
+                    DgnValue::Number(n) => serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+                    DgnValue::String(s) => serde_json::Value::String(s.clone()),
+                    DgnValue::List(l) => serde_json::Value::Array(l.lock().unwrap().iter().map(dgn_to_json).collect()),
+                    DgnValue::Map(m) | DgnValue::Instance(m) => {
+                        let mut map = serde_json::Map::new();
+                        for (k, v) in m.lock().unwrap().iter() { map.insert(k.clone(), dgn_to_json(v)); }
+                        serde_json::Value::Object(map)
+                    },
+                    _ => serde_json::Value::String(val_to_string(v)),
+                }
+            }
+
+            map.insert("encode".to_string(), native_fn(|args| {
+                let v = args.get(0).unwrap_or(&DgnValue::Null);
+                Ok(DgnValue::String(dgn_to_json(v).to_string()))
+            }));
+
+            map.insert("decode".to_string(), native_fn(|args| {
+                let json_str = args.get(0).map(val_to_string).unwrap_or_default();
+                fn json_to_dgn(v: serde_json::Value) -> DgnValue {
+                    match v {
+                        serde_json::Value::Null => DgnValue::Null,
+                        serde_json::Value::Bool(b) => DgnValue::Bool(b),
+                        serde_json::Value::Number(n) => DgnValue::Number(n.as_f64().unwrap_or(0.0)),
+                        serde_json::Value::String(s) => DgnValue::String(s),
+                        serde_json::Value::Array(arr) => DgnValue::List(Arc::new(Mutex::new(arr.into_iter().map(json_to_dgn).collect()))),
+                        serde_json::Value::Object(m) => {
+                            let mut dgn_map = HashMap::new();
+                            for (k, v) in m { dgn_map.insert(k, json_to_dgn(v)); }
+                            DgnValue::Map(Arc::new(Mutex::new(dgn_map)))
+                        }
+                    }
+                }
+                match serde_json::from_str(&json_str) {
+                    Ok(val) => Ok(json_to_dgn(val)),
+                    Err(_) => Ok(DgnValue::Null)
+                }
+            }));
+            
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "base64" => {
+            let mut map = HashMap::new();
+            map.insert("encode".to_string(), native_fn(|args| {
+                use base64::{Engine as _, engine::general_purpose};
+                let s = args.get(0).map(val_to_string).unwrap_or_default();
+                Ok(DgnValue::String(general_purpose::STANDARD.encode(s)))
+            }));
+            map.insert("decode".to_string(), native_fn(|args| {
+                use base64::{Engine as _, engine::general_purpose};
+                let s = args.get(0).map(val_to_string).unwrap_or_default();
+                match general_purpose::STANDARD.decode(s) {
+                    Ok(bytes) => Ok(DgnValue::String(String::from_utf8_lossy(&bytes).to_string())),
+                    Err(_) => Ok(DgnValue::Null)
+                }
+            }));
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "file" => {
+            let mut map = HashMap::new();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                map.insert("read_all".to_string(), native_fn(|a| {
+                    let p = if let Some(DgnValue::String(s)) = a.get(0) { s } else { return Err(DgnError::new("File path required",0)) };
+                    match fs::read_to_string(p) { Ok(c) => Ok(DgnValue::String(c)), Err(_) => Ok(DgnValue::Null) }
+                }));
+                map.insert("read_bytes".to_string(), native_fn(|a| {
+                    let p = if let Some(DgnValue::String(s)) = a.get(0) { s } else { return Err(DgnError::new("File path required",0)) };
+                    match fs::read(p) { Ok(c) => Ok(DgnValue::ByteArray(Arc::new(Mutex::new(c)))), Err(_) => Ok(DgnValue::Null) }
+                }));
+                map.insert("write".to_string(), native_fn(|a| {
+                    let p = if let Some(DgnValue::String(s)) = a.get(0) { s } else { return Err(DgnError::new("Path required",0)) };
+                    let c = if let Some(DgnValue::String(s)) = a.get(1) { s } else { "" };
+                    Ok(DgnValue::Bool(fs::write(p, c).is_ok()))
+                }));
+                map.insert("exists".to_string(), native_fn(|args| {
+                    let path = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(Path::new(&path).exists()))
+                }));
+                map.insert("delete".to_string(), native_fn(|args| {
+                    let path = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(fs::remove_file(path).is_ok()))
+                }));
+
+                map.insert("append".to_string(), native_fn(|args| {
+                    let p = if let Some(DgnValue::String(s)) = args.get(0) { s } else { return Err(DgnError::new("Path required", 0)) };
+                    let c = if let Some(DgnValue::String(s)) = args.get(1) { s } else { "" };
+                    let res = std::fs::OpenOptions::new().create(true).append(true).open(p)
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, c.as_bytes()));
+                    Ok(DgnValue::Bool(res.is_ok()))
+                }));
+                
+                map.insert("mkdir".to_string(), native_fn(|args| {
+                    let p = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(std::fs::create_dir_all(p).is_ok()))
+                }));
+                
+                map.insert("rmdir".to_string(), native_fn(|args| {
+                    let p = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(std::fs::remove_dir_all(p).is_ok()))
+                }));
+                
+                map.insert("rename".to_string(), native_fn(|args| {
+                    let from = args.get(0).map(val_to_string).unwrap_or_default();
+                    let to = args.get(1).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(std::fs::rename(from, to).is_ok()))
+                }));
+                
+                map.insert("size".to_string(), native_fn(|args| {
+                    let p = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Number(std::fs::metadata(p).map(|m| m.len() as f64).unwrap_or(-1.0)))
+                }));
+                
+                map.insert("is_dir".to_string(), native_fn(|args| {
+                    let p = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)))
+                }));
+            }
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "uuid" => {
+            let mut map = HashMap::new();
+            map.insert("v4".to_string(), native_fn(|_| {
+                let u1: u32 = rand::random();
+                let u2: u32 = rand::random();
+                let u3: u32 = rand::random();
+                let u4: u32 = rand::random();
+                let uuid = format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                    u1,
+                    (u2 >> 16) as u16,
+                    (u2 & 0xFFF) as u16,
+                    ((u3 >> 16) & 0x3FFF | 0x8000) as u16,
+                    (((u3 & 0xFFFF) as u64) << 32) | (u4 as u64)
+                );
+                Ok(DgnValue::String(uuid))
+            }));
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "os" => {
+            let mut map = HashMap::new();
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+            {
+                map.insert("name".to_string(), native_fn(|_| Ok(DgnValue::String(std::env::consts::OS.to_string()))));
+                map.insert("arch".to_string(), native_fn(|_| Ok(DgnValue::String(std::env::consts::ARCH.to_string()))));
+                map.insert("family".to_string(), native_fn(|_| Ok(DgnValue::String(std::env::consts::FAMILY.to_string()))));
+                map.insert("system".to_string(), native_fn(|args| {
+                    let cmd = if let Some(DgnValue::String(s)) = args.get(0) { s } else { "" };
+                    if cfg!(target_os = "windows") {
+                        Command::new("cmd").args(["/C", cmd]).status().map(|s| DgnValue::Number(s.code().unwrap_or(0) as f64)).map_err(|e| DgnError::new(&e.to_string(),0))
+                    } else {
+                        Command::new("sh").args(["-c", cmd]).status().map(|s| DgnValue::Number(s.code().unwrap_or(0) as f64)).map_err(|e| DgnError::new(&e.to_string(),0))
+                    }
+                }));
+                map.insert("setenv".to_string(), native_fn(|args| {
+                    let k = args.get(0).map(val_to_string).unwrap_or_default();
+                    let v = args.get(1).map(val_to_string).unwrap_or_default();
+                    std::env::set_var(k, v);
+                    Ok(DgnValue::Null)
+                }));
+                
+                map.insert("cwd".to_string(), native_fn(|_| {
+                    match std::env::current_dir() {
+                        Ok(path) => Ok(DgnValue::String(path.to_string_lossy().into_owned())),
+                        Err(_) => Ok(DgnValue::Null)
+                    }
+                }));
+                
+                map.insert("chdir".to_string(), native_fn(|args| {
+                    let path = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(std::env::set_current_dir(path).is_ok()))
+                }));
+                    map.insert("listdir".to_string(), native_fn(|args| {
+                        let path = args.get(0).map(val_to_string).unwrap_or_default();
+                    let mut files = Vec::new();
+                    if let Ok(entries) = fs::read_dir(path) {
+                        for entry in entries {
+                            if let Ok(e) = entry { if let Ok(name) = e.file_name().into_string() { files.push(DgnValue::String(name)); } }
+                        }
+                    }
+                    Ok(DgnValue::List(Arc::new(Mutex::new(files))))
+                }));
+            }
+            #[cfg(target_arch = "wasm32")]
+            { map.insert("name".to_string(), native_fn(|_| Ok(DgnValue::String("web-wasm".into())))); }
+            map.insert("getenv".to_string(), native_fn(|args| {
+                if let Some(DgnValue::String(k)) = args.get(0) { Ok(DgnValue::String(env::var(k).unwrap_or_default())) } else { Ok(DgnValue::Null) }
+            }));
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "path" => {
+            let mut map = HashMap::new();
+            
+            // Joins multiple path segments using the OS-specific separator
+            map.insert("join".to_string(), native_fn(|args| {
+                let mut path = std::path::PathBuf::new();
+                for arg in args {
+                    path.push(val_to_string(&arg));
+                }
+                Ok(DgnValue::String(path.to_string_lossy().into_owned()))
+            }));
+
+            // Gets the final component of a path (e.g., "file.txt" from "/dir/file.txt")
+            map.insert("basename".to_string(), native_fn(|args| {
+                let p = args.get(0).map(val_to_string).unwrap_or_default();
+                let name = std::path::Path::new(&p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Ok(DgnValue::String(name))
+            }));
+
+            // Gets the directory portion of a path (e.g., "/dir" from "/dir/file.txt")
+            map.insert("dirname".to_string(), native_fn(|args| {
+                let p = args.get(0).map(val_to_string).unwrap_or_default();
+                let dir = std::path::Path::new(&p)
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Ok(DgnValue::String(dir))
+            }));
+
+            // Gets the extension of a file path (e.g., ".txt" from "file.txt")
+            map.insert("extname".to_string(), native_fn(|args| {
+                let p = args.get(0).map(val_to_string).unwrap_or_default();
+                let ext = std::path::Path::new(&p)
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+                Ok(DgnValue::String(ext))
+            }));
+
+            // Checks if a path is absolute
+            map.insert("is_absolute".to_string(), native_fn(|args| {
+                let p = args.get(0).map(val_to_string).unwrap_or_default();
+                Ok(DgnValue::Bool(std::path::Path::new(&p).is_absolute()))
+            }));
+
+            // Resolves a path to its absolute, normalized format (resolving symlinks and '..')
+            #[cfg(not(target_arch = "wasm32"))]
+            map.insert("resolve".to_string(), native_fn(|args| {
+                let p = args.get(0).map(val_to_string).unwrap_or_default();
+                match std::fs::canonicalize(&p) {
+                    Ok(canon) => Ok(DgnValue::String(canon.to_string_lossy().into_owned())),
+                    Err(_) => Ok(DgnValue::Null) 
+                }
+            }));
+
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "time" =>{
+             let mut map = HashMap::new();
+            map.insert("now".to_string(), native_fn(|_| { Ok(DgnValue::Number(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64())) }));
+            map.insert("unix".to_string(), native_fn(|_| {
+                    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                    Ok(DgnValue::Number(t))
+                }));
+            map.insert("date".to_string(), native_fn(|args| {
+                let now = std::time::SystemTime::now();
+                let elapsed = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                
+                let days = elapsed / 86400;
+                let year = 1970 + (days / 365); 
+                
+                let mut map1 = HashMap::new();
+                map1.insert("timestamp".to_string(), DgnValue::Number(elapsed as f64));
+                map1.insert("approx_year".to_string(), DgnValue::Number(year as f64));
+                
+                Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+            }));
+
+            map.insert("date_now".to_string(), native_fn(|_| {
+                let now: DateTime<Local> = Local::now();
+                let mut map1 = HashMap::new();
+                map1.insert("year".to_string(), DgnValue::Number(now.year() as f64));
+                map1.insert("month".to_string(), DgnValue::Number(now.month() as f64));
+                map1.insert("day".to_string(), DgnValue::Number(now.day() as f64));
+                map1.insert("hour".to_string(), DgnValue::Number(now.hour() as f64));
+                map1.insert("minute".to_string(), DgnValue::Number(now.minute() as f64));
+                map1.insert("second".to_string(), DgnValue::Number(now.second() as f64));
+                map1.insert("str".to_string(), DgnValue::String(now.format("%Y-%m-%d %H:%M:%S").to_string()));
+                Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+            }));
+
+            map.insert("sleep_ms".to_string(), native_fn(|args| {
+                let ms = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u64 } else { 0 };
+                thread::sleep(Duration::from_millis(ms));
+                Ok(DgnValue::Null)
+            }));
+            
+              Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "net" =>{
+            let mut map = HashMap::new();
+              map.insert("http_get".to_string(), native_fn(|args| {
+                    let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
+                    
+                    match ureq::get(&url).call() {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let text = resp.into_string().unwrap_or_default();
+                            
+                            let mut map1 = HashMap::new();
+                            map1.insert("status".to_string(), DgnValue::Number(status as f64));
+                            map1.insert("body".to_string(), DgnValue::String(text));
+                            Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                        },
+                        Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
+                    }
+                }));
+
+
+               map.insert("http_post".to_string(), native_fn(|args| {
+                    let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
+                    let body = args.get(1).map(val_to_string).unwrap_or_default();
+                    
+                    let mut req = ureq::post(&url);
+
+                    if let Some(DgnValue::Map(headers)) = args.get(2) {
+                        for (k, v) in headers.lock().unwrap().iter() {
+                            req = req.set(k, &val_to_string(v));
+                        }
+                    }
+
+                    match req.send_string(&body) {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let text = resp.into_string().unwrap_or_default();
+                            let mut map1 = HashMap::new();
+                            map1.insert("status".to_string(), DgnValue::Number(status as f64));
+                            map1.insert("body".to_string(), DgnValue::String(text));
+                            Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                        },
+                        Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
+                    }
+                }));
+
+         #[cfg(not(target_arch = "wasm32"))]
+        {
+                map.insert("socket_connect".to_string(), native_fn(|args| {
+                    let addr = args.get(0).map(val_to_string).ok_or(DgnError::new("Address required", 0))?;
+                    match TcpStream::connect(&addr) {
+                        Ok(stream) => Ok(DgnValue::Socket(Arc::new(Mutex::new(stream)))),
+                        Err(e) => Err(DgnError::new(&format!("Connection failed: {}", e), 0))
+                    }
+                }));
+
+                map.insert("socket_send".to_string(), native_fn(|args| {
+                    if let Some(DgnValue::Socket(s)) = args.get(0) {
+                        let msg = args.get(1).map(val_to_string).unwrap_or_default();
+                        let mut stream = s.lock().unwrap();
+                        match stream.write_all(msg.as_bytes()) {
+                            Ok(_) => Ok(DgnValue::Bool(true)),
+                            Err(_) => Ok(DgnValue::Bool(false))
+                        }
+                    } else {
+                        Err(DgnError::new("Socket required", 0))
+                    }
+                }));
+
+                map.insert("socket_read".to_string(), native_fn(|args| {
+                    if let Some(DgnValue::Socket(s)) = args.get(0) {
+                        let mut stream = s.lock().unwrap();
+                        let mut reader = BufReader::new(&*stream);
+                        let mut buffer = String::new();
+                        match reader.read_line(&mut buffer) {
+                            Ok(_) => Ok(DgnValue::String(buffer)),
+                            Err(_) => Ok(DgnValue::Null)
+                        }
+                    } else {
+                        Err(DgnError::new("Socket required", 0))
+                    }
+                }));
+                
+                map.insert("socket_close".to_string(), native_fn(|args| {
+                    if let Some(DgnValue::Socket(s)) = args.get(0) {
+                        let _ = s.lock().unwrap().shutdown(Shutdown::Both);
+                        Ok(DgnValue::Bool(true))
+                    } else { Ok(DgnValue::Bool(false)) }
+                }));
+
+                map.insert("socket_server".to_string(), native_fn(|args| {
+                    let port = args.get(0).and_then(|v| v.as_number()).unwrap_or(8080.0) as u16;
+                    let handler = args.get(1).cloned().ok_or(DgnError::new("Handler function required", 0))?;
+                    
+                    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+                        .map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                        
+                    thread::spawn(move || {
+                        for stream in listener.incoming() {
+                            if let Ok(s) = stream {
+                                let client_socket = DgnValue::Socket(Arc::new(Mutex::new(s)));
+                                let _ = call_dgn_func(handler.clone(), vec![client_socket]);
+                            }
+                        }
+                    });
+
+                    Ok(DgnValue::Bool(true))
+                }));
+
+                    map.insert("start_http_server".to_string(), native_fn(|args| {
+                    let port = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u16 } else { 8080 };
+                    let handler = args.get(1).cloned().ok_or(DgnError::new("Handler required", 0))?;
+                    
+                    thread::spawn(move || {
+                        let server = match Server::http(format!("0.0.0.0:{}", port)) {
+                            Ok(s) => s,
+                            Err(e) => { println!("Failed to start server: {}", e); return; }
+                        };
+                        
+                        for mut request in server.incoming_requests() {
+                            let method = request.method().to_string();
+                            let url = request.url().to_string();
+                            let mut content = String::new();
+                            request.as_reader().read_to_string(&mut content).unwrap_or(0);
+                            
+                            let headers_map = Arc::new(Mutex::new(HashMap::new()));
+                            for h in request.headers() {
+                                headers_map.lock().unwrap().insert(h.field.to_string(), DgnValue::String(h.value.to_string()));
+                            }
+
+                            let query_map = Arc::new(Mutex::new(HashMap::new()));
+                            if let Some(pos) = url.find('?') {
+                                for pair in url[pos+1..].split('&') {
+                                    let mut parts = pair.split('=');
+                                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                                        query_map.lock().unwrap().insert(k.to_string(), DgnValue::String(v.to_string()));
+                                    }
+                                }
+                            }
+
+                            let req_obj = DgnValue::Map(Arc::new(Mutex::new(HashMap::from([
+                                ("method".to_string(), DgnValue::String(method)),
+                                ("path".to_string(), DgnValue::String(url)), 
+                                ("body".to_string(), DgnValue::String(content)),
+                                ("headers".to_string(), DgnValue::Map(headers_map)),
+                                ("query".to_string(), DgnValue::Map(query_map)),
+                            ]))));
+                            
+                            let req_handle = Arc::new(Mutex::new(Some(request)));
+                            let res_map = Arc::new(Mutex::new(HashMap::new()));
+                            
+                            let rh = req_handle.clone();
+                            res_map.lock().unwrap().insert("send".into(), native_method(rh, move |rh, args| {
+                                let body = val_to_string(args.get(0).unwrap_or(&DgnValue::String("".into())));
+                                let status = if let Some(DgnValue::Number(n)) = args.get(1) { *n as u16 } else { 200 };
+                                let headers_arg = args.get(2).cloned();
+
+                                if let Some(req) = rh.lock().unwrap().take() {
+                                    let mut response = Response::from_string(body).with_status_code(status);
+                                    
+                                    if let Some(DgnValue::Map(hm)) = headers_arg {
+                                        for (k, v) in hm.lock().unwrap().iter() {
+                                            if let Ok(h) = Header::from_bytes(k.as_bytes(), val_to_string(v).as_bytes()) {
+                                                response.add_header(h);
+                                            }
+                                        }
+                                    }
+
+                                    let _ = req.respond(response);
+                                }
+                                Ok(DgnValue::Null)
+                            }));
+
+                            let _ = call_dgn_func(handler.clone(), vec![req_obj, DgnValue::Map(res_map)]);
+                        }
+                    });
+                    Ok(DgnValue::Bool(true))
+                }));
+             }
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        
+        "ffi" => {
+            let mut map = HashMap::new();
+            #[cfg(not(target_arch = "wasm32"))]
+    {
+            map.insert("loadlib".to_string(), native_fn(|args| {
+                let path = if let Some(DgnValue::String(s)) = args.get(0) { s } else { return Err(DgnError::new("Path req", 0)) };
+                unsafe {
+                    let lib = Library::new(path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    
+                    let mut map1 = HashMap::new();
+                    map1.insert("path".to_string(), DgnValue::String(path.clone()));
+                    map1.insert("ptr".to_string(), DgnValue::NativeLib(Arc::new(Mutex::new(lib))));
+                    
+                    Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                }
+            }));
+            
+            map.insert("def".to_string(), native_fn(|args| {
+                if args.len() < 4 { return Err(DgnError::new("Usage: ffi_def(lib, name, ret_type, [arg_types])", 0)); }
+                
+                let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib Object",0)); };
+                let lib_path = val_to_string(lib_map.get("path").unwrap());
+                
+                let func_name = val_to_string(&args[1]);
+                let ret_type = val_to_string(&args[2]);
+                
+                let arg_types_list = if let DgnValue::List(l) = &args[3] { l.lock().unwrap().clone() } else { vec![] };
+                let arg_types: Vec<String> = arg_types_list.iter().map(val_to_string).collect();
+
+                // Store in the global registry
+                let key = format!("{}::{}", lib_path, func_name);
+                FFI_SIGNATURES.lock().unwrap().insert(key, (ret_type, arg_types));
+                
+                Ok(DgnValue::Null)
+            }));
+            
+           map.insert("loadlib_call".to_string(), native_fn(|args| {
+                if args.len() < 2 { return Err(DgnError::new("loadlib_call(lib, symbol, args_json)", 0)); }
+                
+                let lib_val = &args[0];
+                let symbol_name = val_to_string(&args[1]);
+                let input_arg = val_to_string(args.get(2).unwrap_or(&DgnValue::String("".to_string())));
+
+                if let DgnValue::NativeLib(lib) = lib_val {
+                    let l = lib.lock().unwrap();
+                    unsafe {
+                        type DragonFunc = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+                        let func: Symbol<DragonFunc> = l.get(symbol_name.as_bytes()).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                        
+                        let c_input = CString::new(input_arg).unwrap();
+                        let c_result = func(c_input.as_ptr());
+                        
+                        if c_result.is_null() {
+                            return Ok(DgnValue::Null);
+                        }
+                        
+                        let res_str = CStr::from_ptr(c_result).to_string_lossy().into_owned();
+                        Ok(DgnValue::String(res_str))
+                    }
+                } else {
+                    Err(DgnError::new("First arg must be NativeLib", 0))
+                }
+            }));
+             
+              map.insert("symbol_addr".to_string(), native_fn(|args| {
+                // 1. Get Library
+                let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib",0)); };
+                let lib_arc = if let DgnValue::NativeLib(l) = lib_map.get("ptr").unwrap() { l } else { return Err(DgnError::new("Invalid Lib Ptr",0)); };
+                
+                // 2. Get Symbol Name
+                let func_name = val_to_string(&args[1]);
+                
+                // 3. Return Address
+                let l = lib_arc.lock().unwrap();
+                unsafe {
+                    // We cast the symbol to a generic pointer, then to usize (number)
+                    let symbol: Symbol<*const c_void> = l.get(func_name.as_bytes())
+                        .map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    Ok(DgnValue::Number(*symbol as usize as f64))
+                }
+            }));
+
+            map.insert("call".to_string(), native_fn(|args| {
+                    if args.len() < 2 { return Err(DgnError::new("Usage: ffi_call(lib, name, ...args)", 0)); }
+
+                    let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib",0)); };
+                    let lib_path = val_to_string(lib_map.get("path").unwrap());
+                    let lib_arc = if let DgnValue::NativeLib(l) = lib_map.get("ptr").unwrap() { l } else { return Err(DgnError::new("Invalid Lib Ptr",0)); };
+                    
+                    let func_name = val_to_string(&args[1]);
+                    let call_args_values = &args[2..];
+
+                    let key = format!("{}::{}", lib_path, func_name);
+                    let sig_guard = FFI_SIGNATURES.lock().unwrap();
+                    let (ret_type_str, arg_types_str) = sig_guard.get(&key)
+                        .ok_or(DgnError::new(&format!("No signature for '{}'. Call ffi_def() first.", func_name), 0))?;
+
+                    // 1. Prepare Types
+                    let mut arg_types: Vec<Type> = Vec::new();
+                    for t in arg_types_str {
+                        match t.as_str() {
+                            "int" | "i32" => arg_types.push(Type::i32()),
+                            "long" | "i64" => arg_types.push(Type::i64()),
+                            "float" | "f32" => arg_types.push(Type::f32()),
+                            "double" | "f64" => arg_types.push(Type::f64()),
+                            "pointer" | "void*" => arg_types.push(Type::pointer()),
+                            "string" | "char*" => arg_types.push(Type::pointer()),
+                            "bool" => arg_types.push(Type::u8()),
+                            "void" => {}, 
+                            name => {
+                                // NEW: Check if it is a registered C-Struct
+                                if let Some(def) = FFI_STRUCTS.lock().unwrap().get(name) {
+                                    // We clone the pre-calculated LibFFI Type::structure
+                                    arg_types.push(def.libffi_type.clone());
+                                } else {
+                                    return Err(DgnError::new(&format!("Unknown FFI type: {}", name), 0));
+                                }
+                            }
+                        }
+                    }
+
+                    let ret_type = match ret_type_str.as_str() {
+                        "void" => Type::void(),
+                        "int" | "i32" => Type::i32(),
+                        "long" | "i64" => Type::i64(),
+                        "float" | "f32" => Type::f32(),
+                        "double" | "f64" => Type::f64(),
+                        "pointer" | "void*" => Type::pointer(),
+                        "bool" => Type::u8(),
+                        _ => return Err(DgnError::new("Unknown return type", 0))
+                    };
+
+                    // FIX: Use into_iter() to satisfy Cif::new requirements
+                    let cif = Cif::new(arg_types.into_iter(), ret_type.clone());
+                    
+                    let l = lib_arc.lock().unwrap();
+                    let code_ptr: CodePtr = unsafe {
+                        let symbol: Symbol<*mut c_void> = l.get(func_name.as_bytes())
+                            .map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                        CodePtr::from_ptr(*symbol)
+                    };
+
+                    // 2. Prepare Values safely
+                    // We use an enum to keep the converted data alive during the call
+                    enum FfiValue {
+                        I32(i32), I64(i64),
+                        F32(f32), F64(f64),
+                        Ptr(usize), U8(u8),
+                        Struct(Vec<u8>),
+                    }
+
+                    let mut values = Vec::new();
+                    let mut keep_alive_strs: Vec<CString> = Vec::new();
+
+                    for (i, val) in call_args_values.iter().enumerate() {
+                        let t_str = arg_types_str.get(i).map(|s| s.as_str()).unwrap_or("int");
+                        match t_str {
+                            "int" | "i32" => values.push(FfiValue::I32(val.as_number().unwrap_or(0.0) as i32)),
+                            "long" | "i64" => values.push(FfiValue::I64(val.as_number().unwrap_or(0.0) as i64)),
+                            "float" | "f32" => values.push(FfiValue::F32(val.as_number().unwrap_or(0.0) as f32)),
+                            "double" | "f64" => values.push(FfiValue::F64(val.as_number().unwrap_or(0.0) as f64)),
+                            "pointer" | "void*" => values.push(FfiValue::Ptr(val.as_number().unwrap_or(0.0) as usize)),
+                            "string" | "char*" => {
+                                let s = val_to_string(val);
+                                let c_str = CString::new(s).unwrap_or_default();
+                                let ptr = c_str.as_ptr() as usize;
+                                keep_alive_strs.push(c_str); 
+                                values.push(FfiValue::Ptr(ptr));
+                            },
+                            "bool" => values.push(FfiValue::U8(if is_truthy(val) { 1 } else { 0 })),
+                        name => {
+                                if FFI_STRUCTS.lock().unwrap().contains_key(name) {
+                                    if let DgnValue::Map(m) = val {
+                                        let m = m.lock().unwrap();
+                                        if let Some(DgnValue::ByteArray(b)) = m.get("__bytes__") {
+                                            // COPY the bytes into our FfiValue holder
+                                            let data = b.lock().unwrap().clone();
+                                            values.push(FfiValue::Struct(data));
+                                        } else {
+                                            // Fallback: empty struct
+                                            values.push(FfiValue::Struct(vec![])); 
+                                        }
+                                    } else {
+                                        values.push(FfiValue::I32(0)); // Error fallback
+                                    }
+                                } else {
+                                    values.push(FfiValue::I32(0));
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Create LibFFI Arguments
+                    // Arg::new() borrows the value from our 'values' vector
+                    let mut libffi_args = Vec::new();
+                    for v in &values {
+                        match v {
+                            FfiValue::I32(x) => libffi_args.push(Arg::new(x)),
+                            FfiValue::I64(x) => libffi_args.push(Arg::new(x)),
+                            FfiValue::F32(x) => libffi_args.push(Arg::new(x)),
+                            FfiValue::F64(x) => libffi_args.push(Arg::new(x)),
+                            FfiValue::Ptr(x) => libffi_args.push(Arg::new(x)),
+                            FfiValue::U8(x) => libffi_args.push(Arg::new(x)),
+                            FfiValue::Struct(data) => {
+                                if data.is_empty() {
+                                    // Edge case handling
+                                    static EMPTY: u8 = 0;
+                                    libffi_args.push(Arg::new(&EMPTY));
+                                } else {
+                                    libffi_args.push(Arg::new(&data[0]));
+                                }
+                            }
+                        }
+                    }
+
+                    // 4. Execute Call
+                    unsafe {
+                        match ret_type_str.as_str() {
+                            "void" => {
+                                cif.call::<()>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Null)
+                            },
+                            "int" | "i32" => {
+                                let res = cif.call::<i32>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Number(res as f64))
+                            },
+                            "long" | "i64" => {
+                                let res = cif.call::<i64>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Number(res as f64))
+                            },
+                            "float" | "f32" => {
+                                let res = cif.call::<f32>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Number(res as f64))
+                            },
+                            "double" | "f64" => {
+                                let res = cif.call::<f64>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Number(res))
+                            },
+                            "pointer" | "void*" => {
+                                let res = cif.call::<usize>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Number(res as f64))
+                            },
+                            "bool" => {
+                                let res = cif.call::<u8>(code_ptr, &libffi_args);
+                                Ok(DgnValue::Bool(res != 0))
+                            },
+                            _ => Ok(DgnValue::Null)
+                        }
+                    }
+                }));
+            }
+             Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+        "struct" => {
+               let mut map = HashMap::new();
+
+           #[cfg(not(target_arch = "wasm32"))]
+        {    
+                map.insert("def".to_string(), native_fn(|args| {
+                    let name = val_to_string(args.get(0).unwrap());
+                    let fields_list = if let DgnValue::List(l) = args.get(1).unwrap() { l.lock().unwrap().clone() } else { return Err(DgnError::new("Fields must be a list", 0)); };
+
+                    let mut offset = 0;
+                    let mut max_align = 1;
+                    let mut struct_fields = Vec::new();
+                    let mut field_types = Vec::new();
+
+                    for field in fields_list {
+                        if let DgnValue::List(def) = field {
+                            let def = def.lock().unwrap();
+                            let type_name = val_to_string(&def[0]);
+                            let field_name = val_to_string(&def[1]);
+
+                            let (ffi_type, size, align) = get_ffi_type_info(&type_name)
+                                .ok_or(DgnError::new(&format!("Unknown type: {}", type_name), 0))?;
+
+                            // 1. Add Padding for Alignment
+                            let padding = (align - (offset % align)) % align;
+                            offset += padding;
+
+                            // 2. Store Field
+                            struct_fields.push((field_name, offset, ffi_type.clone()));
+                            field_types.push(ffi_type);
+
+                            // 3. Advance Offset
+                            offset += size;
+                            if align > max_align { max_align = align; }
+                        }
+                    }
+
+                    // 4. Final Padding (Structure size must be multiple of largest alignment)
+                    let final_padding = (max_align - (offset % max_align)) % max_align;
+                    let total_size = offset + final_padding;
+
+                    // 5. Create LibFFI Structure Type
+                    let struct_type = Type::structure(field_types);
+
+                    let def = FfiStructDef {
+                        size: total_size,
+                        fields: struct_fields,
+                        libffi_type: struct_type,
+                    };
+
+                    FFI_STRUCTS.lock().unwrap().insert(name, def);
+                    Ok(DgnValue::Number(total_size as f64))
+                }));
+
+
+                map.insert("create".to_string(), native_fn(|args| {
+                    let name = val_to_string(args.get(0).unwrap());
+                    let structs = FFI_STRUCTS.lock().unwrap();
+                    let def = structs.get(&name).ok_or(DgnError::new("Struct not defined", 0))?;
+
+                    // Allocate zeroed memory
+                    let bytes = vec![0u8; def.size];
+                    
+                    // Return a Map acting as the Struct Object
+                    // It contains the Raw Bytes + Metadata
+                    let mut map1 = HashMap::new();
+                    map1.insert("__struct_id__".to_string(), DgnValue::String(name.clone()));
+                    map1.insert("__bytes__".to_string(), DgnValue::ByteArray(Arc::new(Mutex::new(bytes))));
+                    
+                    Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                }));
+
+                map.insert("set".to_string(), native_fn(|args| {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
+                    let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
+                    let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
+                    
+                    let field_name = val_to_string(&args[1]);
+                    let val = &args[2];
+
+                    let structs = FFI_STRUCTS.lock().unwrap();
+                    let def = structs.get(&struct_name).unwrap();
+                    
+                    // Find field offset and type
+                    let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
+                        .ok_or(DgnError::new("Field not found", 0))?;
+
+                    // Write Data
+                    let mut b = buffer.lock().unwrap();
+                    let offset = *offset;
+                    
+                    // This is a simplified writer (Supports i32/f32 for now - expand for others)
+                    // You can copy the logic from `mem_write_int` here but adapt for floats
+                    match val {
+                        DgnValue::Number(n) => {
+                            let remaining = b.len().saturating_sub(offset);
+                            let bytes = (*n as f32).to_ne_bytes();
+                        
+                            let write_len = std::cmp::min(4, remaining);
+                            
+                            for i in 0..write_len {
+                                b[offset + i] = bytes[i];
+                            }
+                        },
+                        _ => {}
+                    }
+
+                    Ok(DgnValue::Null)
+                    }));
+                    match result {
+                        Ok(val) => val,
+                        Err(_) => Err(DgnError::new("Dragon: Memory access violation in struct.set", 0))
+                    }
+                }));
+
+            // [INSERT THIS AFTER struct_set block (~Line 1485)]
+            map.insert("get".to_string(), native_fn(|args| {
+                let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
+                let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
+                let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
+                
+                let field_name = val_to_string(&args[1]);
+
+                let structs = FFI_STRUCTS.lock().unwrap();
+                let def = structs.get(&struct_name).ok_or(DgnError::new("Struct def not found", 0))?;
+                
+                // Find field offset and type
+                let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
+                    .ok_or(DgnError::new("Field not found", 0))?;
+
+                let b = buffer.lock().unwrap();
+                let offset = *offset;
+                
+                // Read based on type size (Simplified for basics, expand logic as needed)
+                // We look at the 'size' of the field type to decide how to read
+                // Note: You might want to match on 'type_info' specifically for cleaner code
+                if offset + 4 <= b.len() {
+                    let bytes: [u8; 4] = b[offset..offset+4].try_into().unwrap();
+                    let f_val = f32::from_ne_bytes(bytes); // Assume float for colors
+                    let i_val = u32::from_ne_bytes(bytes);
+                    
+                    // Heuristic: If field name suggests float, return float, else int
+                    // In a perfect world, you'd check type_info. 
+                    // For Allegro colors (r,g,b,a are floats), we return float.
+                    return Ok(DgnValue::Number(f_val as f64));
+                }
+
+                Ok(DgnValue::Null)
+            }));
+
+        }
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+         "mem" => {
+               let mut map = HashMap::new();
+            #[cfg(not(target_arch = "wasm32"))]
+             {
+              map.insert("alloc".to_string(), native_fn(|args| {
+                    let size = args.get(0).and_then(|v| if let DgnValue::Number(n) = v { Some(*n as usize) } else { None }).unwrap_or(0);
+                    let vec = vec![0u8; size];
+                    Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec))))
+                }));
+
+                // Add this inside the "mem" map insertions
+map.insert("read_ptr".to_string(), native_fn(|args| {
+    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+    
+    if ptr == 0 { return Ok(DgnValue::Null); }
+
+    unsafe {
+        // Read 8 bytes for a 64-bit pointer
+        let target_addr = (ptr + offset) as *const usize;
+        let val = *target_addr;
+        Ok(DgnValue::Number(val as f64))
+    }
+}));
+
+map.insert("read_float".to_string(), native_fn(|args| {
+    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+    
+    if ptr == 0 { return Ok(DgnValue::Null); }
+
+    unsafe {
+        // Read 4 bytes as a float (f32)
+        let target_addr = (ptr + offset) as *const f32;
+        let val = *target_addr;
+        Ok(DgnValue::Number(val as f64))
+    }
+}));
+
+map.insert("read_mem_int".to_string(), native_fn(|args| {
+                    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    
+                    if ptr == 0 { return Ok(DgnValue::Null); }
+
+                    unsafe {
+                        // Read 4 bytes as a 32-bit integer from raw memory
+                        let target_addr = (ptr + offset) as *const u32;
+                        let val = *target_addr;
+                        Ok(DgnValue::Number(val as f64))
+                    }
+                }));
+
+                map.insert("addr".to_string(), native_fn(|args| {
+                    match args.get(0) {
+                        Some(DgnValue::ByteArray(b)) => {
+                            let ptr = b.lock().unwrap().as_ptr() as usize;
+                            Ok(DgnValue::Number(ptr as f64))
+                        },
+                        Some(DgnValue::String(s)) => {
+                            let ptr = s.as_ptr() as usize;
+                            Ok(DgnValue::Number(ptr as f64))
+                        }
+                        _ => Ok(DgnValue::Null)
+                    }
+                }));
+
+                map.insert("read_int".to_string(), native_fn(|args| {
+                    let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
+                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    
+                    let b = buffer.lock().unwrap();
+                    if offset + 4 <= b.len() {
+                        let bytes: [u8; 4] = b[offset..offset+4].try_into().unwrap();
+                        let val = u32::from_ne_bytes(bytes); 
+                        Ok(DgnValue::Number(val as f64))
+                    } else {
+                        Ok(DgnValue::Null)
+                    }
+                }));
+
+
+                map.insert("write_int".to_string(), native_fn(|args| {
+                    let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
+                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u32 } else { 0 };
+
+                    let mut b = buffer.lock().unwrap();
+                    if offset + 4 <= b.len() {
+                        let bytes = val.to_ne_bytes();
+                        for i in 0..4 { b[offset + i] = bytes[i]; }
+                    }
+                    Ok(DgnValue::Null)
+                }));
+
+
+                map.insert("read_string".to_string(), native_fn(|args| {
+                    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                    
+                    if ptr == 0 { return Ok(DgnValue::Null); }
+
+                    unsafe {
+                        let c_str = std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char);
+                        Ok(DgnValue::String(c_str.to_string_lossy().into_owned()))
+                    }
+                }));
+
+                map.insert("read_byte".to_string(), native_fn(|args| {
+                    let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
+                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    
+                    let b = buffer.lock().unwrap();
+                    if offset < b.len() {
+                        Ok(DgnValue::Number(b[offset] as f64))
+                    } else {
+                        Ok(DgnValue::Null)
+                    }
+                }));
+
+                map.insert("write_byte".to_string(), native_fn(|args| {
+                    let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
+                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u8 } else { 0 };
+
+                    let mut b = buffer.lock().unwrap();
+                    if offset < b.len() {
+                        b[offset] = val;
+                    }
+                    Ok(DgnValue::Null)
+                }));
+             }
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+         },
+         
+         "thread" => {
+             let mut map = HashMap::new();
+             #[cfg(not(target_arch = "wasm32"))]
+             {
+                    map.insert("spawn".to_string(), native_fn(|args| {
+                        let func = args.get(0).cloned().ok_or(DgnError::new("Func required",0))?;
+                        let t_args = if let Some(DgnValue::List(l)) = args.get(1) { l.lock().unwrap().clone() } else { vec![] };
+                        let handle = thread::spawn(move || { let _ = call_dgn_func(func, t_args); });
+                        Ok(DgnValue::Thread(Arc::new(handle)))
+                    }));
+            }
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+         }
+        // To keep things truly modular, you can move memory, ffi, and struct globals here as well!
+        // You just transfer the logic from `populate_builtins` verbatim under an "ffi" and "mem" match block.
+        _ => None,
+    }
+}
+
 pub fn populate_builtins(env: Arc<Mutex<Env>>) {
     let mut e = env.lock().unwrap();
     let gc_env = env.clone();
@@ -2218,42 +3404,28 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         Ok(DgnValue::Null) 
     }));
 
-    e.set("readln", native_fn(|_| { let mut b = String::new(); std::io::stdin().read_line(&mut b).unwrap(); Ok(DgnValue::String(b.trim().to_string())) }));
+  e.set("readln", native_fn(|args| {
+    use std::io::{self, Write};
+
+    if let Some(prompt) = args.get(0) {
+        print!("{}", val_to_string(prompt));
+        let _ = io::stdout().flush(); 
+    }
+
+    let mut b = String::new();
+    match io::stdin().read_line(&mut b) {
+        Ok(_) => Ok(DgnValue::String(b.trim_end_matches(|c| c == '\r' || c == '\n').to_string())),
+        Err(e) => Err(DgnError::new(&e.to_string(), 0)),
+    }
+}));
     e.set("exit", native_fn(|args| { let c = if let Some(DgnValue::Number(n)) = args.get(0) { *n as i32 } else { 0 }; std::process::exit(c); }));
     e.set("gc", native_fn(move |_| {
         let count = gc_collect(gc_env.clone());
         Ok(DgnValue::Number(count as f64))
     }));
 
-    e.set("time_now", native_fn(|_| { Ok(DgnValue::Number(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64())) }));
+
     e.set("sleep", native_fn(|args| { thread::sleep(Duration::from_secs_f64(if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 })); Ok(DgnValue::Null) }));
-    e.set("random", native_fn(|_| Ok(DgnValue::Number(rand::random::<f64>()))));
-
-    e.set("range", native_fn(|args| {
-        let (start, stop, step) = match args.len() {
-            1 => (0.0, args[0].as_number().unwrap_or(0.0), 1.0),
-            2 => (args[0].as_number().unwrap_or(0.0), args[1].as_number().unwrap_or(0.0), 1.0),
-            3 => (args[0].as_number().unwrap_or(0.0), args[1].as_number().unwrap_or(0.0), args[2].as_number().unwrap_or(1.0)),
-            _ => return Err(DgnError::new("range() expects 1 to 3 arguments", 0)),
-        };
-
-        let mut nums = Vec::new();
-        let mut curr = start;
-
-        if step > 0.0 {
-            while curr < stop {
-                nums.push(DgnValue::Number(curr));
-                curr += step;
-            }
-        } else if step < 0.0 {
-            while curr > stop {
-                nums.push(DgnValue::Number(curr));
-                curr += step;
-            }
-        }
-
-        Ok(DgnValue::List(Arc::new(Mutex::new(nums))))
-    }));
 
     e.set("hashmap", native_fn(|_| {
         let val = DgnValue::Map(Arc::new(Mutex::new(HashMap::new())));
@@ -2271,15 +3443,6 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
     }));
      e.set("regex", native_fn(|args| { let p = if let Some(DgnValue::String(s)) = args.get(0) { s } else { "" }; match Regex::new(p) { Ok(r) => Ok(DgnValue::Regex(Arc::new(r))), Err(e) => Err(DgnError::new(&e.to_string(), 0)) } }));
     
-    // e.set("bytes", native_fn(|args| {
-    //     if let Some(DgnValue::String(s)) = args.get(0) {
-    //          Ok(DgnValue::ByteArray(Arc::new(Mutex::new(s.as_bytes().to_vec()))))
-    //     } else if let Some(DgnValue::Number(n)) = args.get(0) {
-    //          Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec![0; *n as usize]))))
-    //     } else {
-    //          Ok(DgnValue::ByteArray(Arc::new(Mutex::new(Vec::new()))))
-    //     }
-    // }));
 
             e.set("bytes", native_fn(|args| {
             if let Some(DgnValue::List(l)) = args.get(0) {
@@ -2302,325 +3465,6 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
                 Ok(DgnValue::ByteArray(Arc::new(Mutex::new(Vec::new()))))
             }
         }));
-
-    e.set("math_sin", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.sin() } else { 0.0 }))));
-    e.set("math_cos", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.cos() } else { 0.0 }))));
-    e.set("math_sqrt", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.sqrt() } else { 0.0 }))));
-
-#[cfg(not(target_arch = "wasm32"))]
-    {
-    e.set("file_read_all", native_fn(|a| {
-         let p = if let Some(DgnValue::String(s)) = a.get(0) { s } else { return Err(DgnError::new("File path required",0)) };
-         match fs::read_to_string(p) { Ok(c) => Ok(DgnValue::String(c)), Err(_) => Ok(DgnValue::Null) }
-    }));
-
-    e.set("file_read_bytes", native_fn(|a| {
-         let p = if let Some(DgnValue::String(s)) = a.get(0) { s } else { return Err(DgnError::new("File path required",0)) };
-         match fs::read(p) { 
-             Ok(c) => Ok(DgnValue::ByteArray(Arc::new(Mutex::new(c)))), 
-             Err(_) => Ok(DgnValue::Null) 
-         }
-    }));
-
-    e.set("file_write", native_fn(|a| {
-        let p = if let Some(DgnValue::String(s)) = a.get(0) { s } else { return Err(DgnError::new("Path required",0)) };
-        let c = if let Some(DgnValue::String(s)) = a.get(1) { s } else { "" };
-        Ok(DgnValue::Bool(fs::write(p, c).is_ok()))
-    }));
-    }
-
-    e.set("json_encode", native_fn(|a| {
-         let v = a.get(0).unwrap_or(&DgnValue::Null);
-         Ok(DgnValue::String(serde_json::to_string(&val_to_string(v)).unwrap()))
-    }));
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-    {
-    e.set("start_server", native_fn(|args| {
-        let port = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u16 } else { 8080 };
-        let handler = args.get(1).cloned().ok_or(DgnError::new("Handler required", 0))?;
-        
-        thread::spawn(move || {
-            let server = match Server::http(format!("0.0.0.0:{}", port)) {
-                Ok(s) => s,
-                Err(e) => { println!("Failed to start server: {}", e); return; }
-            };
-            
-            for mut request in server.incoming_requests() {
-                 let method = request.method().to_string();
-                 let url = request.url().to_string();
-                 let mut content = String::new();
-                 request.as_reader().read_to_string(&mut content).unwrap_or(0);
-                 
-                 let headers_map = Arc::new(Mutex::new(HashMap::new()));
-                 for h in request.headers() {
-                     headers_map.lock().unwrap().insert(h.field.to_string(), DgnValue::String(h.value.to_string()));
-                 }
-
-                 let query_map = Arc::new(Mutex::new(HashMap::new()));
-                 if let Some(pos) = url.find('?') {
-                     for pair in url[pos+1..].split('&') {
-                         let mut parts = pair.split('=');
-                         if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                             query_map.lock().unwrap().insert(k.to_string(), DgnValue::String(v.to_string()));
-                         }
-                     }
-                 }
-
-                 let req_obj = DgnValue::Map(Arc::new(Mutex::new(HashMap::from([
-                     ("method".to_string(), DgnValue::String(method)),
-                     ("path".to_string(), DgnValue::String(url)), 
-                     ("body".to_string(), DgnValue::String(content)),
-                     ("headers".to_string(), DgnValue::Map(headers_map)),
-                     ("query".to_string(), DgnValue::Map(query_map)),
-                 ]))));
-                 
-                 let req_handle = Arc::new(Mutex::new(Some(request)));
-                 let res_map = Arc::new(Mutex::new(HashMap::new()));
-                 
-                 let rh = req_handle.clone();
-                 res_map.lock().unwrap().insert("send".into(), native_method(rh, move |rh, args| {
-                      let body = val_to_string(args.get(0).unwrap_or(&DgnValue::String("".into())));
-                      let status = if let Some(DgnValue::Number(n)) = args.get(1) { *n as u16 } else { 200 };
-                      let headers_arg = args.get(2).cloned();
-
-                      if let Some(req) = rh.lock().unwrap().take() {
-                          let mut response = Response::from_string(body).with_status_code(status);
-                          
-                          if let Some(DgnValue::Map(hm)) = headers_arg {
-                              for (k, v) in hm.lock().unwrap().iter() {
-                                  if let Ok(h) = Header::from_bytes(k.as_bytes(), val_to_string(v).as_bytes()) {
-                                      response.add_header(h);
-                                  }
-                              }
-                          }
-
-                          let _ = req.respond(response);
-                      }
-                      Ok(DgnValue::Null)
-                 }));
-
-                 let _ = call_dgn_func(handler.clone(), vec![req_obj, DgnValue::Map(res_map)]);
-            }
-        });
-        Ok(DgnValue::Bool(true))
-    }));
-
-
-    e.set("thread_spawn", native_fn(|args| {
-        let func = args.get(0).cloned().ok_or(DgnError::new("Func required",0))?;
-        let t_args = if let Some(DgnValue::List(l)) = args.get(1) { l.lock().unwrap().clone() } else { vec![] };
-        let handle = thread::spawn(move || { let _ = call_dgn_func(func, t_args); });
-        Ok(DgnValue::Thread(Arc::new(handle)))
-    }));
-
-
-    e.set("system", native_fn(|args| {
-         let cmd = if let Some(DgnValue::String(s)) = args.get(0) { s } else { "" };
-         if cfg!(target_os = "windows") {
-             Command::new("cmd").args(["/C", cmd]).status().map(|s| DgnValue::Number(s.code().unwrap_or(0) as f64)).map_err(|e| DgnError::new(&e.to_string(),0))
-         } else {
-             Command::new("sh").args(["-c", cmd]).status().map(|s| DgnValue::Number(s.code().unwrap_or(0) as f64)).map_err(|e| DgnError::new(&e.to_string(),0))
-         }
-    }));
-    
-
-    e.set("loadlib", native_fn(|args| {
-        let path = if let Some(DgnValue::String(s)) = args.get(0) { s } else { return Err(DgnError::new("Path req", 0)) };
-        unsafe {
-            let lib = Library::new(path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
-            
-            let mut map = HashMap::new();
-            map.insert("path".to_string(), DgnValue::String(path.clone()));
-            map.insert("ptr".to_string(), DgnValue::NativeLib(Arc::new(Mutex::new(lib))));
-            
-            Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
-        }
-    }));
-
-    e.set("ffi_struct", native_fn(|args| {
-        let name = val_to_string(args.get(0).unwrap());
-        let fields_list = if let DgnValue::List(l) = args.get(1).unwrap() { l.lock().unwrap().clone() } else { return Err(DgnError::new("Fields must be a list", 0)); };
-
-        let mut offset = 0;
-        let mut max_align = 1;
-        let mut struct_fields = Vec::new();
-        let mut field_types = Vec::new();
-
-        for field in fields_list {
-            if let DgnValue::List(def) = field {
-                let def = def.lock().unwrap();
-                let type_name = val_to_string(&def[0]);
-                let field_name = val_to_string(&def[1]);
-
-                let (ffi_type, size, align) = get_ffi_type_info(&type_name)
-                    .ok_or(DgnError::new(&format!("Unknown type: {}", type_name), 0))?;
-
-                // 1. Add Padding for Alignment
-                let padding = (align - (offset % align)) % align;
-                offset += padding;
-
-                // 2. Store Field
-                struct_fields.push((field_name, offset, ffi_type.clone()));
-                field_types.push(ffi_type);
-
-                // 3. Advance Offset
-                offset += size;
-                if align > max_align { max_align = align; }
-            }
-        }
-
-        // 4. Final Padding (Structure size must be multiple of largest alignment)
-        let final_padding = (max_align - (offset % max_align)) % max_align;
-        let total_size = offset + final_padding;
-
-        // 5. Create LibFFI Structure Type
-        let struct_type = Type::structure(field_types);
-
-        let def = FfiStructDef {
-            size: total_size,
-            fields: struct_fields,
-            libffi_type: struct_type,
-        };
-
-        FFI_STRUCTS.lock().unwrap().insert(name, def);
-        Ok(DgnValue::Number(total_size as f64))
-    }));
-
-
-    e.set("struct_new", native_fn(|args| {
-        let name = val_to_string(args.get(0).unwrap());
-        let structs = FFI_STRUCTS.lock().unwrap();
-        let def = structs.get(&name).ok_or(DgnError::new("Struct not defined", 0))?;
-
-        // Allocate zeroed memory
-        let bytes = vec![0u8; def.size];
-        
-        // Return a Map acting as the Struct Object
-        // It contains the Raw Bytes + Metadata
-        let mut map = HashMap::new();
-        map.insert("__struct_id__".to_string(), DgnValue::String(name.clone()));
-        map.insert("__bytes__".to_string(), DgnValue::ByteArray(Arc::new(Mutex::new(bytes))));
-        
-        Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
-    }));
-
-    e.set("struct_set", native_fn(|args| {
-        let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
-        let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
-        let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
-        
-        let field_name = val_to_string(&args[1]);
-        let val = &args[2];
-
-        let structs = FFI_STRUCTS.lock().unwrap();
-        let def = structs.get(&struct_name).unwrap();
-        
-        // Find field offset and type
-        let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
-            .ok_or(DgnError::new("Field not found", 0))?;
-
-        // Write Data
-        let mut b = buffer.lock().unwrap();
-        let offset = *offset;
-        
-        // This is a simplified writer (Supports i32/f32 for now - expand for others)
-        // You can copy the logic from `mem_write_int` here but adapt for floats
-        match val {
-            DgnValue::Number(n) => {
-                 // Simple Heuristic: If field is float, write f32/f64 bytes. If int, write i32 bytes.
-                 // In a real engine, check `type_info` structure to know exact write type.
-                 let bytes = (*n as f32).to_ne_bytes(); // Assuming float for Allegro colors
-                 for i in 0..4 { b[offset + i] = bytes[i]; }
-            },
-            _ => {}
-        }
-
-        Ok(DgnValue::Null)
-    }));
-
-    // [INSERT THIS AFTER struct_set block (~Line 1485)]
-    e.set("struct_get", native_fn(|args| {
-        let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
-        let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
-        let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
-        
-        let field_name = val_to_string(&args[1]);
-
-        let structs = FFI_STRUCTS.lock().unwrap();
-        let def = structs.get(&struct_name).ok_or(DgnError::new("Struct def not found", 0))?;
-        
-        // Find field offset and type
-        let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
-            .ok_or(DgnError::new("Field not found", 0))?;
-
-        let b = buffer.lock().unwrap();
-        let offset = *offset;
-        
-        // Read based on type size (Simplified for basics, expand logic as needed)
-        // We look at the 'size' of the field type to decide how to read
-        // Note: You might want to match on 'type_info' specifically for cleaner code
-        if offset + 4 <= b.len() {
-             let bytes: [u8; 4] = b[offset..offset+4].try_into().unwrap();
-             let f_val = f32::from_ne_bytes(bytes); // Assume float for colors
-             let i_val = u32::from_ne_bytes(bytes);
-             
-             // Heuristic: If field name suggests float, return float, else int
-             // In a perfect world, you'd check type_info. 
-             // For Allegro colors (r,g,b,a are floats), we return float.
-             return Ok(DgnValue::Number(f_val as f64));
-        }
-
-        Ok(DgnValue::Null)
-    }));
-
-    e.set("ffi_def", native_fn(|args| {
-        if args.len() < 4 { return Err(DgnError::new("Usage: ffi_def(lib, name, ret_type, [arg_types])", 0)); }
-        
-        // Extract library path from the map we created in loadlib
-        let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib Object",0)); };
-        let lib_path = val_to_string(lib_map.get("path").unwrap());
-        
-        let func_name = val_to_string(&args[1]);
-        let ret_type = val_to_string(&args[2]);
-        
-        let arg_types_list = if let DgnValue::List(l) = &args[3] { l.lock().unwrap().clone() } else { vec![] };
-        let arg_types: Vec<String> = arg_types_list.iter().map(val_to_string).collect();
-
-        // Store in the global registry
-        let key = format!("{}::{}", lib_path, func_name);
-        FFI_SIGNATURES.lock().unwrap().insert(key, (ret_type, arg_types));
-        
-        Ok(DgnValue::Null)
-    }));
-    
-    e.set("loadlib_call", native_fn(|args| {
-        if args.len() < 2 { return Err(DgnError::new("loadlib_call(lib, symbol, args_json)", 0)); }
-        
-        let lib_val = &args[0];
-        let symbol_name = val_to_string(&args[1]);
-        let input_arg = val_to_string(args.get(2).unwrap_or(&DgnValue::String("".to_string())));
-
-        if let DgnValue::NativeLib(lib) = lib_val {
-            let l = lib.lock().unwrap();
-            unsafe {
-                type DragonFunc = unsafe extern "C" fn(*const c_char) -> *mut c_char;
-                let func: Symbol<DragonFunc> = l.get(symbol_name.as_bytes()).map_err(|e| DgnError::new(&e.to_string(), 0))?;
-                
-                let c_input = CString::new(input_arg).unwrap();
-                let c_result = func(c_input.as_ptr());
-                
-                if c_result.is_null() {
-                    return Ok(DgnValue::Null);
-                }
-                
-                let res_str = CStr::from_ptr(c_result).to_string_lossy().into_owned();
-                Ok(DgnValue::String(res_str))
-            }
-        } else {
-            Err(DgnError::new("First arg must be NativeLib", 0))
-        }
-    }));
-    }
 
      e.set("typeof", native_fn(|args| {
         let val = args.get(0).unwrap_or(&DgnValue::Null);
@@ -2673,33 +3517,6 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         Ok(DgnValue::String(val_to_string(v)))
     }));
 
-     e.set("math_abs", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.abs() } else { 0.0 }))));
-     e.set("math_floor", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.floor() } else { 0.0 }))));
-     e.set("math_ceil", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.ceil() } else { 0.0 }))));
-     e.set("math_round", native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.round() } else { 0.0 }))));
-     e.set("math_min", native_fn(|args| {
-        let mut min = std::f64::INFINITY;
-        for arg in args {
-            if let DgnValue::Number(n) = arg { if n < min { min = n; } }
-        }
-        Ok(DgnValue::Number(min))
-    }));
-     e.set("math_max", native_fn(|args| {
-        let mut max = std::f64::NEG_INFINITY;
-        for arg in args {
-            if let DgnValue::Number(n) = arg { if n > max { max = n; } }
-        }
-        Ok(DgnValue::Number(max))
-    }));
-
-     e.set("env_get", native_fn(|args| {
-        if let Some(DgnValue::String(k)) = args.get(0) {
-            Ok(DgnValue::String(env::var(k).unwrap_or_default()))
-        } else {
-            Ok(DgnValue::Null)
-        }
-    }));
-    
      e.set("len", native_fn(|args| {
         match args.get(0) {
             Some(DgnValue::String(s)) => Ok(DgnValue::Number(s.len() as f64)),
@@ -2708,63 +3525,6 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
             Some(DgnValue::ByteArray(b)) => Ok(DgnValue::Number(b.lock().unwrap().len() as f64)),
             _ => Ok(DgnValue::Number(0.0))
         }
-    }));
-
-    e.set("time", native_fn(|_| {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
-        Ok(DgnValue::Number(t))
-    }));
-
-    e.set("date", native_fn(|args| {
-        let now = std::time::SystemTime::now();
-        let elapsed = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        
-        let days = elapsed / 86400;
-        let year = 1970 + (days / 365); 
-        
-        let mut map = HashMap::new();
-        map.insert("timestamp".to_string(), DgnValue::Number(elapsed as f64));
-        map.insert("approx_year".to_string(), DgnValue::Number(year as f64));
-        
-        Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
-    }));
-#[cfg(not(target_arch = "wasm32"))]
-    {
-    e.set("file_exists", native_fn(|args| {
-        let path = args.get(0).map(val_to_string).unwrap_or_default();
-        Ok(DgnValue::Bool(Path::new(&path).exists()))
-    }));
-
-    e.set("file_delete", native_fn(|args| {
-        let path = args.get(0).map(val_to_string).unwrap_or_default();
-        Ok(DgnValue::Bool(fs::remove_file(path).is_ok()))
-    }));
-    
-    e.set("dir_list", native_fn(|args| {
-        let path = args.get(0).map(val_to_string).unwrap_or_default();
-        let mut files = Vec::new();
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries {
-                if let Ok(e) = entry {
-                    if let Ok(name) = e.file_name().into_string() {
-                        files.push(DgnValue::String(name));
-                    }
-                }
-            }
-        }
-        Ok(DgnValue::List(Arc::new(Mutex::new(files))))
-    }));
-    }
-
-    e.set("math_pow", native_fn(|args| {
-        let base = if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 };
-        let exp = if let Some(DgnValue::Number(n)) = args.get(1) { *n } else { 1.0 };
-        Ok(DgnValue::Number(base.powf(exp)))
-    }));
-    
-    e.set("math_log", native_fn(|args| {
-        let n = if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 };
-        Ok(DgnValue::Number(n.ln()))
     }));
 
 
@@ -2803,453 +3563,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         }
     }));
 
-    e.set("date_now", native_fn(|_| {
-        let now: DateTime<Local> = Local::now();
-        let mut map = HashMap::new();
-        map.insert("year".to_string(), DgnValue::Number(now.year() as f64));
-        map.insert("month".to_string(), DgnValue::Number(now.month() as f64));
-        map.insert("day".to_string(), DgnValue::Number(now.day() as f64));
-        map.insert("hour".to_string(), DgnValue::Number(now.hour() as f64));
-        map.insert("minute".to_string(), DgnValue::Number(now.minute() as f64));
-        map.insert("second".to_string(), DgnValue::Number(now.second() as f64));
-        map.insert("str".to_string(), DgnValue::String(now.format("%Y-%m-%d %H:%M:%S").to_string()));
-        Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
-    }));
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-    {
-    e.set("os_name", native_fn(|_| {
-        Ok(DgnValue::String(std::env::consts::OS.to_string()))
-    }));
 
-    e.set("os_arch", native_fn(|_| {
-        Ok(DgnValue::String(std::env::consts::ARCH.to_string()))
-    }));
-
-    e.set("os_family", native_fn(|_| {
-        Ok(DgnValue::String(std::env::consts::FAMILY.to_string()))
-    }));
-
-    e.set("mem_alloc", native_fn(|args| {
-        let size = args.get(0).and_then(|v| if let DgnValue::Number(n) = v { Some(*n as usize) } else { None }).unwrap_or(0);
-        let vec = vec![0u8; size];
-        Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec))))
-    }));
-
-    e.set("mem_addr", native_fn(|args| {
-        match args.get(0) {
-            Some(DgnValue::ByteArray(b)) => {
-                let ptr = b.lock().unwrap().as_ptr() as usize;
-                Ok(DgnValue::Number(ptr as f64))
-            },
-            Some(DgnValue::String(s)) => {
-                let ptr = s.as_ptr() as usize;
-                Ok(DgnValue::Number(ptr as f64))
-            }
-            _ => Ok(DgnValue::Null)
-        }
-    }));
-
-    e.set("mem_read_int", native_fn(|args| {
-        let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-        let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-        
-        let b = buffer.lock().unwrap();
-        if offset + 4 <= b.len() {
-            let bytes: [u8; 4] = b[offset..offset+4].try_into().unwrap();
-            let val = u32::from_ne_bytes(bytes); 
-            Ok(DgnValue::Number(val as f64))
-        } else {
-            Ok(DgnValue::Null)
-        }
-    }));
-
-
-    e.set("mem_write_int", native_fn(|args| {
-        let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-        let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-        let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u32 } else { 0 };
-
-        let mut b = buffer.lock().unwrap();
-        if offset + 4 <= b.len() {
-            let bytes = val.to_ne_bytes();
-            for i in 0..4 { b[offset + i] = bytes[i]; }
-        }
-        Ok(DgnValue::Null)
-    }));
-
-
-    e.set("mem_read_string", native_fn(|args| {
-        let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-        
-        if ptr == 0 { return Ok(DgnValue::Null); }
-
-        unsafe {
-            let c_str = std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char);
-            Ok(DgnValue::String(c_str.to_string_lossy().into_owned()))
-        }
-    }));
-
-    e.set("mem_read_byte", native_fn(|args| {
-        let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-        let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-        
-        let b = buffer.lock().unwrap();
-        if offset < b.len() {
-            Ok(DgnValue::Number(b[offset] as f64))
-        } else {
-            Ok(DgnValue::Null)
-        }
-    }));
-
-    e.set("mem_write_byte", native_fn(|args| {
-        let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-        let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-        let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u8 } else { 0 };
-
-        let mut b = buffer.lock().unwrap();
-        if offset < b.len() {
-            b[offset] = val;
-        }
-        Ok(DgnValue::Null)
-    }));
-
-    e.set("ffi_symbol_addr", native_fn(|args| {
-        // 1. Get Library
-        let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib",0)); };
-        let lib_arc = if let DgnValue::NativeLib(l) = lib_map.get("ptr").unwrap() { l } else { return Err(DgnError::new("Invalid Lib Ptr",0)); };
-        
-        // 2. Get Symbol Name
-        let func_name = val_to_string(&args[1]);
-        
-        // 3. Return Address
-        let l = lib_arc.lock().unwrap();
-        unsafe {
-            // We cast the symbol to a generic pointer, then to usize (number)
-            let symbol: Symbol<*const c_void> = l.get(func_name.as_bytes())
-                .map_err(|e| DgnError::new(&e.to_string(), 0))?;
-            Ok(DgnValue::Number(*symbol as usize as f64))
-        }
-    }));
-
-   e.set("ffi_call", native_fn(|args| {
-        if args.len() < 2 { return Err(DgnError::new("Usage: ffi_call(lib, name, ...args)", 0)); }
-
-        let lib_map = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid Lib",0)); };
-        let lib_path = val_to_string(lib_map.get("path").unwrap());
-        let lib_arc = if let DgnValue::NativeLib(l) = lib_map.get("ptr").unwrap() { l } else { return Err(DgnError::new("Invalid Lib Ptr",0)); };
-        
-        let func_name = val_to_string(&args[1]);
-        let call_args_values = &args[2..];
-
-        let key = format!("{}::{}", lib_path, func_name);
-        let sig_guard = FFI_SIGNATURES.lock().unwrap();
-        let (ret_type_str, arg_types_str) = sig_guard.get(&key)
-            .ok_or(DgnError::new(&format!("No signature for '{}'. Call ffi_def() first.", func_name), 0))?;
-
-        // 1. Prepare Types
-        let mut arg_types: Vec<Type> = Vec::new();
-        for t in arg_types_str {
-            match t.as_str() {
-                "int" | "i32" => arg_types.push(Type::i32()),
-                "long" | "i64" => arg_types.push(Type::i64()),
-                "float" | "f32" => arg_types.push(Type::f32()),
-                "double" | "f64" => arg_types.push(Type::f64()),
-                "pointer" | "void*" => arg_types.push(Type::pointer()),
-                "string" | "char*" => arg_types.push(Type::pointer()),
-                "bool" => arg_types.push(Type::u8()),
-                "void" => {}, 
-                name => {
-                    // NEW: Check if it is a registered C-Struct
-                    if let Some(def) = FFI_STRUCTS.lock().unwrap().get(name) {
-                        // We clone the pre-calculated LibFFI Type::structure
-                        arg_types.push(def.libffi_type.clone());
-                    } else {
-                        return Err(DgnError::new(&format!("Unknown FFI type: {}", name), 0));
-                    }
-                }
-            }
-        }
-
-        let ret_type = match ret_type_str.as_str() {
-            "void" => Type::void(),
-            "int" | "i32" => Type::i32(),
-            "long" | "i64" => Type::i64(),
-            "float" | "f32" => Type::f32(),
-            "double" | "f64" => Type::f64(),
-            "pointer" | "void*" => Type::pointer(),
-            "bool" => Type::u8(),
-            _ => return Err(DgnError::new("Unknown return type", 0))
-        };
-
-        // FIX: Use into_iter() to satisfy Cif::new requirements
-        let cif = Cif::new(arg_types.into_iter(), ret_type.clone());
-        
-        let l = lib_arc.lock().unwrap();
-        let code_ptr: CodePtr = unsafe {
-            let symbol: Symbol<*mut c_void> = l.get(func_name.as_bytes())
-                .map_err(|e| DgnError::new(&e.to_string(), 0))?;
-            CodePtr::from_ptr(*symbol)
-        };
-
-        // 2. Prepare Values safely
-        // We use an enum to keep the converted data alive during the call
-        enum FfiValue {
-            I32(i32), I64(i64),
-            F32(f32), F64(f64),
-            Ptr(usize), U8(u8),
-            Struct(Vec<u8>),
-        }
-
-        let mut values = Vec::new();
-        let mut keep_alive_strs: Vec<CString> = Vec::new();
-
-        for (i, val) in call_args_values.iter().enumerate() {
-             let t_str = arg_types_str.get(i).map(|s| s.as_str()).unwrap_or("int");
-             match t_str {
-                "int" | "i32" => values.push(FfiValue::I32(val.as_number().unwrap_or(0.0) as i32)),
-                "long" | "i64" => values.push(FfiValue::I64(val.as_number().unwrap_or(0.0) as i64)),
-                "float" | "f32" => values.push(FfiValue::F32(val.as_number().unwrap_or(0.0) as f32)),
-                "double" | "f64" => values.push(FfiValue::F64(val.as_number().unwrap_or(0.0) as f64)),
-                "pointer" | "void*" => values.push(FfiValue::Ptr(val.as_number().unwrap_or(0.0) as usize)),
-                "string" | "char*" => {
-                    let s = val_to_string(val);
-                    let c_str = CString::new(s).unwrap_or_default();
-                    let ptr = c_str.as_ptr() as usize;
-                    keep_alive_strs.push(c_str); 
-                    values.push(FfiValue::Ptr(ptr));
-                },
-                "bool" => values.push(FfiValue::U8(if is_truthy(val) { 1 } else { 0 })),
-               name => {
-                    if FFI_STRUCTS.lock().unwrap().contains_key(name) {
-                        if let DgnValue::Map(m) = val {
-                            let m = m.lock().unwrap();
-                            if let Some(DgnValue::ByteArray(b)) = m.get("__bytes__") {
-                                // COPY the bytes into our FfiValue holder
-                                let data = b.lock().unwrap().clone();
-                                values.push(FfiValue::Struct(data));
-                            } else {
-                                // Fallback: empty struct
-                                values.push(FfiValue::Struct(vec![])); 
-                            }
-                        } else {
-                            values.push(FfiValue::I32(0)); // Error fallback
-                        }
-                    } else {
-                        values.push(FfiValue::I32(0));
-                    }
-                }
-             }
-        }
-
-        // 3. Create LibFFI Arguments
-        // Arg::new() borrows the value from our 'values' vector
-        let mut libffi_args = Vec::new();
-        for v in &values {
-            match v {
-                FfiValue::I32(x) => libffi_args.push(Arg::new(x)),
-                FfiValue::I64(x) => libffi_args.push(Arg::new(x)),
-                FfiValue::F32(x) => libffi_args.push(Arg::new(x)),
-                FfiValue::F64(x) => libffi_args.push(Arg::new(x)),
-                FfiValue::Ptr(x) => libffi_args.push(Arg::new(x)),
-                FfiValue::U8(x) => libffi_args.push(Arg::new(x)),
-                FfiValue::Struct(data) => {
-                    if data.is_empty() {
-                         // Edge case handling
-                         static EMPTY: u8 = 0;
-                         libffi_args.push(Arg::new(&EMPTY));
-                    } else {
-                        libffi_args.push(Arg::new(&data[0]));
-                    }
-                }
-            }
-        }
-
-        // 4. Execute Call
-        unsafe {
-             match ret_type_str.as_str() {
-                 "void" => {
-                     cif.call::<()>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Null)
-                 },
-                 "int" | "i32" => {
-                     let res = cif.call::<i32>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Number(res as f64))
-                 },
-                 "long" | "i64" => {
-                     let res = cif.call::<i64>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Number(res as f64))
-                 },
-                 "float" | "f32" => {
-                     let res = cif.call::<f32>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Number(res as f64))
-                 },
-                 "double" | "f64" => {
-                     let res = cif.call::<f64>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Number(res))
-                 },
-                 "pointer" | "void*" => {
-                     let res = cif.call::<usize>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Number(res as f64))
-                 },
-                 "bool" => {
-                     let res = cif.call::<u8>(code_ptr, &libffi_args);
-                     Ok(DgnValue::Bool(res != 0))
-                 },
-                 _ => Ok(DgnValue::Null)
-             }
-        }
-    }));
-
-
-    e.set("http_get", native_fn(|args| {
-        let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
-        
-        match ureq::get(&url).call() {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.into_string().unwrap_or_default();
-                
-                let mut map = HashMap::new();
-                map.insert("status".to_string(), DgnValue::Number(status as f64));
-                map.insert("body".to_string(), DgnValue::String(text));
-                Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
-            },
-            Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
-        }
-    }));
-
-
-    e.set("http_post", native_fn(|args| {
-        let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
-        let body = args.get(1).map(val_to_string).unwrap_or_default();
-        
-        let mut req = ureq::post(&url);
-
-        if let Some(DgnValue::Map(headers)) = args.get(2) {
-            for (k, v) in headers.lock().unwrap().iter() {
-                req = req.set(k, &val_to_string(v));
-            }
-        }
-
-        match req.send_string(&body) {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.into_string().unwrap_or_default();
-                let mut map = HashMap::new();
-                map.insert("status".to_string(), DgnValue::Number(status as f64));
-                map.insert("body".to_string(), DgnValue::String(text));
-                Ok(DgnValue::Map(Arc::new(Mutex::new(map))))
-            },
-            Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
-        }
-    }));
-
-
-    e.set("socket_connect", native_fn(|args| {
-        let addr = args.get(0).map(val_to_string).ok_or(DgnError::new("Address required", 0))?;
-        match TcpStream::connect(&addr) {
-            Ok(stream) => Ok(DgnValue::Socket(Arc::new(Mutex::new(stream)))),
-            Err(e) => Err(DgnError::new(&format!("Connection failed: {}", e), 0))
-        }
-    }));
-
-    e.set("socket_send", native_fn(|args| {
-        if let Some(DgnValue::Socket(s)) = args.get(0) {
-            let msg = args.get(1).map(val_to_string).unwrap_or_default();
-            let mut stream = s.lock().unwrap();
-            match stream.write_all(msg.as_bytes()) {
-                Ok(_) => Ok(DgnValue::Bool(true)),
-                Err(_) => Ok(DgnValue::Bool(false))
-            }
-        } else {
-            Err(DgnError::new("Socket required", 0))
-        }
-    }));
-
-    e.set("socket_read", native_fn(|args| {
-        if let Some(DgnValue::Socket(s)) = args.get(0) {
-            let mut stream = s.lock().unwrap();
-            let mut reader = BufReader::new(&*stream);
-            let mut buffer = String::new();
-            match reader.read_line(&mut buffer) {
-                Ok(_) => Ok(DgnValue::String(buffer)),
-                Err(_) => Ok(DgnValue::Null)
-            }
-        } else {
-            Err(DgnError::new("Socket required", 0))
-        }
-    }));
-    
-    e.set("socket_close", native_fn(|args| {
-        if let Some(DgnValue::Socket(s)) = args.get(0) {
-            let _ = s.lock().unwrap().shutdown(Shutdown::Both);
-            Ok(DgnValue::Bool(true))
-        } else { Ok(DgnValue::Bool(false)) }
-    }));
-
-    e.set("socket_server", native_fn(|args| {
-        let port = args.get(0).and_then(|v| v.as_number()).unwrap_or(8080.0) as u16;
-        let handler = args.get(1).cloned().ok_or(DgnError::new("Handler function required", 0))?;
-        
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-            .map_err(|e| DgnError::new(&e.to_string(), 0))?;
-            
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(s) = stream {
-                    let client_socket = DgnValue::Socket(Arc::new(Mutex::new(s)));
-                    let _ = call_dgn_func(handler.clone(), vec![client_socket]);
-                }
-            }
-        });
-
-        Ok(DgnValue::Bool(true))
-    }));
-
-
-   
-}
-
-    e.set("json_decode", native_fn(|args| {
-        let json_str = args.get(0).map(val_to_string).unwrap_or_default();
-        fn json_to_dgn(v: serde_json::Value) -> DgnValue {
-            match v {
-                serde_json::Value::Null => DgnValue::Null,
-                serde_json::Value::Bool(b) => DgnValue::Bool(b),
-                serde_json::Value::Number(n) => DgnValue::Number(n.as_f64().unwrap_or(0.0)),
-                serde_json::Value::String(s) => DgnValue::String(s),
-                serde_json::Value::Array(arr) => {
-                    let list: Vec<DgnValue> = arr.into_iter().map(json_to_dgn).collect();
-                    DgnValue::List(Arc::new(Mutex::new(list)))
-                },
-                serde_json::Value::Object(map) => {
-                    let mut dgn_map = HashMap::new();
-                    for (k, v) in map { dgn_map.insert(k, json_to_dgn(v)); }
-                    DgnValue::Map(Arc::new(Mutex::new(dgn_map)))
-                }
-            }
-        }
-
-        match serde_json::from_str(&json_str) {
-            Ok(val) => Ok(json_to_dgn(val)),
-            Err(_) => Ok(DgnValue::Null)
-        }
-    }));
-
- e.set("base64_encode", native_fn(|args| {
-        use base64::{Engine as _, engine::general_purpose};
-        let s = args.get(0).map(val_to_string).unwrap_or_default();
-        Ok(DgnValue::String(general_purpose::STANDARD.encode(s)))
-    }));
-
-    e.set("base64_decode", native_fn(|args| {
-        use base64::{Engine as _, engine::general_purpose};
-        let s = args.get(0).map(val_to_string).unwrap_or_default();
-        match general_purpose::STANDARD.decode(s) {
-            Ok(bytes) => Ok(DgnValue::String(String::from_utf8_lossy(&bytes).to_string())),
-            Err(_) => Ok(DgnValue::Null)
-        }
-    }));
 #[cfg(target_arch = "wasm32")]
     {
         e.set("alert", native_fn(|args| {
@@ -3258,7 +3572,6 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
             Ok(DgnValue::Null)
         }));
         
-        e.set("os_name", native_fn(|_| Ok(DgnValue::String("web-wasm".into()))));
     }
 
     e.define_const("PI".to_string(), DgnValue::Number(std::f64::consts::PI)).ok();
@@ -3308,25 +3621,50 @@ pub fn gather_sources(path: &Path, sources: &mut HashMap<String, String>, is_roo
     let code = fs::read_to_string(path)
         .map_err(|e| format!("Could not read source file '{}': {}", path.display(), e))?;
 
-    let key = if is_root {
-        "__entry__".to_string()
-    } else {
-        path.file_name().unwrap().to_string_lossy().to_string()
-    };
-
+    let key = if is_root { "__entry__".to_string() } else { path.file_name().unwrap().to_string_lossy().to_string() };
     if sources.contains_key(&key) { return Ok(()); }
     sources.insert(key, code.clone());
 
-    // let re = Regex::new(r#"import\s+["']([^"']+)["']"#).unwrap();
     let re = Regex::new(r#"import[ \t]+["']([^"']+)["']"#).unwrap();
     for cap in re.captures_iter(&code) {
         let import_ref = &cap[1];
-        let mut import_path = path.parent().unwrap().join(import_ref);
-        if import_path.extension().is_none() {
-            import_path.set_extension("dgn");
-        }
         
-        if import_path.exists() {
+        // // Skip built-ins so the bundler doesn't try to look for them on disk
+        // let builtins = ["math", "json", "base64", "file", "os", "path", "time", "net", "ffi", "struct", "mem", "thread", "uuid"];
+        // if builtins.contains(&import_ref.as_str()) { continue; }
+
+        let current_dir = path.parent().unwrap_or(Path::new("."));
+        let mut search_dirs = vec![current_dir.to_path_buf(), current_dir.join("dgn_modules")];
+        if let Ok(dp) = std::env::var("DRAGON_PATH") {
+            for p in std::env::split_paths(&dp) { search_dirs.push(p); }
+        }
+
+        let mut target_files = Vec::new();
+        let path_obj = Path::new(import_ref);
+        if path_obj.extension().is_some() {
+            target_files.push(path_obj.to_path_buf());
+        } else {
+            target_files.push(PathBuf::from(format!("{}.dgn", import_ref)));
+            if let Some(name) = path_obj.file_name() {
+                let n = name.to_string_lossy();
+                target_files.push(PathBuf::from(import_ref).join(format!("{}.dgn", n)));
+                target_files.push(PathBuf::from(import_ref).join("index.dgn"));
+            }
+        }
+
+        let mut found_path = None;
+        for dir in &search_dirs {
+            for target in &target_files {
+                let candidate = dir.join(target);
+                if candidate.exists() && candidate.is_file() {
+                    found_path = Some(candidate);
+                    break;
+                }
+            }
+            if found_path.is_some() { break; }
+        }
+
+        if let Some(import_path) = found_path {
             gather_sources(&import_path, sources, false)?;
         } else {
             println!("Warning: Bundler skipped missing import '{}'", import_ref);
@@ -3368,15 +3706,9 @@ impl Linter {
         };
         l.enter_scope();
         let builtins = vec![
-            "show", "showln", "readln", "exit", "time_now", "sleep", "random",
-            "hashmap", "list", "regex", "bytes", "math_sin", "math_cos", "math_sqrt",
-            "file_read_all", "file_write", "json_encode", "start_server", "thread_spawn",
-            "system", "loadlib", "loadlib_call", "typeof", "int", "float", "str",
-            "math_abs", "math_floor", "math_ceil", "math_round", "math_min", "math_max",
-            "env_get", "len", "time", "date", "date_now", "file_exists", "file_delete",
-            "dir_list", "math_pow", "math_log", "chr", "ord", "parse_int", "parse_float",
-            "os_name", "os_arch", "os_family", "ffi_call","ffi_def","ffi_symbol_addr","argv","mem_alloc", "mem_addr", "mem_read_int", "mem_write_int", "range", "gc",
-            "http_get", "http_post", "socket_connect", "socket_send", "socket_read", "socket_close", "socket_server","json_decode", "base64_encode", "base64_decode", "alert", "mem_read_string","mem_write_byte","mem_read_byte" , "file_read_bytes", "ffi_struct", "struct_new", "struct_set", "struct_get"
+            "show", "showln", "readln", "exit", "time_now", "sleep", 
+            "hashmap", "list", "regex", "bytes", "typeof", "int", "float", "str", "len",  "chr", "ord", "parse_int", "parse_float", "gc","argv",
+         "alert"
         ];
         for b in builtins {
             l.define(b, true); 
@@ -3476,11 +3808,14 @@ impl Linter {
                 self.check_expr(expr);
                 self.define(name, false);
             },
-            StmtNode::Import(_, as_name) => {
-                if let Some(n) = as_name {
-                    self.define(n, false);
-                }
-            },
+                StmtNode::Import(path, as_name) => {
+                    // Determine the name the module is bound to (alias, or file stem)
+                    let bind = as_name.clone().unwrap_or_else(|| {
+                        std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string()
+                    });
+                    // Define the module in the current scope so the linter knows it exists
+                    self.define(&bind, false);
+                },
             StmtNode::Switch(expr, cases, default) => {
                 self.check_expr(expr);
                 for (case_expr, block) in cases {
