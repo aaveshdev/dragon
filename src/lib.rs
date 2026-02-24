@@ -427,12 +427,13 @@ if let Some(entry_code) = sources.get("__entry__") {
         let mut parser = Parser::new(tokens);
         if let Ok(ast) = parser.parse() {
 
+            let rt = tokio::runtime::Runtime::new().unwrap(); // <--- Create Runtime
             if let StmtNode::Block(stmts) = ast.node {
                 for s in stmts {
-                    if eval_stmt(&s, env.clone()).is_err() { return -3; }
+                    if rt.block_on(eval_stmt(&s, env.clone())).is_err() { return -3; } // <--- block_on
                 }
             } else {
-                if eval_stmt(&ast, env.clone()).is_err() { return -3; }
+                if rt.block_on(eval_stmt(&ast, env.clone())).is_err() { return -3; } // <--- block_on
             }
         } else { return -4; }
     }
@@ -478,7 +479,8 @@ pub extern "C" fn Dragon_Call(func_name: *const c_char, json_args: *const c_char
     let func = env.lock().unwrap().get(name);
 
 if let Some(f) = func {
-        match call_dgn_func(f, dgn_args) {
+       let rt = tokio::runtime::Runtime::new().unwrap(); // <--- Create Runtime
+        match rt.block_on(call_dgn_func(f, dgn_args)) {   // <--- block_on
             Ok(res) => CString::new(dgn_to_json_str(&res)).unwrap().into_raw(),
             Err(e) => CString::new(format!("{{\"error\": \"{}\"}}", e.msg)).unwrap().into_raw(),
         }

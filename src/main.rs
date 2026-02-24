@@ -10,7 +10,7 @@ use std::env;
 use std::panic;
 
 const DGN_VERSION: &str = "Dragon Programming Language v1.0.3";
-const DGN_BUILD: &str = "Build 2026-02-20"; 
+const DGN_BUILD: &str = "Build 2026-02-22"; 
 const DGN_AUTHOR: &str = "Aavesh Jilani";
 fn main() {
     panic::set_hook(Box::new(|info| {
@@ -50,8 +50,13 @@ fn main() {
         let tokens = lex(entry);
         let mut parser = Parser::new(tokens);
         match parser.parse() {
-            Ok(ast) => { if let Err(e) = eval_stmt(&ast, env) { eprintln!("Runtime Error: {} at line {}", e.msg, e.line); std::process::exit(1); } },
-            Err(e) => { eprintln!("Bundle Parse Error: {}", e); std::process::exit(1); }
+            Ok(ast) => { 
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                if let Err(e) = rt.block_on(eval_stmt(&ast, env)) { 
+                    eprintln!("Runtime Error: {} at line {}", e.msg, e.line); 
+                    std::process::exit(1); 
+                } 
+            },   Err(e) => { eprintln!("Bundle Parse Error: {}", e); std::process::exit(1); }
         }
         return;
     }
@@ -73,12 +78,18 @@ fn main() {
         println!("  dragon -c <in> -o <out>           Compile script to Executable");
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
         println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
+        println!("  dragon -v, --version              Show version information");
         println!("");
         return;
     }
 
     let command = &args[1];
 
+    if command == "-v" || command == "--version" {
+        println!("{}", DGN_VERSION);
+        println!("{} by {}", DGN_BUILD, DGN_AUTHOR);
+        return;
+    }
 
     if command == "-build" {
        println!("Dragon Build System");
@@ -338,7 +349,8 @@ fn main() {
             let tokens = lex(&line);
             let mut parser = Parser::new(tokens);
             if let Ok(ast) = parser.parse_stmt() {
-                match eval_stmt(&ast, env.clone()) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(eval_stmt(&ast, env.clone())) {
                     Ok(EvalResult::Val(v)) | Ok(EvalResult::Return(v)) => println!("{}", val_to_string(&v)),
                     Err(e) => println!("Error: {} at line {}", e.msg, e.line),
                     _ => {}
@@ -401,7 +413,8 @@ fn main() {
                     }
 
 
-                    if let Err(e) = eval_stmt(&ast, env) {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    if let Err(e) = rt.block_on(eval_stmt(&ast, env)) {
                         eprintln!("Runtime Error: {} at line {}", e.msg, e.line);
                         std::process::exit(1);
                     }

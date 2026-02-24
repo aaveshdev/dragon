@@ -15,12 +15,19 @@ use std::os::raw::c_char;
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::io::{BufReader, BufRead};
 
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
+use async_recursion::async_recursion;
+
 use regex::Regex;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use tiny_http::{Server, Response, Header, Method};
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use libloading::{Library, Symbol};
 use lazy_static::lazy_static;
+
+use std::cell::RefCell;
+use tokio::task_local;
 
 #[cfg(target_arch = "wasm32")]
 use web_sys;
@@ -31,10 +38,9 @@ use libffi::middle::{Cif, Type, CodePtr, Arg};
 use std::ffi::c_void;
 
 lazy_static! {
-    static ref GC_STATE: Mutex<GcState> = Mutex::new(GcState::new());
+    // static ref GC_STATE: Mutex<GcState> = Mutex::new(GcState::new());
     static ref FFI_SIGNATURES: Mutex<HashMap<String, (String, Vec<String>)>> = Mutex::new(HashMap::new());
-
-    static ref FFI_STRUCTS: Mutex<HashMap<String, FfiStructDef>> = Mutex::new(HashMap::new());
+static ref FFI_STRUCTS: Mutex<HashMap<String, FfiStructDef>> = Mutex::new(HashMap::new());
 
     static ref TOKEN_REGEXES: Vec<(&'static str, Regex)> = vec![
         ("INC", Regex::new(r"^\+\+").unwrap()), 
@@ -45,13 +51,16 @@ lazy_static! {
         ("NUMBER", Regex::new(r"^[0-9]+(\.[0-9]+)?").unwrap()), 
         ("STRING", Regex::new(r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)+'"#).unwrap()), 
         ("NAME", Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*").unwrap()),
-        ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
+        ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|\?\?|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
         ("NEWLINE", Regex::new(r"^\n").unwrap()),
         ("SKIP", Regex::new(r"^[ \t\r\u{FEFF}\x00]+").unwrap()), 
         ("MISMATCH", Regex::new(r"^.").unwrap()),
     ];
 }
 
+task_local! {
+    pub static GC_STATE: RefCell<GcState>;
+}
 
 struct FfiStructDef {
     size: usize,
@@ -60,7 +69,9 @@ struct FfiStructDef {
 }
 // We need Send/Sync to store Type in a global Mutex, forcing unsafe impl if necessary
 // (libffi Types are generally thread-safe as they are read-only descriptors)
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 unsafe impl Send for FfiStructDef {}
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 unsafe impl Sync for FfiStructDef {}
 
 pub const BUNDLE_SIGNATURE: &[u8; 16] = b"DRAGON_BUNDLE_v1";
@@ -115,6 +126,7 @@ pub enum ExprNode {
     FuncExpr(Vec<String>, Box<Stmt>),
     New(Box<Expr>, Vec<Expr>),
     Super(String, Vec<Expr>),
+    Await(Box<Expr>), // ADD THIS
 }
 
 #[derive(Debug, Clone)]
@@ -132,10 +144,16 @@ pub enum StmtNode {
     CFor(Option<Expr>, Option<Expr>, Option<Expr>, Box<Stmt>),
     Switch(Expr, Vec<(Expr, Stmt)>, Option<Box<Stmt>>),
     Try(Box<Stmt>, Option<String>, Option<Box<Stmt>>, Option<Box<Stmt>>),
-    FuncDef(String, Vec<String>, Box<Stmt>),
+    FuncDef(String, Vec<String>, Box<Stmt>, bool),
     ClassDef(String, Option<String>, Box<Stmt>),
     Import(String, Option<String>),
     ConstDecl(String, Expr),
+}
+
+#[derive(Clone, Debug)]
+pub enum PromiseState {
+    Pending(Arc<AsyncMutex<Option<JoinHandle<Result<DgnValue, DgnError>>>>>),
+    Resolved(Result<DgnValue, DgnError>),
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +174,7 @@ pub enum DgnValue {
     Thread(Arc<thread::JoinHandle<()>>), 
    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     Socket(Arc<Mutex<TcpStream>>),
+    Promise(Arc<AsyncMutex<PromiseState>>),
 }
 
 
@@ -175,6 +194,7 @@ pub struct DgnFunc {
     pub body: Stmt,
     pub closure: Arc<Mutex<Env>>, 
     pub is_native: bool,
+    pub is_async: bool, // ADD THIS
     pub native_fn: Option<Arc<dyn Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync>>,
 }
 
@@ -196,28 +216,30 @@ impl GcState {
 }
 
 pub fn gc_register(val: &DgnValue) {
-    match val {
-        DgnValue::List(l) => {
-            let mut state = GC_STATE.lock().unwrap();
-            state.objects.push(WeakContainer::List(Arc::downgrade(l)));
-            state.allocations += 1;
-        },
-        DgnValue::Map(m) | DgnValue::Instance(m) => {
-            let mut state = GC_STATE.lock().unwrap();
-            state.objects.push(WeakContainer::Map(Arc::downgrade(m)));
-            state.allocations += 1;
-        },
-        _ => {}
-    }
+    // try_with safely checks if we are running inside an agent's Tokio task
+    let _ = GC_STATE.try_with(|state_cell| {
+        let mut state = state_cell.borrow_mut(); // No Mutex lock! Fast!
+        match val {
+            DgnValue::List(l) => {
+                state.objects.push(WeakContainer::List(Arc::downgrade(l)));
+                state.allocations += 1;
+            },
+            DgnValue::Map(m) | DgnValue::Instance(m) => {
+                state.objects.push(WeakContainer::Map(Arc::downgrade(m)));
+                state.allocations += 1;
+            },
+            _ => {}
+        }
+    });
 }
 
 pub fn gc_check_auto(env: Arc<Mutex<Env>>) {
-    let should = {
-        let state = GC_STATE.lock().unwrap();
+    let should_collect = GC_STATE.try_with(|state_cell| {
+        let state = state_cell.borrow();
         state.allocations >= state.threshold
-    };
+    }).unwrap_or(false);
     
-    if should {
+    if should_collect {
         gc_collect(env);
     }
 }
@@ -228,40 +250,41 @@ pub fn gc_collect(root_env: Arc<Mutex<Env>>) -> usize {
     
     mark_env(root_env, &mut visited_objs, &mut visited_envs);
     
-    let mut state = GC_STATE.lock().unwrap();
-    let mut reclaimed = 0;
-    
-    state.objects.retain(|weak| {
-        match weak {
-            WeakContainer::List(w) => {
-                if let Some(arc) = w.upgrade() {
-                    let ptr = Arc::as_ptr(&arc) as usize;
-                    if !visited_objs.contains(&ptr) {
-                        arc.lock().unwrap().clear();
-                        reclaimed += 1;
-                        return false; 
-                    }
-                    true 
-                } else { false }
-            },
-            WeakContainer::Map(w) => {
-                if let Some(arc) = w.upgrade() {
-                    let ptr = Arc::as_ptr(&arc) as usize;
-                    if !visited_objs.contains(&ptr) {
-                        arc.lock().unwrap().clear();
-                        reclaimed += 1;
-                        return false; 
-                    }
-                    true
-                } else { false }
+    GC_STATE.try_with(|state_cell| {
+        let mut state = state_cell.borrow_mut();
+        let mut reclaimed = 0;
+        
+        state.objects.retain(|weak| {
+            match weak {
+                WeakContainer::List(w) => {
+                    if let Some(arc) = w.upgrade() {
+                        let ptr = Arc::as_ptr(&arc) as usize;
+                        if !visited_objs.contains(&ptr) {
+                            arc.lock().unwrap().clear();
+                            reclaimed += 1;
+                            return false; 
+                        }
+                        true 
+                    } else { false }
+                },
+                WeakContainer::Map(w) => {
+                    if let Some(arc) = w.upgrade() {
+                        let ptr = Arc::as_ptr(&arc) as usize;
+                        if !visited_objs.contains(&ptr) {
+                            arc.lock().unwrap().clear();
+                            reclaimed += 1;
+                            return false; 
+                        }
+                        true
+                    } else { false }
+                }
             }
-        }
-    });
-    
-    state.allocations = 0;
-    reclaimed
+        });
+        
+        state.allocations = 0;
+        reclaimed
+    }).unwrap_or(0)
 }
-
 
 fn mark_env(env: Arc<Mutex<Env>>, visited_objs: &mut HashSet<usize>, visited_envs: &mut HashSet<usize>) {
     let mut curr = Some(env);
@@ -426,7 +449,7 @@ pub const KEYWORDS: &[&str] = &[
     "func","class","if","elif","else","while","return","True","False","null",
     "and","or","not","for","in","switch","case","default","break","continue",
     "import","as","try","catch","finally","raise","do","new","extends","this",
-    "super", "const", "var"
+    "super", "const", "var", "async", "await"
 ];
 
 pub fn lex(src: &str) -> Vec<Token> {
@@ -610,7 +633,11 @@ impl Parser {
 
         if cur == "const" { return self.parse_const(); }
         if cur == "var" { self.advance(); } 
-        if cur == "func" { return self.parse_func(); }
+        if cur == "async" { 
+            self.advance(); 
+            return self.parse_func(true); // ADD THIS BLOCK
+        }
+        if cur == "func" { return self.parse_func(false); }
         if cur == "class" { return self.parse_class(); }
         if cur == "return" {
             self.advance();
@@ -696,7 +723,7 @@ impl Parser {
         Ok(Stmt { node: StmtNode::ConstDecl(name, val), line })
     }
 
-    fn parse_func(&mut self) -> Result<Stmt, String> {
+    fn parse_func(&mut self, is_async: bool) -> Result<Stmt, String> {
         let line = self.current().line;
         self.expect("func")?;
         let mut name = String::new();
@@ -713,7 +740,7 @@ impl Parser {
         }
         self.expect(")")?;
         let body = self.parse_block()?;
-        Ok(Stmt { node: StmtNode::FuncDef(name, params, Box::new(body)), line })
+        Ok(Stmt { node: StmtNode::FuncDef(name, params, Box::new(body), is_async), line })
     }
 
     fn parse_bitwise(&mut self) -> Result<Expr, String> {
@@ -915,12 +942,25 @@ impl Parser {
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, String> {
-        let node = self.parse_or()?;
+        // MUST be changed from parse_or() to parse_null_coalesce()
+        let node = self.parse_null_coalesce()?; 
         if self.match_token("?") {
             let t = self.parse_expr()?;
             self.expect(":")?;
             let f = self.parse_expr()?;
             return Ok(Expr { node: ExprNode::Ternary(Box::new(node.clone()), Box::new(t), Box::new(f)), line: node.line });
+        }
+        Ok(node)
+    }
+
+    fn parse_null_coalesce(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_or()?;
+        while self.match_token("??") {
+            let rhs = self.parse_or()?;
+            node = Expr { 
+                node: ExprNode::Binary("??".to_string(), Box::new(node.clone()), Box::new(rhs)), 
+                line: node.line 
+            };
         }
         Ok(node)
     }
@@ -1011,6 +1051,12 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        if self.match_token("await") {
+            let line = self.current().line;
+            let expr = self.parse_unary()?;
+            return Ok(Expr { node: ExprNode::Await(Box::new(expr)), line });
+        }
+
         if self.current().typ == TokenType::Op && ["+", "-"].contains(&self.current().value.as_str()) {
             let op = self.advance().value;
             let v = self.parse_unary()?;
@@ -1019,8 +1065,12 @@ impl Parser {
             let mut cls_expr = self.parse_primary()?;
             
             while self.match_token(".") {
-                let attr = self.expect("NAME")?.value;
-                let line = cls_expr.line; 
+                let t = self.advance();
+                let attr = match t.typ {
+                    TokenType::Name | TokenType::Keyword(_) => t.value,
+                    _ => return Err(format!("Expected property name after '.', got '{}' at line {}", t.value, t.line))
+                };
+                let line = cls_expr.line;
                 cls_expr = Expr { 
                     node: ExprNode::GetAttr(Box::new(cls_expr), attr), 
                     line 
@@ -1059,7 +1109,12 @@ impl Parser {
                 self.expect(")")?;
                 node = Expr { node: ExprNode::Call(Box::new(node.clone()), args), line: node.line };
             } else if self.match_token(".") {
-                let attr = self.expect("NAME")?.value;
+                let t = self.advance();
+                let attr = match t.typ {
+                    TokenType::Name | TokenType::Keyword(_) => t.value,
+                    _ => return Err(format!("Expected property name after '.', got '{}' at line {}", t.value, t.line))
+                };
+                
                 node = Expr { node: ExprNode::GetAttr(Box::new(node.clone()), attr), line: node.line };
             } else if self.match_token("[") {
                 let idx = self.parse_expr()?;
@@ -1227,16 +1282,18 @@ pub fn val_to_string(v: &DgnValue) -> String {
         DgnValue::Socket(_) => "<Socket>".to_string(),
         DgnValue::Regex(r) => format!("<Regex {}>", r.as_str()),
         DgnValue::Thread(_) => "<Thread>".to_string(),
+        DgnValue::Promise(_) => "<Promise>".to_string(),
     }
 }
 
-pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnError> {
+#[async_recursion]
+pub async fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnError> {
     if let StmtNode::Block(_) = &stmt.node {
         gc_check_auto(env.clone());
     }
     match &stmt.node {
           StmtNode::ConstDecl(name, expr) => {
-            let val = eval_expr(expr, env.clone())?;
+            let val = eval_expr(expr, env.clone()).await?;
             env.lock().unwrap().define_const(name.clone(), val)
                 .map_err(|msg| DgnError::new(&msg, stmt.line))?;
             Ok(EvalResult::None)
@@ -1245,7 +1302,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             let block_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
             gc_check_auto(block_env.clone());
             for s in stmts {
-                let r = eval_stmt(s, block_env.clone())?;
+                let r = eval_stmt(s, block_env.clone()).await?;
                 match r {
                     EvalResult::None => continue,
                     _ => return Ok(r),
@@ -1254,34 +1311,34 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             Ok(EvalResult::None)
         },
         StmtNode::Expr(e) => {
-            eval_expr(e, env)?;
+            eval_expr(e, env).await?;
             Ok(EvalResult::None)
         },
         StmtNode::Return(e) => {
-            let val = if let Some(expr) = e { eval_expr(expr, env)? } else { DgnValue::Null };
+            let val = if let Some(expr) = e { eval_expr(expr, env).await? } else { DgnValue::Null };
             Ok(EvalResult::Return(val))
         },
         StmtNode::Break => Ok(EvalResult::Break),
         StmtNode::Continue => Ok(EvalResult::Continue),
         StmtNode::Raise(e) => {
-            let msg = val_to_string(&eval_expr(e, env)?);
+            let msg = val_to_string(&eval_expr(e, env).await?);
             Err(DgnError::new(&msg, stmt.line))
         },
         StmtNode::IfChain(chain) => {
             for (cond, block) in chain {
                 if let Some(c) = cond {
-                    if is_truthy(&eval_expr(c, env.clone())?) {
-                        return eval_stmt(block, env);
+                    if is_truthy(&eval_expr(c, env.clone()).await?) {
+                        return eval_stmt(block, env).await;
                     }
                 } else {
-                    return eval_stmt(block, env);
+                    return eval_stmt(block, env).await;
                 }
             }
             Ok(EvalResult::None)
         },
         StmtNode::While(cond, body) => {
-            while is_truthy(&eval_expr(cond, env.clone())?) {
-                let res = eval_stmt(body, env.clone())?;
+            while is_truthy(&eval_expr(cond, env.clone()).await?) {
+                let res = eval_stmt(body, env.clone()).await?;
                 match res {
                     EvalResult::Break => break,
                     EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
@@ -1292,18 +1349,18 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
         },
         StmtNode::DoWhile(body, cond) => {
             loop {
-                let res = eval_stmt(body, env.clone())?;
+                let res = eval_stmt(body, env.clone()).await?;
                 match res {
                     EvalResult::Break => break,
                     EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
                     _ => {}
                 }
-                if !is_truthy(&eval_expr(cond, env.clone())?) { break; }
+                if !is_truthy(&eval_expr(cond, env.clone()).await?) { break; }
             }
             Ok(EvalResult::None)
         },
         StmtNode::For(name, iter_expr, body) => {
-            let iter = eval_expr(iter_expr, env.clone())?;
+            let iter = eval_expr(iter_expr, env.clone()).await?;
             let items = match iter {
                 DgnValue::List(l) => l.lock().unwrap().clone(),
                 DgnValue::String(s) => s.chars().map(|c| DgnValue::String(c.to_string())).collect(),
@@ -1315,7 +1372,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             for item in items {
                 let new_scope = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
                 new_scope.lock().unwrap().set(name.clone(), item).map_err(|e| DgnError::new(&e, 0))?;
-                let res = eval_stmt(body, new_scope)?;
+                let res = eval_stmt(body, new_scope).await?;
                 match res {
                     EvalResult::Break => break,
                     EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
@@ -1326,27 +1383,27 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
         },
         StmtNode::CFor(init, cond, step, body) => {
             let loop_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
-            if let Some(i) = init { eval_expr(i, loop_env.clone())?; }
+            if let Some(i) = init { eval_expr(i, loop_env.clone()).await?; }
             
             loop {
                 if let Some(c) = cond {
-                    if !is_truthy(&eval_expr(c, loop_env.clone())?) { break; }
+                    if !is_truthy(&eval_expr(c, loop_env.clone()).await?) { break; }
                 }
-                let res = eval_stmt(body, loop_env.clone())?;
+                let res = eval_stmt(body, loop_env.clone()).await?;
                 match res {
                     EvalResult::Break => break,
                     EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
                     _ => {}
                 }
-                if let Some(s) = step { eval_expr(s, loop_env.clone())?; }
+                if let Some(s) = step { eval_expr(s, loop_env.clone()).await?; }
             }
             Ok(EvalResult::None)
         },
         StmtNode::Switch(val_expr, cases, default) => {
-            let val = eval_expr(val_expr, env.clone())?;
+            let val = eval_expr(val_expr, env.clone()).await?;
             let mut matched = false;
             for (case_expr, block) in cases {
-                let c_val = eval_expr(case_expr, env.clone())?;
+                let c_val = eval_expr(case_expr, env.clone()).await?;
                 let eq = match (&val, &c_val) {
                     (DgnValue::Number(a), DgnValue::Number(b)) => (a-b).abs() < f64::EPSILON,
                     (DgnValue::String(a), DgnValue::String(b)) => a == b,
@@ -1355,7 +1412,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                     _ => false 
                 };
                 if eq {
-                    let r = eval_stmt(block, Arc::new(Mutex::new(Env::new(Some(env.clone()), None))))?;
+                    let r = eval_stmt(block, Arc::new(Mutex::new(Env::new(Some(env.clone()), None)))).await?;
                     if let EvalResult::Break = r { return Ok(EvalResult::None); }
                     if let EvalResult::Return(_) = r { return Ok(r); }
                     matched = true;
@@ -1363,7 +1420,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             }
             if !matched {
                 if let Some(def) = default {
-                    let r = eval_stmt(def, Arc::new(Mutex::new(Env::new(Some(env.clone()), None))))?;
+                    let r = eval_stmt(def, Arc::new(Mutex::new(Env::new(Some(env.clone()), None)))).await?;
                     if let EvalResult::Break = r { return Ok(EvalResult::None); }
                     if let EvalResult::Return(_) = r { return Ok(r); }
                 }
@@ -1371,7 +1428,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             Ok(EvalResult::None)
         },
         StmtNode::Try(try_b, catch_var, catch_b, fin_b) => {
-            let res = eval_stmt(try_b, env.clone());
+            let res = eval_stmt(try_b, env.clone()).await;
             let mut final_res = Ok(EvalResult::None);
 
             if let Err(e) = res {
@@ -1380,7 +1437,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
                     if let Some(v) = catch_var {
                         catch_env.lock().unwrap().set(v.clone(), DgnValue::String(e.msg)).map_err(|e| DgnError::new(&e, 0))?;
                     }
-                    final_res = eval_stmt(cb, catch_env);
+                    final_res = eval_stmt(cb, catch_env).await;
                 } else {
                     final_res = Err(e);
                 }
@@ -1389,17 +1446,18 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             }
 
             if let Some(fb) = fin_b {
-                eval_stmt(fb, env.clone())?;
+                eval_stmt(fb, env.clone()).await?;
             }
             final_res
         },
-        StmtNode::FuncDef(name, params, body) => {
+        StmtNode::FuncDef(name, params, body, is_async) => {
             let func = DgnFunc {
                 name: Some(name.clone()),
                 params: params.clone(),
                 body: *body.clone(),
                 closure: env.clone(),
                 is_native: false,
+                is_async: *is_async,
                 native_fn: None
             };
             if !name.is_empty() {
@@ -1428,10 +1486,10 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
             
             if let StmtNode::Block(stmts) = &body.node {
                 for s in stmts {
-                    eval_stmt(s, class_env.clone())?;
+                    eval_stmt(s, class_env.clone()).await?;
                 }
             } else {
-                eval_stmt(body, class_env.clone())?;
+                eval_stmt(body, class_env.clone()).await?;
             }
             env.lock().unwrap().set(name.clone(), DgnValue::Class(class_env)).map_err(|e| DgnError::new(&e, 0))?;
             Ok(EvalResult::None)
@@ -1547,7 +1605,7 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
 
                 if let StmtNode::Block(stmts) = module_body.node {
                     for s in stmts {
-                        eval_stmt(&s, mod_env.clone())?;
+                        eval_stmt(&s, mod_env.clone()).await?;
                     }
                 }
                 mod_env.lock().unwrap().store.remove("__loading__");
@@ -1565,7 +1623,8 @@ pub fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnErr
     }
 }
 
-pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError> {
+#[async_recursion]
+pub async fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError> {
     match &expr.node {
         ExprNode::Number(n) => Ok(DgnValue::Number(*n)),
         ExprNode::String(s) => Ok(DgnValue::String(s.clone())),
@@ -1573,6 +1632,33 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
         ExprNode::Null => Ok(DgnValue::Null),
         ExprNode::This => {
             env.lock().unwrap().get("this").ok_or(DgnError::new("this not found", expr.line))
+        },
+
+        ExprNode::Await(inner) => {
+            let val = eval_expr(inner, env.clone()).await?;
+            // 1. Use `ref` so we don't move `state_arc` out of `val`
+            if let DgnValue::Promise(ref state_arc) = val {
+                let mut state = state_arc.lock().await;
+                
+                // 2. Extract the handle and immediately drop the internal borrow
+                let extracted_handle = match &mut *state {
+                    PromiseState::Resolved(res) => return res.clone(),
+                    PromiseState::Pending(handle_arc) => {
+                        let mut handle_lock = handle_arc.lock().await;
+                        handle_lock.take() // Takes the Option<JoinHandle> out
+                    }
+                };
+
+                // 3. Now that the inner lock is gone, we can safely await and mutate `state`
+                if let Some(handle) = extracted_handle {
+                    let res = handle.await.map_err(|_| DgnError::new("Promise panicked", expr.line))?;
+                    *state = PromiseState::Resolved(res.clone());
+                    return res;
+                } else {
+                    return Err(DgnError::new("Promise already consumed", expr.line));
+                }
+            }
+            Ok(val) // If they await a non-promise, just return it
         },
         
         ExprNode::Super(method_name, args_expr) => {
@@ -1593,8 +1679,8 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
 
                         if let DgnValue::Func(f) = method {
                             let mut args = Vec::new();
-                            for a in args_expr { args.push(eval_expr(a, env.clone())?); }
-                            return call_dgn_func_impl(f, args, Some(this_val));
+                            for a in args_expr { args.push(eval_expr(a, env.clone()).await?); }
+                            return call_dgn_func_impl(f, args, Some(this_val)).await;
                         }
                     }
                 }
@@ -1606,7 +1692,7 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
         },
         ExprNode::List(es) => {
             let mut vec = Vec::new();
-            for e in es { vec.push(eval_expr(e, env.clone())?); }
+            for e in es { vec.push(eval_expr(e, env.clone()).await?); }
             let val = DgnValue::List(Arc::new(Mutex::new(vec)));
             gc_register(&val); 
             Ok(val)
@@ -1614,14 +1700,14 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
         ExprNode::Obj(entries) => {
             let mut map = HashMap::new();
             for (k, v) in entries {
-                map.insert(k.clone(), eval_expr(v, env.clone())?);
+                map.insert(k.clone(), eval_expr(v, env.clone()).await?);
             }
             let val = DgnValue::Map(Arc::new(Mutex::new(map)));
             gc_register(&val); 
             Ok(val)
         },
         ExprNode::Assign(target, val_expr) => {
-            let val = eval_expr(val_expr, env.clone())?;
+            let val = eval_expr(val_expr, env.clone()).await?;
             match &target.node {
                 ExprNode::Var(name) => {
                     env.lock().unwrap()
@@ -1630,8 +1716,8 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
                     Ok(val)
                 },
                 ExprNode::Index(obj, idx) => {
-                    let o = eval_expr(obj, env.clone())?;
-                    let i = eval_expr(idx, env.clone())?;
+                    let o = eval_expr(obj, env.clone()).await?;
+                    let i = eval_expr(idx, env.clone()).await?;
                     match o {
                         DgnValue::List(l) => {
                             if let DgnValue::Number(n) = i {
@@ -1661,7 +1747,7 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
                     Ok(val)
                 },
                 ExprNode::GetAttr(obj, name) => {
-                    let o = eval_expr(obj, env.clone())?;
+                    let o = eval_expr(obj, env.clone()).await?;
                     if let DgnValue::Map(m) | DgnValue::Instance(m) = o {
                         m.lock().unwrap().insert(name.clone(), val.clone());
                         Ok(val)
@@ -1673,7 +1759,7 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
             }
         },
         ExprNode::Unary(op, rhs) => {
-             let v = eval_expr(rhs, env)?;
+             let v = eval_expr(rhs, env).await?;
              match (op.as_str(), v) {
                  ("-", DgnValue::Number(n)) => Ok(DgnValue::Number(-n)),
                  ("not", x) => Ok(DgnValue::Bool(!is_truthy(&x))),
@@ -1681,11 +1767,15 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
              }
         },
         ExprNode::Binary(op, lhs, rhs) => {
-            let l = eval_expr(lhs, env.clone())?;
-            if op == "and" { return Ok(if !is_truthy(&l) { l } else { eval_expr(rhs, env)? }); }
-            if op == "or" { return Ok(if is_truthy(&l) { l } else { eval_expr(rhs, env)? }); }
-            
-            let r = eval_expr(rhs, env)?;
+            let l = eval_expr(lhs, env.clone()).await?;
+            if op == "and" { return Ok(if !is_truthy(&l) { l } else { eval_expr(rhs, env).await? }); }
+            if op == "or" { return Ok(if is_truthy(&l) { l } else { eval_expr(rhs, env).await? }); }
+
+            if op == "??" { 
+                return Ok(if let DgnValue::Null = l { eval_expr(rhs, env).await? } else { l }); 
+                
+            }
+            let r = eval_expr(rhs, env).await?;
             
             match op.as_str() {
                 "+" => match (l, r) {
@@ -1748,23 +1838,36 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
                 _ => Ok(DgnValue::Null)
             }
         },
-        ExprNode::Call(func_expr, args_expr) => {
-            let func_val = eval_expr(func_expr, env.clone())?;
+       ExprNode::Call(func_expr, args_expr) => {
+            let func_val = eval_expr(func_expr, env.clone()).await?;
             let mut args = Vec::new();
-            for a in args_expr { args.push(eval_expr(a, env.clone())?); }
+            for a in args_expr { args.push(eval_expr(a, env.clone()).await?); }
             
-            call_dgn_func(func_val, args).map_err(|mut e| { 
+            // Check if it's an async function being called
+            if let DgnValue::Func(f) = &func_val {
+                if f.is_async {
+                    let f_clone = f.clone();
+                    let handle = tokio::spawn(async move {
+                        call_dgn_func_impl(f_clone, args, None).await
+                    });
+                    
+                    let handle_arc = Arc::new(AsyncMutex::new(Some(handle)));
+                    return Ok(DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(handle_arc)))));
+                }
+            }
+            
+            call_dgn_func(func_val, args).await.map_err(|mut e| { 
                 if e.line == 0 { e.line = expr.line; } 
                 e 
             })
         },
         ExprNode::GetAttr(obj_expr, name) => {
-            let obj = eval_expr(obj_expr, env.clone())?;
+            let obj = eval_expr(obj_expr, env.clone()).await?;
             get_attr(obj, name).map_err(|mut e| { e.line = expr.line; e })
         },
         ExprNode::Index(obj, idx) => {
-             let o = eval_expr(obj, env.clone())?;
-             let i = eval_expr(idx, env.clone())?;
+             let o = eval_expr(obj, env.clone()).await?;
+             let i = eval_expr(idx, env.clone()).await?;
              match (o, i) {
                  (DgnValue::List(l), DgnValue::Number(n)) => {
                      let vec = l.lock().unwrap();
@@ -1790,16 +1893,16 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
              }
         },
         ExprNode::Ternary(c, t, f) => {
-            if is_truthy(&eval_expr(c, env.clone())?) { eval_expr(t, env) } else { eval_expr(f, env) }
+            if is_truthy(&eval_expr(c, env.clone()).await?) { eval_expr(t, env).await } else { eval_expr(f, env).await }
         },
         ExprNode::FuncExpr(params, body) => {
              Ok(DgnValue::Func(DgnFunc {
-                 name: None, params: params.clone(), body: *body.clone(), closure: env.clone(), is_native: false, native_fn: None
+                 name: None, params: params.clone(), body: *body.clone(), closure: env.clone(), is_native: false, is_async: false, native_fn: None
              }))
         },
         ExprNode::New(cls_expr, args) => {
 
-             let cls_val = eval_expr(cls_expr, env.clone())?;
+             let cls_val = eval_expr(cls_expr, env.clone()).await?;
              
              if let DgnValue::Class(cls_env) = cls_val {
                  let instance_map = Arc::new(Mutex::new(HashMap::new()));
@@ -1810,7 +1913,7 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
                  
                  if let Ok(init_func) = get_attr(instance.clone(), "init") {
                      if let DgnValue::Func(_) = init_func {
-                        call_dgn_func(init_func, args_expr_to_val(args, env.clone())?).map_err(|mut e| { e.line = expr.line; e })?;
+                        call_dgn_func(init_func, args_expr_to_val(args, env.clone()).await?).await.map_err(|mut e| { e.line = expr.line; e })?;
                      }
                  }
                  
@@ -1820,21 +1923,21 @@ pub fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError
              }
         },
         ExprNode::PreOp(op, target) => {
-             handle_inc_dec(op, target, env, true).map_err(|mut e| { e.line = expr.line; e })
+             handle_inc_dec(op, target, env, true).await.map_err(|mut e| { e.line = expr.line; e })
         },
         ExprNode::PostOp(op, target) => {
-             handle_inc_dec(op, target, env, false).map_err(|mut e| { e.line = expr.line; e })
+             handle_inc_dec(op, target, env, false).await.map_err(|mut e| { e.line = expr.line; e })
         },
     }
 }
 
-pub fn args_expr_to_val(args: &[Expr], env: Arc<Mutex<Env>>) -> Result<Vec<DgnValue>, DgnError> {
+pub async fn args_expr_to_val(args: &[Expr], env: Arc<Mutex<Env>>) -> Result<Vec<DgnValue>, DgnError> {
     let mut v = Vec::new();
-    for a in args { v.push(eval_expr(a, env.clone())?); }
+    for a in args { v.push(eval_expr(a, env.clone()).await?); }
     Ok(v)
 }
 
-pub fn handle_inc_dec(op: &str, target: &Expr, env: Arc<Mutex<Env>>, is_pre: bool) -> Result<DgnValue, DgnError> {
+pub async fn handle_inc_dec(op: &str, target: &Expr, env: Arc<Mutex<Env>>, is_pre: bool) -> Result<DgnValue, DgnError> {
     match &target.node {
         // Case 1: Simple Variables (i++)
         ExprNode::Var(name) => {
@@ -1848,7 +1951,7 @@ pub fn handle_inc_dec(op: &str, target: &Expr, env: Arc<Mutex<Env>>, is_pre: boo
         
         // Case 2: Object Properties (this.pc++)
         ExprNode::GetAttr(obj_expr, name) => {
-            let obj = eval_expr(obj_expr, env.clone())?;
+            let obj = eval_expr(obj_expr, env.clone()).await?;
             // Use existing get_attr helper to resolve value (handles inheritance)
             let current = get_attr(obj.clone(), name)?; 
             
@@ -1871,8 +1974,8 @@ pub fn handle_inc_dec(op: &str, target: &Expr, env: Arc<Mutex<Env>>, is_pre: boo
 
         // Case 3: Index/Array Access (arr[0]++)
         ExprNode::Index(obj_expr, idx_expr) => {
-            let obj = eval_expr(obj_expr, env.clone())?;
-            let idx = eval_expr(idx_expr, env.clone())?;
+            let obj = eval_expr(obj_expr, env.clone()).await?;
+            let idx = eval_expr(idx_expr, env.clone()).await?;
 
             match obj {
                 DgnValue::List(list) => {
@@ -1925,6 +2028,81 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                 return Ok(val);
             }
             Ok(DgnValue::Null)
+        },
+
+        DgnValue::Promise(state_arc) => {
+            match name {
+                "then" => {
+                    let state_arc_clone = state_arc.clone();
+                    Ok(native_fn(move |args| {
+                        let callback = args.get(0).cloned().ok_or(DgnError::new("Expected callback for .then", 0))?;
+                        let state = state_arc_clone.clone();
+                        
+                        // Return a NEW Promise representing the chain
+                        let handle = tokio::spawn(async move {
+                            let mut s = state.lock().await;
+                            
+                            let extracted_handle = match &mut *s {
+                                PromiseState::Resolved(r) => return r.clone(),
+                                PromiseState::Pending(h_arc) => {
+                                    let mut h_lock = h_arc.lock().await;
+                                    h_lock.take()
+                                }
+                            };
+                            
+                            let res = if let Some(h) = extracted_handle {
+                                let r = h.await.map_err(|_| DgnError::new("Promise panicked", 0))?;
+                                *s = PromiseState::Resolved(r.clone());
+                                r
+                            } else {
+                                Err(DgnError::new("Promise already consumed", 0))
+                            };
+                            
+                            match res {
+                                Ok(val) => call_dgn_func(callback, vec![val]).await,
+                                Err(e) => Err(e),
+                            }
+                        });
+                        
+                        Ok(DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(Arc::new(AsyncMutex::new(Some(handle))))))))
+                    }))
+                },
+                "catch" => {
+                    let state_arc_clone = state_arc.clone();
+                    Ok(native_fn(move |args| {
+                        let callback = args.get(0).cloned().ok_or(DgnError::new("Expected callback for .catch", 0))?;
+                        let state = state_arc_clone.clone();
+                        
+                        let handle = tokio::spawn(async move {
+                            let mut s = state.lock().await;
+                            
+                            let extracted_handle = match &mut *s {
+                                PromiseState::Resolved(r) => return r.clone(),
+                                PromiseState::Pending(h_arc) => {
+                                    let mut h_lock = h_arc.lock().await;
+                                    h_lock.take()
+                                }
+                            };
+                            
+                            let res = if let Some(h) = extracted_handle {
+                                let r = h.await.map_err(|_| DgnError::new("Promise panicked", 0))?;
+                                *s = PromiseState::Resolved(r.clone());
+                                r
+                            } else {
+                                Err(DgnError::new("Promise already consumed", 0))
+                            };
+                            
+                            match res {
+                                Ok(val) => Ok(val), 
+                                Err(e) => call_dgn_func(callback, vec![DgnValue::String(e.msg)]).await,
+                            }
+                        });
+                        
+                        Ok(DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(Arc::new(AsyncMutex::new(Some(handle))))))))
+                    }))
+                },
+                _ => Ok(DgnValue::Null)
+            }
         },
 
         DgnValue::Map(m) => {
@@ -1991,8 +2169,12 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                              name: f.name.clone(), params: f.params.clone(), body: Stmt { node: StmtNode::Block(vec![]), line: 0 },
                              closure: f.closure.clone(),
                              is_native: true,
+                             is_async: f.is_async,
                              native_fn: Some(Arc::new(move |args| {
-                                 call_dgn_func_impl(f_clone.clone(), args, Some(DgnValue::Instance(inst_capture.clone())))
+                                 let rt = tokio::runtime::Handle::current();
+                                    tokio::task::block_in_place(|| {
+                                        rt.block_on(call_dgn_func_impl(f_clone.clone(), args, Some(DgnValue::Instance(inst_capture.clone()))))
+                                    })
                              }))
                          }));
                      }
@@ -2033,22 +2215,32 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
                     let old_vec = l.lock().unwrap().clone();
                     let mut new_vec = Vec::new();
+                    
+                    // Grab the current runtime to block on the async function safely
+                    let rt = tokio::runtime::Handle::current(); 
+                    
                     for item in old_vec {
-                        new_vec.push(call_dgn_func(func.clone(), vec![item])?);
+                        let val = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item])))?;
+                        new_vec.push(val);
                     }
                     Ok(DgnValue::List(Arc::new(Mutex::new(new_vec))))
                 })),
                 "filter" => Ok(native_method(l, |l, args| {
-                    let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
-                    let old_vec = l.lock().unwrap().clone();
-                    let mut new_vec = Vec::new();
-                    for item in old_vec {
-                        if is_truthy(&call_dgn_func(func.clone(), vec![item.clone()])?) {
-                            new_vec.push(item);
+                        let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
+                        let old_vec = l.lock().unwrap().clone();
+                        let mut new_vec = Vec::new();
+                        
+                        let rt = tokio::runtime::Handle::current(); // Grab runtime
+                        
+                        for item in old_vec {
+                            // Block on the async call
+                            let res = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item.clone()])))?;
+                            if is_truthy(&res) {
+                                new_vec.push(item);
+                            }
                         }
-                    }
-                    Ok(DgnValue::List(Arc::new(Mutex::new(new_vec))))
-                })),
+                        Ok(DgnValue::List(Arc::new(Mutex::new(new_vec))))
+                    })),
                 "sort" => Ok(native_method(l, |l, _| {
                     let mut vec = l.lock().unwrap();
                     vec.sort_by(|a, b| {
@@ -2223,6 +2415,7 @@ pub fn native_method<T: Send + Sync + 'static>(target: Arc<T>, f: impl Fn(Arc<T>
     DgnValue::Func(DgnFunc {
         name: Some("native_method".into()), params: vec![], body: Stmt { node: StmtNode::Block(vec![]), line: 0 },
         closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true,
+        is_async: false,
         native_fn: Some(Arc::new(move |args| f(target.clone(), args)))
     })
 }
@@ -2230,23 +2423,23 @@ pub fn native_method<T: Send + Sync + 'static>(target: Arc<T>, f: impl Fn(Arc<T>
 pub fn native_fn(f: impl Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync + 'static) -> DgnValue {
     DgnValue::Func(DgnFunc {
         name: Some("native".into()), params: vec![], body: Stmt { node: StmtNode::Block(vec![]), line: 0 },
-        closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true,
+        closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true, is_async: false,
         native_fn: Some(Arc::new(f))
     })
 }
 
-pub fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnValue, DgnError> {
+pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnValue, DgnError> {
     if let DgnValue::Func(f) = func {
         if f.is_native {
              return (f.native_fn.unwrap())(args);
         }
-        call_dgn_func_impl(f, args, None)
+        call_dgn_func_impl(f, args, None).await
     } else {
         Err(DgnError::new("Not a function", 0))
     }
 }
 
-pub fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnValue>) -> Result<DgnValue, DgnError> {
+pub async fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnValue>) -> Result<DgnValue, DgnError> {
 
     let scope = Arc::new(Mutex::new(Env::new(Some(f.closure.clone()), None)));
     
@@ -2261,13 +2454,14 @@ pub fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnV
         scope.lock().unwrap().store.insert("this".to_string(), th);
     }
     
-    match eval_stmt(&f.body, scope) {
+    match eval_stmt(&f.body, scope).await {
         Ok(EvalResult::Return(v)) => Ok(v),
         Ok(_) => Ok(DgnValue::Null),
         Err(e) => Err(e),
     }
 }
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 fn get_ffi_type_info(name: &str) -> Option<(Type, usize, usize)> {
     match name {
         "u8" | "byte"   => Some((Type::u8(), 1, 1)),
@@ -2284,6 +2478,22 @@ fn get_ffi_type_info(name: &str) -> Option<(Type, usize, usize)> {
         _ => None, 
     }
 }
+
+fn make_promise<F>(f: F) -> DgnValue
+where
+    F: FnOnce() -> Result<DgnValue, DgnError> + Send + 'static,
+{
+    let blocking_handle = tokio::task::spawn_blocking(f);
+    
+    let async_handle = tokio::spawn(async move {
+        blocking_handle.await.unwrap_or_else(|_| Err(DgnError::new("Background thread panicked", 0)))
+    });
+    
+    DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(
+        Arc::new(AsyncMutex::new(Some(async_handle)))
+    ))))
+}
+
 
 pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
     match name {
@@ -2643,67 +2853,83 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
         },
         "net" =>{
             let mut map = HashMap::new();
+              #[cfg(not(target_arch = "wasm32"))]
+        {
               map.insert("http_get".to_string(), native_fn(|args| {
                     let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
                     
-                    match ureq::get(&url).call() {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            let text = resp.into_string().unwrap_or_default();
-                            
-                            let mut map1 = HashMap::new();
-                            map1.insert("status".to_string(), DgnValue::Number(status as f64));
-                            map1.insert("body".to_string(), DgnValue::String(text));
-                            Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
-                        },
-                        Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
-                    }
+                    Ok(make_promise(move || {
+                        match ureq::get(&url).call() {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let text = resp.into_string().unwrap_or_default();
+                                
+                                let mut map1 = HashMap::new();
+                                map1.insert("status".to_string(), DgnValue::Number(status as f64));
+                                map1.insert("body".to_string(), DgnValue::String(text));
+                                Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                            },
+                            Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
+                        }
+                    }))
                 }));
 
-
-               map.insert("http_post".to_string(), native_fn(|args| {
+                map.insert("http_post".to_string(), native_fn(|args| {
                     let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
                     let body = args.get(1).map(val_to_string).unwrap_or_default();
                     
-                    let mut req = ureq::post(&url);
-
+                    // Extract headers safely before passing them to the background thread
+                    let mut headers_vec = Vec::new();
                     if let Some(DgnValue::Map(headers)) = args.get(2) {
                         for (k, v) in headers.lock().unwrap().iter() {
-                            req = req.set(k, &val_to_string(v));
+                            headers_vec.push((k.clone(), val_to_string(v)));
                         }
                     }
 
-                    match req.send_string(&body) {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            let text = resp.into_string().unwrap_or_default();
-                            let mut map1 = HashMap::new();
-                            map1.insert("status".to_string(), DgnValue::Number(status as f64));
-                            map1.insert("body".to_string(), DgnValue::String(text));
-                            Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
-                        },
-                        Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
-                    }
+                    Ok(make_promise(move || {
+                        let mut req = ureq::post(&url);
+                        for (k, v) in headers_vec {
+                            req = req.set(&k, &v);
+                        }
+
+                        match req.send_string(&body) {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let text = resp.into_string().unwrap_or_default();
+                                let mut map1 = HashMap::new();
+                                map1.insert("status".to_string(), DgnValue::Number(status as f64));
+                                map1.insert("body".to_string(), DgnValue::String(text));
+                                Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                            },
+                            Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
+                        }
+                    }))
                 }));
 
-         #[cfg(not(target_arch = "wasm32"))]
-        {
+       
                 map.insert("socket_connect".to_string(), native_fn(|args| {
                     let addr = args.get(0).map(val_to_string).ok_or(DgnError::new("Address required", 0))?;
-                    match TcpStream::connect(&addr) {
-                        Ok(stream) => Ok(DgnValue::Socket(Arc::new(Mutex::new(stream)))),
-                        Err(e) => Err(DgnError::new(&format!("Connection failed: {}", e), 0))
-                    }
+                    
+                    Ok(make_promise(move || {
+                        match TcpStream::connect(&addr) {
+                            Ok(stream) => Ok(DgnValue::Socket(Arc::new(Mutex::new(stream)))),
+                            Err(e) => Err(DgnError::new(&format!("Connection failed: {}", e), 0))
+                        }
+                    }))
                 }));
 
                 map.insert("socket_send".to_string(), native_fn(|args| {
                     if let Some(DgnValue::Socket(s)) = args.get(0) {
                         let msg = args.get(1).map(val_to_string).unwrap_or_default();
-                        let mut stream = s.lock().unwrap();
-                        match stream.write_all(msg.as_bytes()) {
-                            Ok(_) => Ok(DgnValue::Bool(true)),
-                            Err(_) => Ok(DgnValue::Bool(false))
-                        }
+                        let socket_clone = s.clone();
+                        
+                        Ok(make_promise(move || {
+                            let mut stream = socket_clone.lock().unwrap();
+                            match stream.write_all(msg.as_bytes()) {
+                                Ok(_) => Ok(DgnValue::Bool(true)),
+                                Err(_) => Ok(DgnValue::Bool(false))
+                            }
+                        }))
                     } else {
                         Err(DgnError::new("Socket required", 0))
                     }
@@ -2711,13 +2937,17 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
 
                 map.insert("socket_read".to_string(), native_fn(|args| {
                     if let Some(DgnValue::Socket(s)) = args.get(0) {
-                        let mut stream = s.lock().unwrap();
-                        let mut reader = BufReader::new(&*stream);
-                        let mut buffer = String::new();
-                        match reader.read_line(&mut buffer) {
-                            Ok(_) => Ok(DgnValue::String(buffer)),
-                            Err(_) => Ok(DgnValue::Null)
-                        }
+                        let socket_clone = s.clone();
+                        
+                        Ok(make_promise(move || {
+                            let mut stream = socket_clone.lock().unwrap();
+                            let mut reader = BufReader::new(&*stream);
+                            let mut buffer = String::new();
+                            match reader.read_line(&mut buffer) {
+                                Ok(_) => Ok(DgnValue::String(buffer)),
+                                Err(_) => Ok(DgnValue::Null)
+                            }
+                        }))
                     } else {
                         Err(DgnError::new("Socket required", 0))
                     }
@@ -2738,10 +2968,15 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
                         .map_err(|e| DgnError::new(&e.to_string(), 0))?;
                         
                     thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap(); 
                         for stream in listener.incoming() {
                             if let Ok(s) = stream {
                                 let client_socket = DgnValue::Socket(Arc::new(Mutex::new(s)));
-                                let _ = call_dgn_func(handler.clone(), vec![client_socket]);
+                                let handler_clone = handler.clone();
+                                
+                                rt.spawn(async move {
+                                    let _ = call_dgn_func(handler_clone, vec![client_socket]).await; 
+                                });
                             }
                         }
                     });
@@ -2758,7 +2993,7 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
                             Ok(s) => s,
                             Err(e) => { println!("Failed to start server: {}", e); return; }
                         };
-                        
+                        let rt = tokio::runtime::Runtime::new().unwrap();
                         for mut request in server.incoming_requests() {
                             let method = request.method().to_string();
                             let url = request.url().to_string();
@@ -2813,7 +3048,10 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
                                 Ok(DgnValue::Null)
                             }));
 
-                            let _ = call_dgn_func(handler.clone(), vec![req_obj, DgnValue::Map(res_map)]);
+                            let handler_clone = handler.clone();
+                            rt.spawn(async move {
+                                let _ = call_dgn_func(handler_clone, vec![req_obj, DgnValue::Map(res_map)]).await;
+                            });
                         }
                     });
                     Ok(DgnValue::Bool(true))
@@ -3370,7 +3608,11 @@ map.insert("read_mem_int".to_string(), native_fn(|args| {
                     map.insert("spawn".to_string(), native_fn(|args| {
                         let func = args.get(0).cloned().ok_or(DgnError::new("Func required",0))?;
                         let t_args = if let Some(DgnValue::List(l)) = args.get(1) { l.lock().unwrap().clone() } else { vec![] };
-                        let handle = thread::spawn(move || { let _ = call_dgn_func(func, t_args); });
+                        let handle = thread::spawn(move || { 
+                            // Create a runtime for the new thread
+                            let rt = tokio::runtime::Runtime::new().unwrap(); 
+                            let _ = rt.block_on(call_dgn_func(func, t_args)); 
+                        });
                         Ok(DgnValue::Thread(Arc::new(handle)))
                     }));
             }
@@ -3485,6 +3727,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
             DgnValue::Socket(_) => "socket",
             DgnValue::Regex(_) => "regex",
             DgnValue::Thread(_) => "thread",
+            DgnValue::Promise(_) => "promise",
         };
         Ok(DgnValue::String(type_name.to_string()))
     }));
@@ -3790,7 +4033,7 @@ impl Linter {
                 self.check_stmt(body);
                 self.exit_scope();
             },
-            StmtNode::FuncDef(name, params, body) => {
+            StmtNode::FuncDef(name, params, body,_is_async) => {
                 self.define(name, false);
                 self.enter_scope();
                 for p in params { self.define(p, false); }
