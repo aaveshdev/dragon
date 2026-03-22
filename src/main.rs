@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::{HashMap};
 use std::fs::{self, File,OpenOptions};
 use std::path::{Path, PathBuf};
-use std::io::{Write, Read};
+use std::io::{Write, Read, Seek, SeekFrom};
 use std::env;
 use std::panic;
 
@@ -76,6 +76,7 @@ fn main() {
         println!("  dragon <file.dgn> [args...]       Run a script file");
         println!("  dragon --repl                     Start the interactive shell");
         println!("  dragon -c <in> -o <out>           Compile script to Executable");
+        println!("  dragon -c <in> -o <out> --window  Compile script to run in background (No Console)");
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
         println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("  dragon -v, --version              Show version information");
@@ -174,6 +175,7 @@ fn main() {
         let output_path = Path::new(&args[4]);
         let is_lib_mode = args.contains(&"--lib".to_string());
         let is_web_mode = args.contains(&"--web".to_string());
+        let is_window_mode = args.contains(&"--window".to_string());
         println!("Compiling {}...", input_path.display());
 
 
@@ -310,6 +312,14 @@ fn main() {
         else {
             fs::copy(&exe_path, output_path).expect("Copy failed");
             println!("Created Executable: {:?}", output_path);
+
+            if is_window_mode {
+                if let Err(e) = hide_windows_console(output_path) {
+                    println!("Warning: Could not set background execution mode: {}", e);
+                } else {
+                    println!("Enabled Window Mode (Background Execution).");
+                }
+            }
         }
 
         let mut outfile = fs::OpenOptions::new().append(true).open(output_path).unwrap();
@@ -448,4 +458,35 @@ fn get_key() -> Vec<u8> {
     key.push(10+20);
 
     key
+}
+
+fn hide_windows_console(path: &Path) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut dos_header = [0u8; 64];
+    
+    if file.read_exact(&mut dos_header).is_err() {
+        return Ok(()); 
+    }
+    
+    if dos_header[0] != b'M' || dos_header[1] != b'Z' {
+        return Ok(()); 
+    }
+    
+    let pe_offset = u32::from_le_bytes(dos_header[60..64].try_into().unwrap()) as u64;
+    
+    file.seek(SeekFrom::Start(pe_offset))?;
+    let mut pe_sig = [0u8; 4];
+    file.read_exact(&mut pe_sig)?;
+
+    if &pe_sig != b"PE\0\0" {
+        return Ok(()); 
+    }
+    
+    let subsystem_offset = pe_offset + 92;
+    file.seek(SeekFrom::Start(subsystem_offset))?;
+    
+    let gui_subsystem: u16 = 2;
+    file.write_all(&gui_subsystem.to_le_bytes())?;
+    
+    Ok(())
 }

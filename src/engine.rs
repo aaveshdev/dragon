@@ -22,7 +22,7 @@ use async_recursion::async_recursion;
 use regex::Regex;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use tiny_http::{Server, Response, Header, Method};
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32")))]
 use libloading::{Library, Symbol};
 use lazy_static::lazy_static;
 
@@ -32,9 +32,9 @@ use tokio::task_local;
 #[cfg(target_arch = "wasm32")]
 use web_sys;
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32")))]
 use libffi::middle::{Cif, Type, CodePtr, Arg};
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32")))]
 use std::ffi::c_void;
 
 lazy_static! {
@@ -69,9 +69,9 @@ struct FfiStructDef {
 }
 // We need Send/Sync to store Type in a global Mutex, forcing unsafe impl if necessary
 // (libffi Types are generally thread-safe as they are read-only descriptors)
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32")))]
 unsafe impl Send for FfiStructDef {}
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32")))]
 unsafe impl Sync for FfiStructDef {}
 
 pub const BUNDLE_SIGNATURE: &[u8; 16] = b"DRAGON_BUNDLE_v1";
@@ -168,7 +168,7 @@ pub enum DgnValue {
     Func(DgnFunc),
     Class(Arc<Mutex<Env>>),
     Instance(Arc<Mutex<HashMap<String, DgnValue>>>),
-    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    #[cfg(not(any(target_arch = "wasm32")))]
     NativeLib(Arc<Mutex<Library>>),
     Regex(Arc<Regex>),
     Thread(Arc<thread::JoinHandle<()>>), 
@@ -1276,7 +1276,7 @@ pub fn val_to_string(v: &DgnValue) -> String {
         DgnValue::Class(_) => "<class>".to_string(),
         DgnValue::Instance(_) => "<instance>".to_string(),
         DgnValue::ByteArray(b) => format!("<ByteArray len={}>", b.lock().unwrap().len()),
-       #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+       #[cfg(not(any(target_arch = "wasm32")))]
         DgnValue::NativeLib(_) => "<NativeLib>".to_string(),
         #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         DgnValue::Socket(_) => "<Socket>".to_string(),
@@ -2329,7 +2329,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                  _ => Ok(DgnValue::Null)
             }
         },
-       #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+       #[cfg(not(any(target_arch = "wasm32")))]
         DgnValue::NativeLib(lib) => {
             let lib_ref = lib.clone();
             let func_name = CString::new(name).unwrap();
@@ -2461,7 +2461,7 @@ pub async fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Optio
     }
 }
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32")))]
 fn get_ffi_type_info(name: &str) -> Option<(Type, usize, usize)> {
     match name {
         "u8" | "byte"   => Some((Type::u8(), 1, 1)),
@@ -2700,7 +2700,7 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
         },
         "os" => {
             let mut map = HashMap::new();
-            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+            #[cfg(not(any(target_arch = "wasm32")))]
             {
                 map.insert("name".to_string(), native_fn(|_| Ok(DgnValue::String(std::env::consts::OS.to_string()))));
                 map.insert("arch".to_string(), native_fn(|_| Ok(DgnValue::String(std::env::consts::ARCH.to_string()))));
@@ -2853,7 +2853,7 @@ pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
         },
         "net" =>{
             let mut map = HashMap::new();
-              #[cfg(not(target_arch = "wasm32"))]
+             #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
               map.insert("http_get".to_string(), native_fn(|args| {
                     let url = args.get(0).map(val_to_string).ok_or(DgnError::new("URL required", 0))?;
@@ -3721,7 +3721,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
             DgnValue::Func(_) => "function",
             DgnValue::Class(_) => "class", 
             DgnValue::Instance(_) => "instance",
-            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+            #[cfg(not(any(target_arch = "wasm32")))]
             DgnValue::NativeLib(_) => "nativelib",
             #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             DgnValue::Socket(_) => "socket",
