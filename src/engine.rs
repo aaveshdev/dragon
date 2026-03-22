@@ -42,6 +42,9 @@ lazy_static! {
     static ref FFI_SIGNATURES: Mutex<HashMap<String, (String, Vec<String>)>> = Mutex::new(HashMap::new());
 static ref FFI_STRUCTS: Mutex<HashMap<String, FfiStructDef>> = Mutex::new(HashMap::new());
 
+static ref BUILTIN_MODULE_CACHE: Mutex<HashMap<String, DgnValue>> =
+        Mutex::new(HashMap::new());
+
     static ref TOKEN_REGEXES: Vec<(&'static str, Regex)> = vec![
         ("INC", Regex::new(r"^\+\+").unwrap()), 
         ("DEC", Regex::new(r"^--").unwrap()), 
@@ -191,11 +194,14 @@ impl DgnValue {
 pub struct DgnFunc {
     pub name: Option<String>,
     pub params: Vec<String>,
-    pub body: Stmt,
-    pub closure: Arc<Mutex<Env>>, 
+    pub body: Option<Stmt>,
+    pub closure: Arc<Mutex<Env>>,
     pub is_native: bool,
-    pub is_async: bool, // ADD THIS
+    pub is_async: bool,
     pub native_fn: Option<Arc<dyn Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync>>,
+    /// Compiled bytecode for this function. When Some, the VM executes this
+    /// instead of tree-walking `body`.
+    pub compiled_chunk: Option<Arc<Chunk>>,
 }
 
 struct GcState {
@@ -362,6 +368,1198 @@ pub enum EvalResult {
     None,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Mod,
+    Eq, Ne, Lt, Gt, Le, Ge,
+    And, Or, NullCoalesce,
+    BitAnd, BitOr, BitXor, Shl, Shr,
+}
+
+// ─── BYTECODE COMPILER ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Instruction {
+    // Stack manipulation
+    LoadConst(DgnValue),       // Push a constant
+    LoadVar(String),           // Push variable value
+    StoreVar(String),          // Pop and assign to variable
+    DefineConst(String),       // Pop and define constant
+    Pop,                       // Discard top of stack
+
+    // Arithmetic / binary ops
+    BinaryOp(BinOp),         // e.g. "+", "-", "==", "and", "or"
+    UnaryOp(String),           // e.g. "-", "not"
+
+    // Collections
+    MakeList(usize),           // Pop N items, push List
+    MakeMap(usize),            // Pop N key-value pairs, push Map
+
+    // Control flow (index = absolute instruction index)
+    Jump(usize),               // Unconditional jump
+    JumpIfFalse(usize),        // Pop, jump if falsy
+    JumpIfTrue(usize),         // Pop, jump if truthy (for `or` short-circuit)
+
+    // Functions
+    // MakeFunc removed — replaced by MakeClosure
+    Call(usize),               // Pop func + N args, call
+    Return,                    // Return top of stack
+
+    // Object access
+    GetAttr(String),           // obj.name
+    SetAttr(String),           // obj.name = val
+    GetIndex,                  // obj[idx]
+    SetIndex,                  // obj[idx] = val
+
+    // Loops
+    ForIter(String, usize),    // var_name, exit_ip
+    Break,                     // break out of loop
+    Continue,                  // continue to loop start
+    DoWhileStart,              // marks do-while body start ip (patched after)
+
+    // Functions / closures
+    MakeClosure(Vec<String>, bool, Box<Vec<Instruction>>, Box<Vec<usize>>), // params, is_async, instrs, lines
+
+    // Classes / instances
+    MakeClass(String, Option<String>, Box<Vec<Instruction>>, Box<Vec<usize>>),
+    NewObject(usize),          // pops class + N args, creates instance
+    SuperCall(String, usize),  // super.method(N args)
+
+    // Exceptions
+    PushTry(usize),            // push try frame, arg = catch ip
+    PopTry,                    // pop try frame on success
+    Raise,                     // pop & throw as error
+    EnterCatch(String),        // bind caught error string to named var
+
+    // Async / await
+    Await,                     // pop Promise, await it
+
+    // Import
+    Import(String, Option<String>), // path, alias
+
+    // Inc/Dec — simple variable forms
+    IncVar(String),             // ++var  (pre,  pushes new value)
+    DecVar(String),             // --var  (pre,  pushes new value)
+    PostIncVar(String),         // var++  (post, pushes old value)
+    PostDecVar(String),         // var--  (post, pushes old value)
+    // Inc/Dec — attr/index forms: compiler emits obj (and idx) expressions
+    // onto the stack BEFORE these instructions, so they just pop.
+    // Stack before RMWAttr:  [..., obj]
+    // Stack before RMWIndex: [..., obj, idx]
+    ReadModWriteAttr(String, bool, bool), // attr, is_pre, is_dec  — pops obj, pushes result
+    ReadModWriteIndex(bool, bool),        // is_pre, is_dec        — pops obj+idx, pushes result
+
+    // Misc
+    Dup,                       // Duplicate top of stack
+    This,                      // Push `this`
+    Nop,
+    Halt,
+}
+
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub instructions: Vec<Instruction>,
+    pub source_lines: Vec<usize>,
+}
+
+impl Chunk {
+    pub fn new() -> Self {
+        Chunk { instructions: vec![], source_lines: vec![] }
+    }
+
+    pub fn emit(&mut self, instr: Instruction, line: usize) -> usize {
+        let idx = self.instructions.len();
+        self.instructions.push(instr);
+        self.source_lines.push(line);
+        idx
+    }
+
+    // Patch a Jump/JumpIfFalse target after you know the destination
+    pub fn patch_jump(&mut self, idx: usize, target: usize) {
+        match &mut self.instructions[idx] {
+            Instruction::Jump(t) | Instruction::JumpIfFalse(t) | Instruction::JumpIfTrue(t) => {
+                *t = target;
+            }
+            _ => {}
+        }
+    }
+}
+
+pub struct Compiler;
+
+impl Compiler {
+    /// Helper: compile a body into its own Chunk and return (instructions, lines)
+    fn compile_body(stmt: &Stmt) -> (Vec<Instruction>, Vec<usize>) {
+        let mut c = Chunk::new();
+        Self::compile_stmt(&mut c, stmt);
+        c.emit(Instruction::LoadConst(DgnValue::Null), 0);
+        c.emit(Instruction::Return, 0);
+        (c.instructions, c.source_lines)
+    }
+
+    /// Like compile_stmt but for REPL use: expression statements leave their
+    /// value on the stack (no trailing Pop) so the REPL can print it.
+    pub fn compile_repl_stmt(chunk: &mut Chunk, stmt: &Stmt) {
+        let line = stmt.line;
+        match &stmt.node {
+            StmtNode::Expr(e) => {
+                // No Pop — leave value on stack for the REPL to print
+                Self::compile_expr(chunk, e);
+            }
+            // Everything else compiles normally
+            _ => Self::compile_stmt(chunk, stmt),
+        }
+    }
+
+    pub fn compile_stmt(chunk: &mut Chunk, stmt: &Stmt) {
+        let line = stmt.line;
+        match &stmt.node {
+
+            StmtNode::Block(stmts) => {
+                // PASS 1: Hoist all function definitions to the top
+                for s in stmts {
+                    if let StmtNode::FuncDef(..) | StmtNode::ClassDef(..) = &s.node {
+                        Self::compile_stmt(chunk, s);
+                    }
+                }
+                
+                // PASS 2: Compile everything else
+                for s in stmts {
+                    if !matches!(s.node, StmtNode::FuncDef(..) | StmtNode::ClassDef(..)) {
+                        Self::compile_stmt(chunk, s);
+                    }
+                }
+            }
+
+            StmtNode::Expr(e) => {
+                Self::compile_expr(chunk, e);
+                chunk.emit(Instruction::Pop, line);
+            }
+
+            StmtNode::Return(opt_e) => {
+                match opt_e {
+                    Some(e) => Self::compile_expr(chunk, e),
+                    None    => { chunk.emit(Instruction::LoadConst(DgnValue::Null), line); }
+                };
+                chunk.emit(Instruction::Return, line);
+            }
+
+            StmtNode::Break    => { chunk.emit(Instruction::Break, line); }
+            StmtNode::Continue => { chunk.emit(Instruction::Continue, line); }
+
+            StmtNode::Raise(e) => {
+                Self::compile_expr(chunk, e);
+                chunk.emit(Instruction::Raise, line);
+            }
+
+            StmtNode::ConstDecl(name, e) => {
+                Self::compile_expr(chunk, e);
+                chunk.emit(Instruction::DefineConst(name.clone()), line);
+            }
+
+            // ── func definition ──────────────────────────────────────────────
+            StmtNode::FuncDef(name, params, body, is_async) => {
+                let (instrs, lines) = Self::compile_body(body);
+                let instr = Instruction::MakeClosure(
+                    params.clone(), *is_async,
+                    Box::new(instrs), Box::new(lines),
+                );
+                chunk.emit(instr, line);
+                if !name.is_empty() {
+                    chunk.emit(Instruction::StoreVar(name.clone()), line);
+                }
+            }
+
+            // ── if / elif / else ──────────────────────────────────────────────
+            StmtNode::IfChain(chain) => {
+                let mut end_jumps = vec![];
+                for (cond_opt, body) in chain {
+                    if let Some(cond) = cond_opt {
+                        Self::compile_expr(chunk, cond);
+                        let false_jump = chunk.emit(Instruction::JumpIfFalse(0), line);
+                        Self::compile_stmt(chunk, body);
+                        let end_jump = chunk.emit(Instruction::Jump(0), line);
+                        end_jumps.push(end_jump);
+                        chunk.patch_jump(false_jump, chunk.instructions.len());
+                    } else {
+                        Self::compile_stmt(chunk, body);
+                        let end_jump = chunk.emit(Instruction::Jump(0), line);
+                        end_jumps.push(end_jump);
+                    }
+                }
+                let end = chunk.instructions.len();
+                for j in end_jumps { chunk.patch_jump(j, end); }
+            }
+
+            // ── while ─────────────────────────────────────────────────────────
+            StmtNode::While(cond, body) => {
+                let loop_start = chunk.instructions.len();
+                Self::compile_expr(chunk, cond);
+                let exit_jump = chunk.emit(Instruction::JumpIfFalse(0), line);
+                // compile body; break/continue are patched below
+                let body_start = chunk.instructions.len();
+                Self::compile_stmt(chunk, body);
+                chunk.emit(Instruction::Jump(loop_start), line);
+                let loop_end = chunk.instructions.len();
+                chunk.patch_jump(exit_jump, loop_end);
+                // patch break/continue inside this loop body
+                Self::patch_loop_jumps(chunk, body_start, loop_end, loop_start);
+            }
+
+            // ── do-while ──────────────────────────────────────────────────────
+            StmtNode::DoWhile(body, cond) => {
+                let body_start = chunk.instructions.len();
+                Self::compile_stmt(chunk, body);
+                let cond_start = chunk.instructions.len();
+                Self::compile_expr(chunk, cond);
+                chunk.emit(Instruction::JumpIfFalse(0), line); // patched below
+                let back_jump = chunk.instructions.len() - 1;
+                chunk.emit(Instruction::Jump(body_start), line);
+                let loop_end = chunk.instructions.len();
+                chunk.patch_jump(back_jump, loop_end);
+                Self::patch_loop_jumps(chunk, body_start, loop_end, cond_start);
+            }
+
+            // ── for-in ────────────────────────────────────────────────────────
+            StmtNode::For(var_name, iter_expr, body) => {
+                Self::compile_expr(chunk, iter_expr);
+                // ForIter pops the iterable, iterates: on each step pushes item
+                // and sets var, jumps to exit when exhausted
+                let for_iter_ip = chunk.emit(Instruction::ForIter(var_name.clone(), 0), line);
+                let body_start = chunk.instructions.len();
+                Self::compile_stmt(chunk, body);
+                chunk.emit(Instruction::Jump(for_iter_ip), line); // next iteration
+                let loop_end = chunk.instructions.len();
+                chunk.patch_jump(for_iter_ip, loop_end);
+                Self::patch_loop_jumps(chunk, body_start, loop_end, for_iter_ip);
+            }
+
+            // ── C-style for ───────────────────────────────────────────────────
+            StmtNode::CFor(init, cond, step, body) => {
+                if let Some(i) = init {
+                    Self::compile_expr(chunk, i);
+                    chunk.emit(Instruction::Pop, line);
+                }
+                let loop_start = chunk.instructions.len();
+                let exit_jump = if let Some(c) = cond {
+                    Self::compile_expr(chunk, c);
+                    Some(chunk.emit(Instruction::JumpIfFalse(0), line))
+                } else { None };
+                let body_start = chunk.instructions.len();
+                Self::compile_stmt(chunk, body);
+                let step_ip = chunk.instructions.len();
+                if let Some(s) = step {
+                    Self::compile_expr(chunk, s);
+                    chunk.emit(Instruction::Pop, line);
+                }
+                chunk.emit(Instruction::Jump(loop_start), line);
+                let loop_end = chunk.instructions.len();
+                if let Some(j) = exit_jump { chunk.patch_jump(j, loop_end); }
+                Self::patch_loop_jumps(chunk, body_start, loop_end, step_ip);
+            }
+
+            // ── switch ────────────────────────────────────────────────────────
+            StmtNode::Switch(val_expr, cases, default) => {
+                Self::compile_expr(chunk, val_expr);
+                // Stack: [switch_val]  (stays on stack throughout)
+                let mut end_jumps = vec![];
+                for (case_expr, block) in cases {
+                    chunk.emit(Instruction::Dup, line);
+                    Self::compile_expr(chunk, case_expr);
+                    chunk.emit(Instruction::BinaryOp(BinOp::Eq), line);
+                    let skip = chunk.emit(Instruction::JumpIfFalse(0), line);
+                    chunk.emit(Instruction::Pop, line); // pop switch_val on match
+                    Self::compile_stmt(chunk, block);
+                    end_jumps.push(chunk.emit(Instruction::Jump(0), line));
+                    chunk.patch_jump(skip, chunk.instructions.len());
+                }
+                if let Some(def) = default {
+                    chunk.emit(Instruction::Pop, line); // pop switch_val
+                    Self::compile_stmt(chunk, def);
+                } else {
+                    chunk.emit(Instruction::Pop, line); // pop switch_val
+                }
+                let end = chunk.instructions.len();
+                for j in end_jumps { chunk.patch_jump(j, end); }
+            }
+
+            // ── try / catch / finally ─────────────────────────────────────────
+            StmtNode::Try(try_b, catch_var, catch_b, fin_b) => {
+                let push_try_ip = chunk.emit(Instruction::PushTry(0), line);
+                Self::compile_stmt(chunk, try_b);
+                chunk.emit(Instruction::PopTry, line);
+                let skip_catch = chunk.emit(Instruction::Jump(0), line);
+
+                // catch block
+                let catch_ip = chunk.instructions.len();
+                chunk.patch_jump(push_try_ip, catch_ip);
+                if let (Some(var), Some(cb)) = (catch_var, catch_b) {
+                    chunk.emit(Instruction::EnterCatch(var.clone()), line);
+                    Self::compile_stmt(chunk, cb);
+                } else {
+                    chunk.emit(Instruction::Pop, line); // discard error
+                }
+                chunk.patch_jump(skip_catch, chunk.instructions.len());
+
+                // finally block runs regardless
+                if let Some(fb) = fin_b {
+                    Self::compile_stmt(chunk, fb);
+                }
+            }
+
+            // ── class ─────────────────────────────────────────────────────────
+            StmtNode::ClassDef(name, parent, body) => {
+                let (instrs, lines) = Self::compile_body(body);
+                chunk.emit(Instruction::MakeClass(
+                    name.clone(), parent.clone(),
+                    Box::new(instrs), Box::new(lines),
+                ), line);
+                chunk.emit(Instruction::StoreVar(name.clone()), line);
+            }
+
+            // ── import ────────────────────────────────────────────────────────
+            StmtNode::Import(path, alias) => {
+                chunk.emit(Instruction::Import(path.clone(), alias.clone()), line);
+            }
+        }
+    }
+
+    // ── patch break/continue targets after compiling a loop body ─────────────
+    // Scans [start..end) and replaces Break/Continue placeholders.
+    // break  → Jump(loop_end)
+    // continue → Jump(continue_target)
+    fn patch_loop_jumps(chunk: &mut Chunk, start: usize, loop_end: usize, continue_target: usize) {
+        for i in start..loop_end {
+            match &chunk.instructions[i] {
+                Instruction::Break    => { chunk.instructions[i] = Instruction::Jump(loop_end); }
+                Instruction::Continue => { chunk.instructions[i] = Instruction::Jump(continue_target); }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn compile_expr(chunk: &mut Chunk, expr: &Expr) {
+        let line = expr.line;
+        match &expr.node {
+
+            ExprNode::Number(n) => { chunk.emit(Instruction::LoadConst(DgnValue::Number(*n)), line); }
+            ExprNode::String(s) => { chunk.emit(Instruction::LoadConst(DgnValue::String(s.clone())), line); }
+            ExprNode::Bool(b)   => { chunk.emit(Instruction::LoadConst(DgnValue::Bool(*b)), line); }
+            ExprNode::Null      => { chunk.emit(Instruction::LoadConst(DgnValue::Null), line); }
+            ExprNode::This      => { chunk.emit(Instruction::This, line); }
+            ExprNode::Var(n)    => { chunk.emit(Instruction::LoadVar(n.clone()), line); }
+
+            // ── assignment ───────────────────────────────────────────────────
+            ExprNode::Assign(target, val) => {
+                Self::compile_expr(chunk, val);
+                match &target.node {
+                    ExprNode::Var(n) => {
+                        chunk.emit(Instruction::Dup, line);
+                        chunk.emit(Instruction::StoreVar(n.clone()), line);
+                    }
+                    ExprNode::GetAttr(obj, n) => {
+                        // stack before SetAttr: [val, obj]  — we need obj on top
+                        // Dup val, then push obj, then SetAttr
+                        chunk.emit(Instruction::Dup, line);       // [val, val]
+                        Self::compile_expr(chunk, obj);            // [val, val, obj]
+                        chunk.emit(Instruction::SetAttr(n.clone()), line); // pops obj+val, leaves val
+                    }
+                    ExprNode::Index(obj, idx) => {
+                        chunk.emit(Instruction::Dup, line);
+                        Self::compile_expr(chunk, obj);
+                        Self::compile_expr(chunk, idx);
+                        chunk.emit(Instruction::SetIndex, line);
+                    }
+                    _ => {}
+                }
+            }
+
+            // ── unary ────────────────────────────────────────────────────────
+            ExprNode::Unary(op, e) => {
+                Self::compile_expr(chunk, e);
+                chunk.emit(Instruction::UnaryOp(op.clone()), line);
+            }
+
+            // ── binary ───────────────────────────────────────────────────────
+            ExprNode::Binary(op, l, r) => {
+                if op == "and" {
+                    Self::compile_expr(chunk, l);
+                    chunk.emit(Instruction::Dup, line);
+                    let fj = chunk.emit(Instruction::JumpIfFalse(0), line);
+                    chunk.emit(Instruction::Pop, line);
+                    Self::compile_expr(chunk, r);
+                    chunk.patch_jump(fj, chunk.instructions.len());
+                } else if op == "or" {
+                    Self::compile_expr(chunk, l);
+                    chunk.emit(Instruction::Dup, line);
+                    let tj = chunk.emit(Instruction::JumpIfTrue(0), line);
+                    chunk.emit(Instruction::Pop, line);
+                    Self::compile_expr(chunk, r);
+                    chunk.patch_jump(tj, chunk.instructions.len());
+                } else if op == "??" {
+                    Self::compile_expr(chunk, l);
+                    chunk.emit(Instruction::Dup, line);
+                    // if not null, keep; else pop and eval rhs
+                    let not_null = chunk.emit(Instruction::JumpIfTrue(0), line);
+                    chunk.emit(Instruction::Pop, line);
+                    Self::compile_expr(chunk, r);
+                    chunk.patch_jump(not_null, chunk.instructions.len());
+                } else {
+                    let binop = match op.as_str() {
+                        "+"  => BinOp::Add,  "-"  => BinOp::Sub,
+                        "*"  => BinOp::Mul,  "/"  => BinOp::Div,  "%" => BinOp::Mod,
+                        "==" => BinOp::Eq,   "!=" => BinOp::Ne,
+                        "<"  => BinOp::Lt,   ">"  => BinOp::Gt,
+                        "<=" => BinOp::Le,   ">=" => BinOp::Ge,
+                        "&"  => BinOp::BitAnd, "|" => BinOp::BitOr, "^" => BinOp::BitXor,
+                        "<<" => BinOp::Shl,  ">>" => BinOp::Shr,
+                        "??" => BinOp::NullCoalesce,
+                        _    => BinOp::Add,
+                    };
+                    Self::compile_expr(chunk, l);
+                    Self::compile_expr(chunk, r);
+                    chunk.emit(Instruction::BinaryOp(binop), line);
+                }
+            }
+
+            // ── ternary ──────────────────────────────────────────────────────
+            ExprNode::Ternary(cond, t, f) => {
+                Self::compile_expr(chunk, cond);
+                let fj = chunk.emit(Instruction::JumpIfFalse(0), line);
+                Self::compile_expr(chunk, t);
+                let ej = chunk.emit(Instruction::Jump(0), line);
+                chunk.patch_jump(fj, chunk.instructions.len());
+                Self::compile_expr(chunk, f);
+                chunk.patch_jump(ej, chunk.instructions.len());
+            }
+
+            // ── call ─────────────────────────────────────────────────────────
+            ExprNode::Call(func_expr, arg_exprs) => {
+                Self::compile_expr(chunk, func_expr);
+                for a in arg_exprs { Self::compile_expr(chunk, a); }
+                chunk.emit(Instruction::Call(arg_exprs.len()), line);
+            }
+
+            // ── attribute / index ─────────────────────────────────────────────
+            ExprNode::GetAttr(obj, name) => {
+                Self::compile_expr(chunk, obj);
+                chunk.emit(Instruction::GetAttr(name.clone()), line);
+            }
+            ExprNode::Index(obj, idx) => {
+                Self::compile_expr(chunk, obj);
+                Self::compile_expr(chunk, idx);
+                chunk.emit(Instruction::GetIndex, line);
+            }
+
+            // ── collections ──────────────────────────────────────────────────
+            ExprNode::List(items) => {
+                for item in items { Self::compile_expr(chunk, item); }
+                chunk.emit(Instruction::MakeList(items.len()), line);
+            }
+            ExprNode::Obj(pairs) => {
+                for (k, v) in pairs {
+                    chunk.emit(Instruction::LoadConst(DgnValue::String(k.clone())), line);
+                    Self::compile_expr(chunk, v);
+                }
+                chunk.emit(Instruction::MakeMap(pairs.len()), line);
+            }
+
+            // ── lambda / func expression ──────────────────────────────────────
+            ExprNode::FuncExpr(params, body) => {
+                let (instrs, lines) = Self::compile_body(body);
+                chunk.emit(Instruction::MakeClosure(
+                    params.clone(), false,
+                    Box::new(instrs), Box::new(lines),
+                ), line);
+            }
+
+            // ── new ───────────────────────────────────────────────────────────
+            ExprNode::New(cls_expr, args) => {
+                Self::compile_expr(chunk, cls_expr);
+                for a in args { Self::compile_expr(chunk, a); }
+                chunk.emit(Instruction::NewObject(args.len()), line);
+            }
+
+            // ── super.method(...) ─────────────────────────────────────────────
+            ExprNode::Super(method, args) => {
+                for a in args { Self::compile_expr(chunk, a); }
+                chunk.emit(Instruction::SuperCall(method.clone(), args.len()), line);
+            }
+
+            // ── await ─────────────────────────────────────────────────────────
+            ExprNode::Await(inner) => {
+                Self::compile_expr(chunk, inner);
+                chunk.emit(Instruction::Await, line);
+            }
+
+            // ── pre/post inc-dec ──────────────────────────────────────────────
+            ExprNode::PreOp(op, target) => {
+                let is_dec = op == "DEC";
+                match &target.node {
+                    ExprNode::Var(n) => {
+                        chunk.emit(if is_dec { Instruction::DecVar(n.clone()) } else { Instruction::IncVar(n.clone()) }, line);
+                    }
+                    ExprNode::GetAttr(obj, attr) => {
+                        // Emit obj expression onto stack, then RMWAttr pops it
+                        Self::compile_expr(chunk, obj);
+                        chunk.emit(Instruction::ReadModWriteAttr(attr.clone(), true, is_dec), line);
+                    }
+                    ExprNode::Index(obj, idx) => {
+                        // Emit obj then idx onto stack, then RMWIndex pops both
+                        Self::compile_expr(chunk, obj);
+                        Self::compile_expr(chunk, idx);
+                        chunk.emit(Instruction::ReadModWriteIndex(true, is_dec), line);
+                    }
+                    _ => {}
+                }
+            }
+            ExprNode::PostOp(op, target) => {
+                let is_dec = op == "DEC";
+                match &target.node {
+                    ExprNode::Var(n) => {
+                        chunk.emit(if is_dec { Instruction::PostDecVar(n.clone()) } else { Instruction::PostIncVar(n.clone()) }, line);
+                    }
+                    ExprNode::GetAttr(obj, attr) => {
+                        Self::compile_expr(chunk, obj);
+                        chunk.emit(Instruction::ReadModWriteAttr(attr.clone(), false, is_dec), line);
+                    }
+                    ExprNode::Index(obj, idx) => {
+                        Self::compile_expr(chunk, obj);
+                        Self::compile_expr(chunk, idx);
+                        chunk.emit(Instruction::ReadModWriteIndex(false, is_dec), line);
+                    }
+                    _ => {}
+                }
+            }
+
+            _ => { chunk.emit(Instruction::Nop, line); }
+        }
+    }
+}
+
+pub struct Vm {
+    pub stack: Vec<DgnValue>,
+    try_frames: Vec<(usize, usize)>,
+    for_iters: HashMap<usize, (Vec<DgnValue>, usize)>,
+}
+
+impl Vm {
+    pub fn new() -> Self {
+        Vm { stack: vec![], try_frames: vec![], for_iters: HashMap::new() }
+    }
+
+    fn pop(&mut self) -> DgnValue { self.stack.pop().unwrap_or(DgnValue::Null) }
+
+    #[async_recursion]
+    pub async fn run(
+        &mut self,
+        chunk: &Chunk,
+        env: Arc<Mutex<Env>>,
+    ) -> Result<DgnValue, DgnError> {
+        let mut ip = 0;
+
+        while ip < chunk.instructions.len() {
+            let line = chunk.source_lines[ip];
+            let instr = chunk.instructions[ip].clone();
+
+            match instr {
+                Instruction::Halt => break,
+                Instruction::Nop  => {}
+
+                // ── stack basics ──────────────────────────────────────────────
+                Instruction::LoadConst(v) => self.stack.push(v),
+                Instruction::LoadVar(ref n) => {
+                    let v = env.lock().unwrap().get(n)
+                        .ok_or_else(|| DgnError::new(&format!("Var '{}' not defined", n), line))?;
+                    self.stack.push(v);
+                }
+                Instruction::StoreVar(ref n) => {
+                    let v = self.pop();
+                    env.lock().unwrap().set(n.clone(), v)
+                        .map_err(|e| DgnError::new(&e, line))?;
+                }
+                Instruction::DefineConst(ref n) => {
+                    let v = self.pop();
+                    env.lock().unwrap().define_const(n.clone(), v)
+                        .map_err(|e| DgnError::new(&e, line))?;
+                }
+                Instruction::Pop => { self.pop(); }
+                Instruction::Dup => {
+                    let v = self.stack.last().cloned().unwrap_or(DgnValue::Null);
+                    self.stack.push(v);
+                }
+                Instruction::This => {
+                    let v = env.lock().unwrap().get("this")
+                        .ok_or(DgnError::new("'this' not defined", line))?;
+                    self.stack.push(v);
+                }
+
+                // ── jumps ─────────────────────────────────────────────────────
+                Instruction::Jump(t)        => { ip = t; continue; }
+                Instruction::JumpIfFalse(t) => { let v = self.pop(); if !is_truthy(&v) { ip = t; continue; } }
+                Instruction::JumpIfTrue(t)  => { let v = self.pop(); if  is_truthy(&v) { ip = t; continue; } }
+
+                // ── operators ─────────────────────────────────────────────────
+                Instruction::UnaryOp(ref op) => {
+                    let v = self.pop();
+                    let r = match (op.as_str(), v) {
+                        ("-",   DgnValue::Number(n)) => DgnValue::Number(-n),
+                        ("+",   DgnValue::Number(n)) => DgnValue::Number(n),
+                        ("not", x)                   => DgnValue::Bool(!is_truthy(&x)),
+                        ("~",   DgnValue::Number(n)) => DgnValue::Number(!(n as i64) as f64),
+                        _ => return Err(DgnError::new("Invalid unary op", line)),
+                    };
+                    self.stack.push(r);
+                }
+                Instruction::BinaryOp(ref op) => {
+                    let r = self.pop();
+                    let l = self.pop();
+                    self.stack.push(vm_binary_op(op, l, r, line)?);
+                }
+
+                // ── collections ───────────────────────────────────────────────
+                Instruction::MakeList(n) => {
+                    let start = self.stack.len().saturating_sub(n);
+                    let items: Vec<DgnValue> = self.stack.drain(start..).collect();
+                    let val = DgnValue::List(Arc::new(Mutex::new(items)));
+                    gc_register(&val);
+                    self.stack.push(val);
+                }
+                Instruction::MakeMap(n) => {
+                    let start = self.stack.len().saturating_sub(n * 2);
+                    let pairs: Vec<DgnValue> = self.stack.drain(start..).collect();
+                    let mut map = HashMap::new();
+                    let mut i = 0;
+                    while i + 1 < pairs.len() {
+                        if let DgnValue::String(k) = &pairs[i] {
+                            map.insert(k.clone(), pairs[i + 1].clone());
+                        }
+                        i += 2;
+                    }
+                    let val = DgnValue::Map(Arc::new(Mutex::new(map)));
+                    gc_register(&val);
+                    self.stack.push(val);
+                }
+
+                // ── attribute / index access ──────────────────────────────────
+                Instruction::GetAttr(ref name) => {
+                    let obj = self.pop();
+                    self.stack.push(get_attr(obj, name).map_err(|mut e| { e.line = line; e })?);
+                }
+                Instruction::SetAttr(ref name) => {
+                    // compiler emits: [Dup val] -> [compile obj] -> SetAttr
+                    // stack top = obj, below = val (Dup'd), val stays on stack as result
+                    let obj = self.pop();
+                    let val = self.stack.last().cloned().unwrap_or(DgnValue::Null);
+                    if let DgnValue::Map(m) | DgnValue::Instance(m) = obj {
+                        m.lock().unwrap().insert(name.clone(), val);
+                    }
+                }
+                Instruction::GetIndex => {
+                    let idx = self.pop();
+                    let obj = self.pop();
+                    let r = match (obj, idx) {
+                        (DgnValue::List(l),   DgnValue::Number(n)) =>
+                            l.lock().unwrap().get(n as usize).cloned().unwrap_or(DgnValue::Null),
+                        (DgnValue::ByteArray(b), DgnValue::Number(n)) =>
+                            b.lock().unwrap().get(n as usize).map(|x| DgnValue::Number(*x as f64)).unwrap_or(DgnValue::Null),
+                        (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) =>
+                            m.lock().unwrap().get(&k).cloned().unwrap_or(DgnValue::Null),
+                        (DgnValue::String(s), DgnValue::Number(n)) =>
+                            s.chars().nth(n as usize).map(|c| DgnValue::String(c.to_string())).unwrap_or(DgnValue::Null),
+                        _ => DgnValue::Null,
+                    };
+                    self.stack.push(r);
+                }
+                Instruction::SetIndex => {
+                    let idx = self.pop();
+                    let obj = self.pop();
+                    // val was Dup'd by compiler so it stays on stack as expression result
+                    let val = self.stack.last().cloned().unwrap_or(DgnValue::Null);
+                    match (obj, idx) {
+                        (DgnValue::List(l), DgnValue::Number(n)) => {
+                            let mut v = l.lock().unwrap();
+                            let i = n as usize;
+                            if i < v.len() { v[i] = val; }
+                        }
+                        (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) => {
+                            m.lock().unwrap().insert(k, val);
+                        }
+                        (DgnValue::ByteArray(b), DgnValue::Number(n)) => {
+                            let mut v = b.lock().unwrap();
+                            let i = n as usize;
+                            if i < v.len() {
+                                if let DgnValue::Number(bv) = val { v[i] = bv as u8; }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // ── function call ─────────────────────────────────────────────
+                Instruction::Call(argc) => {
+                    let start = self.stack.len().saturating_sub(argc);
+                    let args: Vec<DgnValue> = self.stack.drain(start..).collect();
+                    let func = self.pop();
+
+                    // Async function → spawn task, return Promise
+                    if let DgnValue::Func(ref f) = func {
+                        if f.is_async && !f.is_native {
+                            let f_clone = f.clone();
+                            let h = tokio::spawn(async move {
+                                call_dgn_func_impl(f_clone, args, None).await
+                            });
+                            let ha = Arc::new(AsyncMutex::new(Some(h)));
+                            self.stack.push(DgnValue::Promise(Arc::new(AsyncMutex::new(
+                                PromiseState::Pending(ha)
+                            ))));
+                            ip += 1;
+                            continue;
+                        }
+                    }
+
+                    let r = call_dgn_func(func, args).await
+                        .map_err(|mut e| { if e.line == 0 { e.line = line; } e })?;
+                    self.stack.push(r);
+                }
+
+                Instruction::Return => { return Ok(self.pop()); }
+
+                // ── closures ──────────────────────────────────────────────────
+                Instruction::MakeClosure(ref params, is_async, ref body_instrs, ref body_lines) => {
+                    let chunk_arc = Arc::new(Chunk {
+                        instructions: *body_instrs.clone(),
+                        source_lines:  *body_lines.clone(),
+                    });
+                    let func = DgnFunc {
+                        name: None,
+                        params: params.clone(),
+                        body: None,
+                        closure: env.clone(),   // capture env = true lexical closure
+                        is_native: false,
+                        is_async,
+                        native_fn: None,
+                        compiled_chunk: Some(chunk_arc),
+                    };
+                    self.stack.push(DgnValue::Func(func));
+                }
+
+                // ── classes ───────────────────────────────────────────────────
+                Instruction::MakeClass(ref name, ref parent_name, ref body_instrs, ref body_lines) => {
+                    let mut parent_env: Option<Arc<Mutex<Env>>> = None;
+                    if let Some(ref pname) = parent_name {
+                        match env.lock().unwrap().get(pname) {
+                            Some(DgnValue::Class(penv)) => parent_env = Some(penv),
+                            _ => return Err(DgnError::new("Parent class not found", line)),
+                        }
+                    }
+
+                    let class_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
+                    if let Some(pe) = parent_env {
+                        class_env.lock().unwrap().store.insert(
+                            "__parent_class__".into(), DgnValue::Class(pe)
+                        );
+                    }
+
+                    // Execute class body to register methods into class_env
+                    let body_chunk = Chunk {
+                        instructions: *body_instrs.clone(),
+                        source_lines:  *body_lines.clone(),
+                    };
+                    let mut class_vm = Vm::new();
+                    class_vm.run(&body_chunk, class_env.clone()).await?;
+
+                    let class_val = DgnValue::Class(class_env);
+                    // StoreVar follows in the chunk (emitted by compiler), so just push
+                    self.stack.push(class_val);
+                }
+
+                Instruction::NewObject(argc) => {
+                    let start = self.stack.len().saturating_sub(argc);
+                    let args: Vec<DgnValue> = self.stack.drain(start..).collect();
+                    let cls_val = self.pop();
+
+                    if let DgnValue::Class(cls_env) = cls_val {
+                        let inst_map = Arc::new(Mutex::new(HashMap::new()));
+                        inst_map.lock().unwrap().insert(
+                            "__class__".into(), DgnValue::Class(cls_env)
+                        );
+                        let instance = DgnValue::Instance(inst_map);
+                        gc_register(&instance);
+
+                        // Call init if it exists
+                        if let Ok(init) = get_attr(instance.clone(), "init") {
+                            if let DgnValue::Func(_) = init {
+                                call_dgn_func(init, args).await
+                                    .map_err(|mut e| { e.line = line; e })?;
+                            }
+                        }
+                        self.stack.push(instance);
+                    } else {
+                        return Err(DgnError::new("Operand is not a class", line));
+                    }
+                }
+
+                Instruction::SuperCall(ref method_name, argc) => {
+                    let start = self.stack.len().saturating_sub(argc);
+                    let args: Vec<DgnValue> = self.stack.drain(start..).collect();
+
+                    let this_val = env.lock().unwrap().get("this")
+                        .ok_or(DgnError::new("super used outside class method", line))?;
+
+                    let result = if let DgnValue::Instance(ref inst) = this_val {
+                        let cls = inst.lock().unwrap().get("__class__").cloned()
+                            .ok_or(DgnError::new("Instance missing class metadata", line))?;
+                        if let DgnValue::Class(cls_env) = cls {
+                            let parent = cls_env.lock().unwrap().get("__parent_class__")
+                                .ok_or(DgnError::new("No parent class for super", line))?;
+                            if let DgnValue::Class(penv) = parent {
+                                let method = penv.lock().unwrap().get(method_name)
+                                    .ok_or(DgnError::new(&format!("Method '{}' not in parent", method_name), line))?;
+                                if let DgnValue::Func(f) = method {
+                                    call_dgn_func_impl(f, args, Some(this_val)).await?
+                                } else { DgnValue::Null }
+                            } else { return Err(DgnError::new("Parent is not a class", line)); }
+                        } else { return Err(DgnError::new("Invalid class metadata", line)); }
+                    } else { return Err(DgnError::new("super requires instance context", line)); };
+
+                    self.stack.push(result);
+                }
+
+                // ── for-in iterator ───────────────────────────────────────────
+                Instruction::ForIter(ref var_name, exit_ip) => {
+                    // First visit: pop iterable and store state
+                    if !self.for_iters.contains_key(&ip) {
+                        let iterable = self.pop();
+                        let items: Vec<DgnValue> = match iterable {
+                            DgnValue::List(l)      => l.lock().unwrap().clone(),
+                            DgnValue::String(s)    => s.chars().map(|c| DgnValue::String(c.to_string())).collect(),
+                            DgnValue::Number(n)    => (0..n as i64).map(|i| DgnValue::Number(i as f64)).collect(),
+                            DgnValue::ByteArray(b) => b.lock().unwrap().iter().map(|b| DgnValue::Number(*b as f64)).collect(),
+                            _ => return Err(DgnError::new("Not iterable", line)),
+                        };
+                        self.for_iters.insert(ip, (items, 0));
+                    }
+
+                    let entry = self.for_iters.get_mut(&ip).unwrap();
+                    if entry.1 >= entry.0.len() {
+                        // Exhausted — clean up and jump past loop
+                        self.for_iters.remove(&ip);
+                        ip = exit_ip;
+                        continue;
+                    }
+                    let item = entry.0[entry.1].clone();
+                    entry.1 += 1;
+                    env.lock().unwrap().set(var_name.clone(), item)
+                        .map_err(|e| DgnError::new(&e, line))?;
+                }
+
+                // These are patched to Jump by the compiler; should not appear at runtime
+                Instruction::Break | Instruction::Continue | Instruction::DoWhileStart => {}
+
+                // ── exceptions ────────────────────────────────────────────────
+                Instruction::PushTry(catch_ip) => {
+                    self.try_frames.push((catch_ip, self.stack.len()));
+                }
+                Instruction::PopTry => { self.try_frames.pop(); }
+                Instruction::Raise => {
+                    let msg = val_to_string(&self.pop());
+                    if let Some((catch_ip, depth)) = self.try_frames.pop() {
+                        self.stack.truncate(depth);
+                        self.stack.push(DgnValue::String(msg));
+                        ip = catch_ip;
+                        continue;
+                    }
+                    return Err(DgnError::new(&msg, line));
+                }
+                Instruction::EnterCatch(ref var_name) => {
+                    let err = self.pop();
+                    env.lock().unwrap().set(var_name.clone(), err)
+                        .map_err(|e| DgnError::new(&e, line))?;
+                }
+
+                // ── async / await ─────────────────────────────────────────────
+                Instruction::Await => {
+                    let val = self.pop();
+                    if let DgnValue::Promise(ref sa) = val {
+                        let mut state = sa.lock().await;
+                        let extracted = match &mut *state {
+                            PromiseState::Resolved(r) => {
+                                let r = r.clone();
+                                drop(state);
+                                self.stack.push(r?);
+                                ip += 1;
+                                continue;
+                            }
+                            PromiseState::Pending(ha) => ha.lock().await.take(),
+                        };
+                        if let Some(h) = extracted {
+                            let res = h.await.map_err(|_| DgnError::new("Promise panicked", line))?;
+                            *state = PromiseState::Resolved(res.clone());
+                            self.stack.push(res?);
+                        } else {
+                            return Err(DgnError::new("Promise already consumed", line));
+                        }
+                    } else {
+                        self.stack.push(val); // await non-promise is a passthrough
+                    }
+                }
+
+                // ── import ────────────────────────────────────────────────────
+                Instruction::Import(ref path, ref alias) => {
+                    vm_do_import(path, alias, env.clone(), line).await?;
+                }
+
+                // ── inc / dec ─────────────────────────────────────────────────
+                Instruction::IncVar(ref n) => {
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
+                    if let DgnValue::Number(v) = cur {
+                        let nv = v + 1.0;
+                        env.lock().unwrap().set(n.clone(), DgnValue::Number(nv))
+                            .map_err(|e| DgnError::new(&e, line))?;
+                        self.stack.push(DgnValue::Number(nv));
+                    } else { return Err(DgnError::new("Cannot ++ non-number", line)); }
+                }
+                Instruction::DecVar(ref n) => {
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
+                    if let DgnValue::Number(v) = cur {
+                        let nv = v - 1.0;
+                        env.lock().unwrap().set(n.clone(), DgnValue::Number(nv))
+                            .map_err(|e| DgnError::new(&e, line))?;
+                        self.stack.push(DgnValue::Number(nv));
+                    } else { return Err(DgnError::new("Cannot -- non-number", line)); }
+                }
+                Instruction::PostIncVar(ref n) => {
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
+                    if let DgnValue::Number(v) = cur {
+                        env.lock().unwrap().set(n.clone(), DgnValue::Number(v + 1.0))
+                            .map_err(|e| DgnError::new(&e, line))?;
+                        self.stack.push(DgnValue::Number(v)); // old value
+                    } else { return Err(DgnError::new("Cannot ++ non-number", line)); }
+                }
+                Instruction::PostDecVar(ref n) => {
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
+                    if let DgnValue::Number(v) = cur {
+                        env.lock().unwrap().set(n.clone(), DgnValue::Number(v - 1.0))
+                            .map_err(|e| DgnError::new(&e, line))?;
+                        self.stack.push(DgnValue::Number(v)); // old value
+                    } else { return Err(DgnError::new("Cannot -- non-number", line)); }
+                }
+                Instruction::ReadModWriteAttr(ref attr, is_pre, is_dec) => {
+                    // Stack: [..., obj] — compiler emitted obj expression before this op
+                    let obj = self.pop();
+                    if let Ok(DgnValue::Number(n)) = get_attr(obj.clone(), attr) {
+                        let nv = if is_dec { n - 1.0 } else { n + 1.0 };
+                        if let DgnValue::Map(m) | DgnValue::Instance(m) = &obj {
+                            m.lock().unwrap().insert(attr.clone(), DgnValue::Number(nv));
+                        }
+                        self.stack.push(DgnValue::Number(if is_pre { nv } else { n }));
+                    } else { return Err(DgnError::new("Cannot ++/-- non-number attr", line)); }
+                }
+                Instruction::ReadModWriteIndex(is_pre, is_dec) => {
+                    // Stack: [..., obj, idx] — compiler emitted both expressions before this op
+                    let idx = self.pop();
+                    let obj = self.pop();
+                    let cur = match (&obj, &idx) {
+                        (DgnValue::List(l), DgnValue::Number(i)) =>
+                            l.lock().unwrap().get(*i as usize).cloned().unwrap_or(DgnValue::Null),
+                        (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) =>
+                            m.lock().unwrap().get(k).cloned().unwrap_or(DgnValue::Null),
+                        _ => DgnValue::Null,
+                    };
+                    if let DgnValue::Number(n) = cur {
+                        let nv = if is_dec { n - 1.0 } else { n + 1.0 };
+                        match (&obj, &idx) {
+                            (DgnValue::List(l), DgnValue::Number(i)) => {
+                                let mut v = l.lock().unwrap();
+                                let i = *i as usize;
+                                if i < v.len() { v[i] = DgnValue::Number(nv); }
+                            }
+                            (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) => {
+                                m.lock().unwrap().insert(k.clone(), DgnValue::Number(nv));
+                            }
+                            _ => {}
+                        }
+                        self.stack.push(DgnValue::Number(if is_pre { nv } else { n }));
+                    } else { return Err(DgnError::new("Cannot ++/-- non-number index", line)); }
+                }
+            }
+            ip += 1;
+        }
+
+        Ok(self.stack.pop().unwrap_or(DgnValue::Null))
+    }
+}
+
+/// Extracted from eval_expr's Binary arm — reusable by both VM and tree-walk
+/// Fully bytecode-native import — no eval_stmt, no tree-walk.
+pub async fn vm_do_import(
+    path: &str,
+    alias: &Option<String>,
+    env: Arc<Mutex<Env>>,
+    line: usize,
+) -> Result<(), DgnError> {
+    let bind = alias.clone().unwrap_or_else(|| {
+        std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string()
+    });
+
+    // 1. Built-in modules
+    if let Some(module_val) = get_builtin_module(path) {
+        env.lock().unwrap().set(bind, module_val).map_err(|e| DgnError::new(&e, line))?;
+        return Ok(());
+    }
+
+    let root = Env::get_root(env.clone());
+
+    // 2. Bundled sources
+    let bundled_src = {
+        let r = root.lock().unwrap();
+        if let Some(DgnValue::Map(map)) = r.store.get("__bundled_sources__") {
+            let m = map.lock().unwrap();
+            let key2 = format!("{}.dgn", path);
+            if let Some(DgnValue::String(s)) = m.get(path).or_else(|| m.get(&key2)) {
+                Some(s.clone())
+            } else { None }
+        } else { None }
+    };
+
+    let (code, new_env_path) = if let Some(src) = bundled_src {
+        (src, PathBuf::from(format!("bundle:///{}", path)))
+    } else {
+        // 3. File system search
+        let current_dir = env.lock().unwrap().current_path
+            .parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut search_dirs = vec![current_dir.clone(), current_dir.join("dgn_modules")];
+        if let Ok(dp) = std::env::var("DRAGON_PATH") {
+            for p in std::env::split_paths(&dp) { search_dirs.push(p); }
+        }
+
+        let path_obj = Path::new(path);
+        let mut target_files = Vec::new();
+        if path_obj.extension().is_some() {
+            target_files.push(path_obj.to_path_buf());
+        } else {
+            target_files.push(PathBuf::from(format!("{}.dgn", path)));
+            if let Some(name) = path_obj.file_name() {
+                let n = name.to_string_lossy();
+                target_files.push(PathBuf::from(path).join(format!("{}.dgn", n)));
+                target_files.push(PathBuf::from(path).join("index.dgn"));
+            }
+        }
+
+        let mut found_path = None;
+        'outer: for dir in &search_dirs {
+            for target in &target_files {
+                let candidate = dir.join(target);
+                if candidate.exists() && candidate.is_file() {
+                    found_path = Some(candidate.canonicalize().unwrap_or(candidate));
+                    break 'outer;
+                }
+            }
+        }
+
+        let canon = found_path
+            .ok_or_else(|| DgnError::new(&format!("Import not found: '{}'", path), line))?;
+        let c = fs::read_to_string(&canon)
+            .map_err(|e| DgnError::new(&e.to_string(), line))?;
+        (c, canon)
+    };
+
+    let cache_key = new_env_path.to_string_lossy().to_string();
+
+    // 4. Module cache check
+    let cached_mod = {
+        let r = root.lock().unwrap();
+        if let Some(DgnValue::Map(modules)) = r.store.get("__modules__") {
+            modules.lock().unwrap().get(&cache_key).cloned()
+        } else { None }
+    };
+
+    let mod_val = if let Some(m) = cached_mod {
+        if let DgnValue::Class(mod_env) = &m {
+            if mod_env.lock().unwrap().store.contains_key("__loading__") {
+                return Err(DgnError::new(
+                    &format!("Cyclic import detected: '{}' is already loading.", path), line
+                ));
+            }
+        }
+        m
+    } else {
+        // 5. Parse and compile module source
+        let tokens = lex(&code);
+        let mut parser = Parser::new(tokens);
+        let module_body = parser.parse().map_err(|e| DgnError::new(&e, line))?;
+
+        let mod_env = Arc::new(Mutex::new(Env::new(None, Some(new_env_path))));
+        populate_builtins(mod_env.clone());
+        mod_env.lock().unwrap().store.insert("__loading__".to_string(), DgnValue::Bool(true));
+
+        let placeholder = DgnValue::Class(mod_env.clone());
+        {
+            let r = root.lock().unwrap();
+            if let Some(DgnValue::Map(modules)) = r.store.get("__modules__") {
+                modules.lock().unwrap().insert(cache_key, placeholder.clone());
+            }
+        }
+
+        // 6. Execute module via VM (pure bytecode — no eval_stmt)
+        let mut mod_chunk = Chunk::new();
+        Compiler::compile_stmt(&mut mod_chunk, &module_body);
+        mod_chunk.emit(Instruction::Halt, 0);
+
+        let mut mod_vm = Vm::new();
+        mod_vm.run(&mod_chunk, mod_env.clone()).await?;
+
+        mod_env.lock().unwrap().store.remove("__loading__");
+        placeholder
+    };
+
+    // 7. Bind module into caller's env
+    let final_bind = alias.clone().unwrap_or_else(|| {
+        std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string()
+    });
+    env.lock().unwrap().set(final_bind, mod_val).map_err(|e| DgnError::new(&e, line))?;
+    Ok(())
+}
+
+pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result<DgnValue, DgnError> {
+    match op {
+        BinOp::Add => match (l, r) {
+            (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Number(a + b)),
+            (DgnValue::String(a), b) => Ok(DgnValue::String(a + &val_to_string(&b))),
+            (a, DgnValue::String(b)) => Ok(DgnValue::String(val_to_string(&a) + &b)),
+            _ => Ok(DgnValue::Null),
+        },
+        BinOp::Sub => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a-b)) } else { Ok(DgnValue::Null) },
+        BinOp::Mul => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a*b)) } else { Ok(DgnValue::Null) },
+        BinOp::Div => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a/b)) } else { Ok(DgnValue::Null) },
+        BinOp::Mod => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a%b)) } else { Ok(DgnValue::Null) },
+        BinOp::Eq  => match (l,r) {
+            (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() < f64::EPSILON)),
+            (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a==b)),
+            (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a==b)),
+            (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(true)),
+            _ => Ok(DgnValue::Bool(false)),
+        },
+        BinOp::Ne  => match (l,r) {
+            (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() >= f64::EPSILON)),
+            (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a!=b)),
+            _ => Ok(DgnValue::Bool(true)),
+        },
+        BinOp::Lt  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a<b))  } else { Ok(DgnValue::Bool(false)) },
+        BinOp::Gt  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a>b))  } else { Ok(DgnValue::Bool(false)) },
+        BinOp::Le  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a<=b)) } else { Ok(DgnValue::Bool(false)) },
+        BinOp::Ge  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a>=b)) } else { Ok(DgnValue::Bool(false)) },
+        BinOp::BitAnd => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number((a as i64 & b as i64) as f64)) } else { Ok(DgnValue::Null) },
+        BinOp::BitOr  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number((a as i64 | b as i64) as f64)) } else { Ok(DgnValue::Null) },
+        BinOp::BitXor => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number((a as i64 ^ b as i64) as f64)) } else { Ok(DgnValue::Null) },
+        BinOp::Shl   => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(((a as i64) << (b as i64)) as f64)) } else { Ok(DgnValue::Null) },
+        BinOp::Shr   => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(((a as i64) >> (b as i64)) as f64)) } else { Ok(DgnValue::Null) },
+        BinOp::NullCoalesce => if let DgnValue::Null = l { Ok(r) } else { Ok(l) },
+        BinOp::And | BinOp::Or => Ok(DgnValue::Null), // handled by JumpIfFalse/True
+    }
+}
+
 #[derive(Debug)]
 pub struct Env {
     pub store: HashMap<String, DgnValue>,
@@ -454,86 +1652,141 @@ pub const KEYWORDS: &[&str] = &[
 
 pub fn lex(src: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
-    
+    let bytes = src.as_bytes();
+    let len = src.len();
     let mut pos = 0;
-    let mut line = 1;
-    let mut col = 0; 
+    let mut line = 1usize;
+    let mut col = 0usize;
 
-    while pos < src.len() {
-        let remainder = &src[pos..];
-        let mut matched = false;
+    while pos < len {
+        let start = pos;
+        let col_start = col + 1;
+        let b = bytes[pos];
 
-        for (name, re) in TOKEN_REGEXES.iter() {
-            if let Some(mat) = re.find(remainder) {
-                let val = mat.as_str();
-                let len = val.len();
-                let token_col = col + 1;
+        // Skip whitespace fast
+        if b == b' ' || b == b'\t' || b == b'\r' || b == b'\xEF' || b == 0 {
+            pos += 1; col += 1;
+            continue;
+        }
 
-                match *name {
-                    "HEX" => {
-                        // Strip '0x' and parse as base-16 integer, then cast to f64
-                        let clean = val.trim_start_matches("0x");
-                        let n = u64::from_str_radix(clean, 16).unwrap_or(0) as f64;
-                        tokens.push(Token{typ: TokenType::Number, value: val.to_string(), line, col: token_col, num_val: Some(n)});
-                    },
-                    "NUMBER" => {
-                        let n : f64 = val.parse().unwrap_or(0.0);
-                        tokens.push(Token{typ: TokenType::Number, value: val.to_string(), line, col: token_col, num_val: Some(n)});
-                    },
-                    "STRING" => {
-                        let content = &val[1..val.len()-1];
-                        let unescaped = content.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\'", "'");
-                        tokens.push(Token{typ: TokenType::String, value: unescaped, line, col: token_col, num_val: None});
-                    },
-                    "NAME" => {
-                        if KEYWORDS.contains(&val) {
-                            tokens.push(Token{typ: TokenType::Keyword(val.to_string()), value: val.to_string(), line, col: token_col, num_val: None});
-                        } else {
-                            tokens.push(Token{typ: TokenType::Name, value: val.to_string(), line, col: token_col, num_val: None});
-                        }
-                    },
-                    "OP" | "INC" | "DEC" => {
-                        let t = match val {
-                            "++" => TokenType::Inc, "--" => TokenType::Dec,
-                            _ => TokenType::Op
-                        };
-                        tokens.push(Token{typ: t, value: val.to_string(), line, col: token_col, num_val: None});
-                    },
-                    "NEWLINE" => {
-                        line += 1;
-                        col = 0;
-                        pos += len;
-                        matched = true;
-                        continue;
-                    },
-                    "COMMENT_ML" => {
-                        line += val.matches('\n').count();
-                        col = 0; 
-                    },
-                    "COMMENT_SL" | "SKIP" => {},
-                    "MISMATCH" => {
-                        let char_code = val.chars().next().map(|c| c as u32).unwrap_or(0);
-                        panic!("Unexpected character '{}' (Code: {}) at {}:{}", val, char_code, line, col);
-                    },
-                    _ => {}
+        if b == b'\n' {
+            line += 1; col = 0; pos += 1;
+            continue;
+        }
+
+        // Comments
+        if b == b'/' && pos + 1 < len {
+            if bytes[pos+1] == b'/' {
+                while pos < len && bytes[pos] != b'\n' { pos += 1; }
+                continue;
+            }
+            if bytes[pos+1] == b'*' {
+                pos += 2;
+                while pos + 1 < len && !(bytes[pos] == b'*' && bytes[pos+1] == b'/') {
+                    if bytes[pos] == b'\n' { line += 1; col = 0; }
+                    pos += 1;
                 }
-
-                if *name != "NEWLINE" {
-                    col += len;
-                }
-                pos += len;
-                matched = true;
-                break;
+                pos += 2;
+                continue;
             }
         }
-        if !matched {
-            break; 
+
+        // Strings
+        if b == b'"' || b == b'\'' {
+            pos += 1;
+            let mut s = String::new();
+            while pos < len && bytes[pos] != b {
+                if bytes[pos] == b'\\' && pos + 1 < len {
+                    pos += 1;
+                    match bytes[pos] {
+                        b'n'  => s.push('\n'),
+                        b't'  => s.push('\t'),
+                        b'"'  => s.push('"'),
+                        b'\'' => s.push('\''),
+                        b'\\' => s.push('\\'),
+                        c     => { s.push('\\'); s.push(c as char); }
+                    }
+                } else {
+                    s.push(bytes[pos] as char);
+                }
+                pos += 1;
+            }
+            pos += 1; // closing quote
+            col += pos - start;
+            tokens.push(Token { typ: TokenType::String, value: s, line, col: col_start, num_val: None });
+            continue;
         }
+
+        // Numbers (including hex)
+        if b.is_ascii_digit() || (b == b'0' && pos+1 < len && bytes[pos+1] == b'x') {
+            if b == b'0' && pos+1 < len && bytes[pos+1] == b'x' {
+                pos += 2;
+                let hex_start = pos;
+                while pos < len && bytes[pos].is_ascii_hexdigit() { pos += 1; }
+                let hex_str = &src[hex_start..pos];
+                let n = u64::from_str_radix(hex_str, 16).unwrap_or(0) as f64;
+                col += pos - start;
+                tokens.push(Token { typ: TokenType::Number, value: src[start..pos].to_string(), line, col: col_start, num_val: Some(n) });
+            } else {
+                while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+                if pos < len && bytes[pos] == b'.' && pos+1 < len && bytes[pos+1].is_ascii_digit() {
+                    pos += 1;
+                    while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+                }
+                let n: f64 = src[start..pos].parse().unwrap_or(0.0);
+                col += pos - start;
+                tokens.push(Token { typ: TokenType::Number, value: src[start..pos].to_string(), line, col: col_start, num_val: Some(n) });
+            }
+            continue;
+        }
+
+        // Identifiers and keywords
+        if b.is_ascii_alphabetic() || b == b'_' {
+            while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+                pos += 1;
+            }
+            let word = &src[start..pos];
+            col += pos - start;
+            if KEYWORDS.contains(&word) {
+                tokens.push(Token { typ: TokenType::Keyword(word.to_string()), value: word.to_string(), line, col: col_start, num_val: None });
+            } else {
+                tokens.push(Token { typ: TokenType::Name, value: word.to_string(), line, col: col_start, num_val: None });
+            }
+            continue;
+        }
+
+        // Two-char operators
+        if pos + 1 < len {
+            let two = &src[pos..pos+2];
+            let tok = match two {
+                "++" => Some(TokenType::Inc),
+                "--" => Some(TokenType::Dec),
+                "==" | "!=" | "<=" | ">=" | "=>" | "<<" | ">>" | "??" => Some(TokenType::Op),
+                "//" | "/*" => None, // handled above
+                _ => None,
+            };
+            if let Some(t) = tok {
+                tokens.push(Token { typ: t, value: two.to_string(), line, col: col_start, num_val: None });
+                pos += 2; col += 2;
+                continue;
+            }
+        }
+
+        // Single-char operators
+        let op_chars = b"!+-*/%<>=?:;,&|^~(){}[].";
+        if op_chars.contains(&b) {
+            tokens.push(Token { typ: TokenType::Op, value: (b as char).to_string(), line, col: col_start, num_val: None });
+            pos += 1; col += 1;
+            continue;
+        }
+
+        // Unrecognized
+        panic!("Unexpected character '{}' (Code: {}) at {}:{}", b as char, b, line, col);
     }
-    tokens.push(Token{typ: TokenType::Eof, value: "".to_string(), line, col, num_val: None});
+
+    tokens.push(Token { typ: TokenType::Eof, value: String::new(), line, col, num_val: None });
     tokens
 }
-
 
 pub struct Parser {
     pub tokens: Vec<Token>,
@@ -1286,738 +2539,7 @@ pub fn val_to_string(v: &DgnValue) -> String {
     }
 }
 
-#[async_recursion]
-pub async fn eval_stmt(stmt: &Stmt, env: Arc<Mutex<Env>>) -> Result<EvalResult, DgnError> {
-    if let StmtNode::Block(_) = &stmt.node {
-        gc_check_auto(env.clone());
-    }
-    match &stmt.node {
-          StmtNode::ConstDecl(name, expr) => {
-            let val = eval_expr(expr, env.clone()).await?;
-            env.lock().unwrap().define_const(name.clone(), val)
-                .map_err(|msg| DgnError::new(&msg, stmt.line))?;
-            Ok(EvalResult::None)
-        },
-        StmtNode::Block(stmts) => {
-            let block_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
-            gc_check_auto(block_env.clone());
-            for s in stmts {
-                let r = eval_stmt(s, block_env.clone()).await?;
-                match r {
-                    EvalResult::None => continue,
-                    _ => return Ok(r),
-                }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::Expr(e) => {
-            eval_expr(e, env).await?;
-            Ok(EvalResult::None)
-        },
-        StmtNode::Return(e) => {
-            let val = if let Some(expr) = e { eval_expr(expr, env).await? } else { DgnValue::Null };
-            Ok(EvalResult::Return(val))
-        },
-        StmtNode::Break => Ok(EvalResult::Break),
-        StmtNode::Continue => Ok(EvalResult::Continue),
-        StmtNode::Raise(e) => {
-            let msg = val_to_string(&eval_expr(e, env).await?);
-            Err(DgnError::new(&msg, stmt.line))
-        },
-        StmtNode::IfChain(chain) => {
-            for (cond, block) in chain {
-                if let Some(c) = cond {
-                    if is_truthy(&eval_expr(c, env.clone()).await?) {
-                        return eval_stmt(block, env).await;
-                    }
-                } else {
-                    return eval_stmt(block, env).await;
-                }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::While(cond, body) => {
-            while is_truthy(&eval_expr(cond, env.clone()).await?) {
-                let res = eval_stmt(body, env.clone()).await?;
-                match res {
-                    EvalResult::Break => break,
-                    EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                    _ => {}
-                }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::DoWhile(body, cond) => {
-            loop {
-                let res = eval_stmt(body, env.clone()).await?;
-                match res {
-                    EvalResult::Break => break,
-                    EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                    _ => {}
-                }
-                if !is_truthy(&eval_expr(cond, env.clone()).await?) { break; }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::For(name, iter_expr, body) => {
-            let iter = eval_expr(iter_expr, env.clone()).await?;
-            let items = match iter {
-                DgnValue::List(l) => l.lock().unwrap().clone(),
-                DgnValue::String(s) => s.chars().map(|c| DgnValue::String(c.to_string())).collect(),
-                DgnValue::Number(n) => (0..n as i64).map(|i| DgnValue::Number(i as f64)).collect(),
-                DgnValue::ByteArray(b) => b.lock().unwrap().iter().map(|byte| DgnValue::Number(*byte as f64)).collect(),
-                _ => return Err(DgnError::new("Not iterable", stmt.line)),
-            };
-            
-            for item in items {
-                let new_scope = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
-                new_scope.lock().unwrap().set(name.clone(), item).map_err(|e| DgnError::new(&e, 0))?;
-                let res = eval_stmt(body, new_scope).await?;
-                match res {
-                    EvalResult::Break => break,
-                    EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                    _ => {}
-                }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::CFor(init, cond, step, body) => {
-            let loop_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
-            if let Some(i) = init { eval_expr(i, loop_env.clone()).await?; }
-            
-            loop {
-                if let Some(c) = cond {
-                    if !is_truthy(&eval_expr(c, loop_env.clone()).await?) { break; }
-                }
-                let res = eval_stmt(body, loop_env.clone()).await?;
-                match res {
-                    EvalResult::Break => break,
-                    EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                    _ => {}
-                }
-                if let Some(s) = step { eval_expr(s, loop_env.clone()).await?; }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::Switch(val_expr, cases, default) => {
-            let val = eval_expr(val_expr, env.clone()).await?;
-            let mut matched = false;
-            for (case_expr, block) in cases {
-                let c_val = eval_expr(case_expr, env.clone()).await?;
-                let eq = match (&val, &c_val) {
-                    (DgnValue::Number(a), DgnValue::Number(b)) => (a-b).abs() < f64::EPSILON,
-                    (DgnValue::String(a), DgnValue::String(b)) => a == b,
-                    (DgnValue::Bool(a), DgnValue::Bool(b)) => a == b,
-                    (DgnValue::Null, DgnValue::Null) => true,
-                    _ => false 
-                };
-                if eq {
-                    let r = eval_stmt(block, Arc::new(Mutex::new(Env::new(Some(env.clone()), None)))).await?;
-                    if let EvalResult::Break = r { return Ok(EvalResult::None); }
-                    if let EvalResult::Return(_) = r { return Ok(r); }
-                    matched = true;
-                }
-            }
-            if !matched {
-                if let Some(def) = default {
-                    let r = eval_stmt(def, Arc::new(Mutex::new(Env::new(Some(env.clone()), None)))).await?;
-                    if let EvalResult::Break = r { return Ok(EvalResult::None); }
-                    if let EvalResult::Return(_) = r { return Ok(r); }
-                }
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::Try(try_b, catch_var, catch_b, fin_b) => {
-            let res = eval_stmt(try_b, env.clone()).await;
-            let mut final_res = Ok(EvalResult::None);
 
-            if let Err(e) = res {
-                if let Some(cb) = catch_b {
-                    let catch_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
-                    if let Some(v) = catch_var {
-                        catch_env.lock().unwrap().set(v.clone(), DgnValue::String(e.msg)).map_err(|e| DgnError::new(&e, 0))?;
-                    }
-                    final_res = eval_stmt(cb, catch_env).await;
-                } else {
-                    final_res = Err(e);
-                }
-            } else {
-                final_res = res;
-            }
-
-            if let Some(fb) = fin_b {
-                eval_stmt(fb, env.clone()).await?;
-            }
-            final_res
-        },
-        StmtNode::FuncDef(name, params, body, is_async) => {
-            let func = DgnFunc {
-                name: Some(name.clone()),
-                params: params.clone(),
-                body: *body.clone(),
-                closure: env.clone(),
-                is_native: false,
-                is_async: *is_async,
-                native_fn: None
-            };
-            if !name.is_empty() {
-                env.lock().unwrap().set(name, DgnValue::Func(func)).map_err(|e| DgnError::new(&e, 0))?;
-            }
-            Ok(EvalResult::None)
-        },
-        StmtNode::ClassDef(name, parent_name, body) => {
-            let mut parent_env = None;
-            if let Some(p) = parent_name {
-                 if let Some(pv) = env.lock().unwrap().get(p) {
-                     if let DgnValue::Class(penv) = pv {
-                         parent_env = Some(penv);
-                     } else {
-                         return Err(DgnError::new("Parent is not a class", stmt.line));
-                     }
-                 } else {
-                     return Err(DgnError::new("Parent class not found", stmt.line));
-                 }
-            }
-            
-            let class_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
-            if let Some(pe) = parent_env {
-                class_env.lock().unwrap().store.insert("__parent_class__".into(), DgnValue::Class(pe));
-            }
-            
-            if let StmtNode::Block(stmts) = &body.node {
-                for s in stmts {
-                    eval_stmt(s, class_env.clone()).await?;
-                }
-            } else {
-                eval_stmt(body, class_env.clone()).await?;
-            }
-            env.lock().unwrap().set(name.clone(), DgnValue::Class(class_env)).map_err(|e| DgnError::new(&e, 0))?;
-            Ok(EvalResult::None)
-        },
-          StmtNode::Import(path, as_name) => {
-            let bind = as_name.clone().unwrap_or_else(|| {
-                 Path::new(&path).file_stem().unwrap().to_str().unwrap().to_string()
-                });
-
-                // --- NEW: Intercept Built-in Modules ---
-                if let Some(module_val) = get_builtin_module(path) {
-                    env.lock().unwrap().set(bind, module_val).map_err(|msg| DgnError::new(&msg, stmt.line))?;
-                    return Ok(EvalResult::None);
-                }
-            let root = Env::get_root(env.clone());
-            let bundled_src = {
-                let r = root.lock().unwrap();
-                if let Some(DgnValue::Map(map)) = r.store.get("__bundled_sources__") {
-                     let m = map.lock().unwrap();
-                     let key1 = path.clone();
-                     let key2 = format!("{}.dgn", path);
-                     
-                     if let Some(DgnValue::String(s)) = m.get(&key1).or(m.get(&key2)) {
-                         Some(s.clone())
-                     } else { None }
-                } else { None }
-            };
-
-            let (code, new_env_path) = if let Some(src) = bundled_src {
-                (src, PathBuf::from(format!("bundle:///{}", path)))
-            } else {
-                let current_dir = env.lock().unwrap().current_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-
-                let mut search_dirs = vec![
-                    current_dir.clone(),                 
-                    current_dir.join("dgn_modules"),     
-                ];
-                if let Ok(dp) = std::env::var("DRAGON_PATH") {
-                    for p in std::env::split_paths(&dp) { search_dirs.push(p); }
-                }
-
-                let mut target_files = Vec::new();
-                let path_obj = Path::new(&path);
-
-                if path_obj.extension().is_some() {
-                    target_files.push(path_obj.to_path_buf());
-                } else {
-                    target_files.push(PathBuf::from(format!("{}.dgn", path))); 
-                    if let Some(name) = path_obj.file_name() {
-                        let n = name.to_string_lossy();
-                        target_files.push(PathBuf::from(&path).join(format!("{}.dgn", n))); 
-                        target_files.push(PathBuf::from(&path).join("index.dgn"));   
-                    }
-                }
-
-                let mut found_path = None;
-                for dir in &search_dirs {
-                    for target in &target_files {
-                        let candidate = dir.join(target);
-                        if candidate.exists() && candidate.is_file() {
-                            found_path = Some(candidate.canonicalize().unwrap_or(candidate));
-                            break;
-                        }
-                    }
-                    if found_path.is_some() { break; }
-                }
-
-                let canon = found_path.ok_or_else(|| {
-                    DgnError::new(&format!("Import not found: '{}'", path), stmt.line)
-                })?;
-                
-                let c = fs::read_to_string(&canon).map_err(|e| DgnError::new(&e.to_string(), stmt.line))?;
-                (c, canon)
-            };
-
-            let cache_key = new_env_path.to_string_lossy().to_string();
-            
-            let cached_mod = {
-                let r = root.lock().unwrap();
-                if let Some(DgnValue::Map(modules)) = r.store.get("__modules__") {
-                    modules.lock().unwrap().get(&cache_key).cloned()
-                } else { None }
-            };
-
-            let mod_val = if let Some(m) = cached_mod {
-                if let DgnValue::Class(mod_env) = &m {
-                    if mod_env.lock().unwrap().store.contains_key("__loading__") {
-                        return Err(DgnError::new(
-                            &format!("Cyclic import detected: '{}' is already loading.", path), 
-                            stmt.line
-                        ));
-                    }
-                }
-                m
-            } else {
-                let tokens = lex(&code);
-                let mut parser = Parser::new(tokens);
-                let module_body = parser.parse().map_err(|e| DgnError::new(&e, stmt.line))?;
-
-                let mod_env = Arc::new(Mutex::new(Env::new(None, Some(new_env_path))));
-                populate_builtins(mod_env.clone());
-                
-                mod_env.lock().unwrap().store.insert("__loading__".to_string(), DgnValue::Bool(true));
-
-                let mod_val_placeholder = DgnValue::Class(mod_env.clone());
-                
-                {
-                    let mut r = root.lock().unwrap();
-                    if let Some(DgnValue::Map(modules)) = r.store.get("__modules__") {
-                        modules.lock().unwrap().insert(cache_key, mod_val_placeholder.clone());
-                    }
-                }
-
-                if let StmtNode::Block(stmts) = module_body.node {
-                    for s in stmts {
-                        eval_stmt(&s, mod_env.clone()).await?;
-                    }
-                }
-                mod_env.lock().unwrap().store.remove("__loading__");
-
-                mod_val_placeholder
-            };
-
-            let bind = as_name.clone().unwrap_or_else(|| {
-                Path::new(&path).file_stem().unwrap().to_str().unwrap().to_string()
-            });
-            
-            env.lock().unwrap().set(bind, mod_val).map_err(|msg| DgnError::new(&msg, stmt.line))?;
-            Ok(EvalResult::None)
-        },
-    }
-}
-
-#[async_recursion]
-pub async fn eval_expr(expr: &Expr, env: Arc<Mutex<Env>>) -> Result<DgnValue, DgnError> {
-    match &expr.node {
-        ExprNode::Number(n) => Ok(DgnValue::Number(*n)),
-        ExprNode::String(s) => Ok(DgnValue::String(s.clone())),
-        ExprNode::Bool(b) => Ok(DgnValue::Bool(*b)),
-        ExprNode::Null => Ok(DgnValue::Null),
-        ExprNode::This => {
-            env.lock().unwrap().get("this").ok_or(DgnError::new("this not found", expr.line))
-        },
-
-        ExprNode::Await(inner) => {
-            let val = eval_expr(inner, env.clone()).await?;
-            // 1. Use `ref` so we don't move `state_arc` out of `val`
-            if let DgnValue::Promise(ref state_arc) = val {
-                let mut state = state_arc.lock().await;
-                
-                // 2. Extract the handle and immediately drop the internal borrow
-                let extracted_handle = match &mut *state {
-                    PromiseState::Resolved(res) => return res.clone(),
-                    PromiseState::Pending(handle_arc) => {
-                        let mut handle_lock = handle_arc.lock().await;
-                        handle_lock.take() // Takes the Option<JoinHandle> out
-                    }
-                };
-
-                // 3. Now that the inner lock is gone, we can safely await and mutate `state`
-                if let Some(handle) = extracted_handle {
-                    let res = handle.await.map_err(|_| DgnError::new("Promise panicked", expr.line))?;
-                    *state = PromiseState::Resolved(res.clone());
-                    return res;
-                } else {
-                    return Err(DgnError::new("Promise already consumed", expr.line));
-                }
-            }
-            Ok(val) // If they await a non-promise, just return it
-        },
-        
-        ExprNode::Super(method_name, args_expr) => {
-            let this_val = env.lock().unwrap().get("this")
-                .ok_or(DgnError::new("'super' used outside of a class method", 0))?;
-
-            if let DgnValue::Instance(inst) = &this_val {
-                let cls_val = inst.lock().unwrap().get("__class__").cloned()
-                    .ok_or(DgnError::new("Instance missing class metadata", 0))?;
-
-                if let DgnValue::Class(cls_env) = cls_val {
-                    let parent_cls = cls_env.lock().unwrap().get("__parent_class__")
-                        .ok_or(DgnError::new("No parent class found for 'super' call", 0))?;
-
-                    if let DgnValue::Class(parent_env) = parent_cls {
-                        let method = parent_env.lock().unwrap().get(method_name)
-                            .ok_or(DgnError::new(&format!("Method '{}' not found in parent", method_name), 0))?;
-
-                        if let DgnValue::Func(f) = method {
-                            let mut args = Vec::new();
-                            for a in args_expr { args.push(eval_expr(a, env.clone()).await?); }
-                            return call_dgn_func_impl(f, args, Some(this_val)).await;
-                        }
-                    }
-                }
-            }
-            Err(DgnError::new("Invalid super call", 0))
-        },
-        ExprNode::Var(n) => {
-            env.lock().unwrap().get(n).ok_or(DgnError::new(&format!("Var '{}' not defined", n), expr.line))
-        },
-        ExprNode::List(es) => {
-            let mut vec = Vec::new();
-            for e in es { vec.push(eval_expr(e, env.clone()).await?); }
-            let val = DgnValue::List(Arc::new(Mutex::new(vec)));
-            gc_register(&val); 
-            Ok(val)
-        },
-        ExprNode::Obj(entries) => {
-            let mut map = HashMap::new();
-            for (k, v) in entries {
-                map.insert(k.clone(), eval_expr(v, env.clone()).await?);
-            }
-            let val = DgnValue::Map(Arc::new(Mutex::new(map)));
-            gc_register(&val); 
-            Ok(val)
-        },
-        ExprNode::Assign(target, val_expr) => {
-            let val = eval_expr(val_expr, env.clone()).await?;
-            match &target.node {
-                ExprNode::Var(name) => {
-                    env.lock().unwrap()
-                .set(name.clone(), val.clone())
-                .map_err(|msg| DgnError::new(&msg, expr.line))?;
-                    Ok(val)
-                },
-                ExprNode::Index(obj, idx) => {
-                    let o = eval_expr(obj, env.clone()).await?;
-                    let i = eval_expr(idx, env.clone()).await?;
-                    match o {
-                        DgnValue::List(l) => {
-                            if let DgnValue::Number(n) = i {
-                                let mut arr = l.lock().unwrap();
-                                let idx = n as usize;
-                                if idx < arr.len() { arr[idx] = val.clone(); }
-                            }
-                        },
-                        DgnValue::Map(m) | DgnValue::Instance(m) => {
-                             if let DgnValue::String(k) = i {
-                                 m.lock().unwrap().insert(k, val.clone());
-                             }
-                        },
-                        DgnValue::ByteArray(b) => {
-                            if let DgnValue::Number(n) = i {
-                                let mut arr = b.lock().unwrap();
-                                let idx = n as usize;
-                                if idx < arr.len() { 
-                                    if let DgnValue::Number(byte_val) = val {
-                                        arr[idx] = byte_val as u8;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    Ok(val)
-                },
-                ExprNode::GetAttr(obj, name) => {
-                    let o = eval_expr(obj, env.clone()).await?;
-                    if let DgnValue::Map(m) | DgnValue::Instance(m) = o {
-                        m.lock().unwrap().insert(name.clone(), val.clone());
-                        Ok(val)
-                    } else {
-                        Err(DgnError::new("Cannot set attr on this type", expr.line))
-                    }
-                },
-                _ => Err(DgnError::new("Invalid assignment target", expr.line))
-            }
-        },
-        ExprNode::Unary(op, rhs) => {
-             let v = eval_expr(rhs, env).await?;
-             match (op.as_str(), v) {
-                 ("-", DgnValue::Number(n)) => Ok(DgnValue::Number(-n)),
-                 ("not", x) => Ok(DgnValue::Bool(!is_truthy(&x))),
-                 _ => Err(DgnError::new("Invalid unary op", expr.line))
-             }
-        },
-        ExprNode::Binary(op, lhs, rhs) => {
-            let l = eval_expr(lhs, env.clone()).await?;
-            if op == "and" { return Ok(if !is_truthy(&l) { l } else { eval_expr(rhs, env).await? }); }
-            if op == "or" { return Ok(if is_truthy(&l) { l } else { eval_expr(rhs, env).await? }); }
-
-            if op == "??" { 
-                return Ok(if let DgnValue::Null = l { eval_expr(rhs, env).await? } else { l }); 
-                
-            }
-            let r = eval_expr(rhs, env).await?;
-            
-            match op.as_str() {
-                "+" => match (l, r) {
-                    (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Number(a+b)),
-                    (DgnValue::String(a), b) => Ok(DgnValue::String(a + &val_to_string(&b))),
-                    (a, DgnValue::String(b)) => Ok(DgnValue::String(val_to_string(&a) + &b)),
-                    (DgnValue::List(a), DgnValue::List(b)) => {
-                        let mut new_list = a.lock().unwrap().clone();
-                        new_list.extend(b.lock().unwrap().clone());
-                        Ok(DgnValue::List(Arc::new(Mutex::new(new_list))))
-                    },
-                    (DgnValue::ByteArray(a), DgnValue::ByteArray(b)) => {
-                        let mut new_bytes = a.lock().unwrap().clone();
-                        new_bytes.extend(b.lock().unwrap().clone());
-                        Ok(DgnValue::ByteArray(Arc::new(Mutex::new(new_bytes))))
-                    }
-                    _ => Ok(DgnValue::Null)
-                },
-                "-" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a-b)) } else { Ok(DgnValue::Null) },
-                "*" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a*b)) } else { Ok(DgnValue::Null) },
-                "/" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a/b)) } else { Ok(DgnValue::Null) },
-                "%" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a%b)) } else { Ok(DgnValue::Null) },
-                "<" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a<b)) } else { Ok(DgnValue::Bool(false)) },
-                ">" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a>b)) } else { Ok(DgnValue::Bool(false)) },
-                "<=" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a<=b)) } else { Ok(DgnValue::Bool(false)) },
-                ">=" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a>=b)) } else { Ok(DgnValue::Bool(false)) },
-                "==" => match (l, r) {
-                    (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() < f64::EPSILON)),
-                    (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a==b)),
-                    (DgnValue::Bool(a), DgnValue::Bool(b)) => Ok(DgnValue::Bool(a==b)),
-                    (DgnValue::Null, DgnValue::Null) => Ok(DgnValue::Bool(true)),
-                    _ => Ok(DgnValue::Bool(false)),
-                },
-                "!=" => match (l, r) { 
-                    (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() >= f64::EPSILON)),
-                    (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a!=b)),
-                    (DgnValue::Bool(a), DgnValue::Bool(b)) => Ok(DgnValue::Bool(a!=b)),
-                    (DgnValue::Null, DgnValue::Null) => Ok(DgnValue::Bool(false)),
-                    _ => Ok(DgnValue::Bool(true)),
-                },
-                "&" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l, r) { 
-                    Ok(DgnValue::Number((a as i64 & b as i64) as f64)) 
-                } else { Ok(DgnValue::Null) },
-                
-                "|" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l, r) { 
-                    Ok(DgnValue::Number((a as i64 | b as i64) as f64)) 
-                } else { Ok(DgnValue::Null) },
-                
-                "^" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l, r) { 
-                    Ok(DgnValue::Number((a as i64 ^ b as i64) as f64)) 
-                } else { Ok(DgnValue::Null) },
-                
-                "<<" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l, r) { 
-                    Ok(DgnValue::Number(((a as i64) << (b as i64)) as f64)) 
-                } else { Ok(DgnValue::Null) },
-                
-                ">>" => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l, r) { 
-                    Ok(DgnValue::Number(((a as i64) >> (b as i64)) as f64)) 
-                } else { Ok(DgnValue::Null) },
-                _ => Ok(DgnValue::Null)
-            }
-        },
-       ExprNode::Call(func_expr, args_expr) => {
-            let func_val = eval_expr(func_expr, env.clone()).await?;
-            let mut args = Vec::new();
-            for a in args_expr { args.push(eval_expr(a, env.clone()).await?); }
-            
-            // Check if it's an async function being called
-            if let DgnValue::Func(f) = &func_val {
-                if f.is_async {
-                    let f_clone = f.clone();
-                    let handle = tokio::spawn(async move {
-                        call_dgn_func_impl(f_clone, args, None).await
-                    });
-                    
-                    let handle_arc = Arc::new(AsyncMutex::new(Some(handle)));
-                    return Ok(DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(handle_arc)))));
-                }
-            }
-            
-            call_dgn_func(func_val, args).await.map_err(|mut e| { 
-                if e.line == 0 { e.line = expr.line; } 
-                e 
-            })
-        },
-        ExprNode::GetAttr(obj_expr, name) => {
-            let obj = eval_expr(obj_expr, env.clone()).await?;
-            get_attr(obj, name).map_err(|mut e| { e.line = expr.line; e })
-        },
-        ExprNode::Index(obj, idx) => {
-             let o = eval_expr(obj, env.clone()).await?;
-             let i = eval_expr(idx, env.clone()).await?;
-             match (o, i) {
-                 (DgnValue::List(l), DgnValue::Number(n)) => {
-                     let vec = l.lock().unwrap();
-                     let idx = n as usize;
-                     if idx < vec.len() { Ok(vec[idx].clone()) } else { Ok(DgnValue::Null) }
-                 },
-                 (DgnValue::ByteArray(b), DgnValue::Number(n)) => {
-                     let vec = b.lock().unwrap();
-                     let idx = n as usize;
-                     if idx < vec.len() { Ok(DgnValue::Number(vec[idx] as f64)) } else { Ok(DgnValue::Null) }
-                 },
-                 (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) => {
-                     let val = m.lock().unwrap().get(&k).cloned();
-                     Ok(val.unwrap_or(DgnValue::Null))
-                 },
-                 (DgnValue::String(s), DgnValue::Number(n)) => {
-                    let idx = n as usize;
-                    if idx < s.len() {
-                        Ok(DgnValue::String(s.chars().nth(idx).unwrap().to_string()))
-                    } else { Ok(DgnValue::Null) }
-                 }
-                 _ => Ok(DgnValue::Null)
-             }
-        },
-        ExprNode::Ternary(c, t, f) => {
-            if is_truthy(&eval_expr(c, env.clone()).await?) { eval_expr(t, env).await } else { eval_expr(f, env).await }
-        },
-        ExprNode::FuncExpr(params, body) => {
-             Ok(DgnValue::Func(DgnFunc {
-                 name: None, params: params.clone(), body: *body.clone(), closure: env.clone(), is_native: false, is_async: false, native_fn: None
-             }))
-        },
-        ExprNode::New(cls_expr, args) => {
-
-             let cls_val = eval_expr(cls_expr, env.clone()).await?;
-             
-             if let DgnValue::Class(cls_env) = cls_val {
-                 let instance_map = Arc::new(Mutex::new(HashMap::new()));
-                 instance_map.lock().unwrap().insert("__class__".to_string(), DgnValue::Class(cls_env.clone()));
-                 
-                 let instance = DgnValue::Instance(instance_map);
-                 gc_register(&instance);
-                 
-                 if let Ok(init_func) = get_attr(instance.clone(), "init") {
-                     if let DgnValue::Func(_) = init_func {
-                        call_dgn_func(init_func, args_expr_to_val(args, env.clone()).await?).await.map_err(|mut e| { e.line = expr.line; e })?;
-                     }
-                 }
-                 
-                 Ok(instance)
-             } else {
-                 Err(DgnError::new("Operand is not a class", expr.line))
-             }
-        },
-        ExprNode::PreOp(op, target) => {
-             handle_inc_dec(op, target, env, true).await.map_err(|mut e| { e.line = expr.line; e })
-        },
-        ExprNode::PostOp(op, target) => {
-             handle_inc_dec(op, target, env, false).await.map_err(|mut e| { e.line = expr.line; e })
-        },
-    }
-}
-
-pub async fn args_expr_to_val(args: &[Expr], env: Arc<Mutex<Env>>) -> Result<Vec<DgnValue>, DgnError> {
-    let mut v = Vec::new();
-    for a in args { v.push(eval_expr(a, env.clone()).await?); }
-    Ok(v)
-}
-
-pub async fn handle_inc_dec(op: &str, target: &Expr, env: Arc<Mutex<Env>>, is_pre: bool) -> Result<DgnValue, DgnError> {
-    match &target.node {
-        // Case 1: Simple Variables (i++)
-        ExprNode::Var(name) => {
-            let cur = env.lock().unwrap().get(name).unwrap_or(DgnValue::Number(0.0));
-            if let DgnValue::Number(n) = cur {
-                let new_n = if op == "INC" { n + 1.0 } else { n - 1.0 };
-                env.lock().unwrap().set(name.clone(), DgnValue::Number(new_n)).map_err(|e| DgnError::new(&e, 0))?;
-                Ok(DgnValue::Number(if is_pre { new_n } else { n }))
-            } else { Err(DgnError::new("Cannot ++/-- non-number", target.line)) }
-        },
-        
-        // Case 2: Object Properties (this.pc++)
-        ExprNode::GetAttr(obj_expr, name) => {
-            let obj = eval_expr(obj_expr, env.clone()).await?;
-            // Use existing get_attr helper to resolve value (handles inheritance)
-            let current = get_attr(obj.clone(), name)?; 
-            
-            if let DgnValue::Number(n) = current {
-                let new_n = if op == "INC" { n + 1.0 } else { n - 1.0 };
-                
-                // Write the new value back to the object
-                match obj {
-                    DgnValue::Instance(map) | DgnValue::Map(map) => {
-                        map.lock().unwrap().insert(name.clone(), DgnValue::Number(new_n));
-                    },
-                    _ => return Err(DgnError::new("Cannot assign property on this type", target.line))
-                }
-                
-                Ok(DgnValue::Number(if is_pre { new_n } else { n }))
-            } else {
-                Err(DgnError::new("Cannot increment/decrement non-number property", target.line))
-            }
-        },
-
-        // Case 3: Index/Array Access (arr[0]++)
-        ExprNode::Index(obj_expr, idx_expr) => {
-            let obj = eval_expr(obj_expr, env.clone()).await?;
-            let idx = eval_expr(idx_expr, env.clone()).await?;
-
-            match obj {
-                DgnValue::List(list) => {
-                    if let DgnValue::Number(i) = idx {
-                        let i = i as usize;
-                        let mut vec = list.lock().unwrap();
-                        if i < vec.len() {
-                             if let DgnValue::Number(n) = vec[i] {
-                                 let new_n = if op == "INC" { n + 1.0 } else { n - 1.0 };
-                                 vec[i] = DgnValue::Number(new_n);
-                                 Ok(DgnValue::Number(if is_pre { new_n } else { n }))
-                             } else {
-                                 Err(DgnError::new("Element is not a number", target.line))
-                             }
-                        } else {
-                             Err(DgnError::new("Index out of bounds", target.line))
-                        }
-                    } else {
-                        Err(DgnError::new("List index must be a number", target.line))
-                    }
-                },
-                 DgnValue::Instance(map) | DgnValue::Map(map) => {
-                    if let DgnValue::String(k) = idx {
-                        let mut m = map.lock().unwrap();
-                        let cur = m.get(&k).cloned().unwrap_or(DgnValue::Number(0.0));
-                        if let DgnValue::Number(n) = cur {
-                            let new_n = if op == "INC" { n + 1.0 } else { n - 1.0 };
-                            m.insert(k, DgnValue::Number(new_n));
-                            Ok(DgnValue::Number(if is_pre { new_n } else { n }))
-                        } else {
-                             Err(DgnError::new("Value is not a number", target.line))
-                        }
-                    } else {
-                        Err(DgnError::new("Map key must be string", target.line))
-                    }
-                },
-                _ => Err(DgnError::new("Cannot index this type", target.line))
-            }
-        },
-        _ => Err(DgnError::new("Invalid op target", target.line))
-    }
-}
 
 pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
     match obj {
@@ -2166,10 +2688,11 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                          let f_clone = f.clone();
                      
                          return Ok(DgnValue::Func(DgnFunc {
-                             name: f.name.clone(), params: f.params.clone(), body: Stmt { node: StmtNode::Block(vec![]), line: 0 },
+                             name: f.name.clone(), params: f.params.clone(), body: None,
                              closure: f.closure.clone(),
                              is_native: true,
                              is_async: f.is_async,
+                             compiled_chunk: None,
                              native_fn: Some(Arc::new(move |args| {
                                  let rt = tokio::runtime::Handle::current();
                                     tokio::task::block_in_place(|| {
@@ -2413,17 +2936,19 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
 
 pub fn native_method<T: Send + Sync + 'static>(target: Arc<T>, f: impl Fn(Arc<T>, Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync + 'static) -> DgnValue {
     DgnValue::Func(DgnFunc {
-        name: Some("native_method".into()), params: vec![], body: Stmt { node: StmtNode::Block(vec![]), line: 0 },
+        name: Some("native_method".into()), params: vec![], body: None,
         closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true,
         is_async: false,
+        compiled_chunk: None,
         native_fn: Some(Arc::new(move |args| f(target.clone(), args)))
     })
 }
 
 pub fn native_fn(f: impl Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync + 'static) -> DgnValue {
     DgnValue::Func(DgnFunc {
-        name: Some("native".into()), params: vec![], body: Stmt { node: StmtNode::Block(vec![]), line: 0 },
+        name: Some("native".into()), params: vec![], body: None,
         closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true, is_async: false,
+        compiled_chunk: None,
         native_fn: Some(Arc::new(f))
     })
 }
@@ -2439,26 +2964,29 @@ pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnVal
     }
 }
 
+#[async_recursion]
 pub async fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnValue>) -> Result<DgnValue, DgnError> {
-
     let scope = Arc::new(Mutex::new(Env::new(Some(f.closure.clone()), None)));
-    
+
     for (i, param) in f.params.iter().enumerate() {
         let v = args.get(i).cloned().unwrap_or(DgnValue::Null);
         scope.lock().unwrap().store.insert(param.clone(), v);
     }
-    
-   
-    if let Some(th) = this_ctx {
 
+    if let Some(th) = this_ctx {
         scope.lock().unwrap().store.insert("this".to_string(), th);
     }
-    
-    match eval_stmt(&f.body, scope).await {
-        Ok(EvalResult::Return(v)) => Ok(v),
-        Ok(_) => Ok(DgnValue::Null),
-        Err(e) => Err(e),
+
+    // If this function has a compiled bytecode chunk, run it through the VM
+    if let Some(chunk_arc) = &f.compiled_chunk {
+        let chunk = chunk_arc.as_ref().clone();
+        let mut vm = Vm::new();
+        return vm.run(&chunk, scope).await;
     }
+
+
+        Ok(DgnValue::Null)
+
 }
 
 #[cfg(not(any(target_arch = "wasm32")))]
@@ -2496,6 +3024,21 @@ where
 
 
 pub fn get_builtin_module(name: &str) -> Option<DgnValue> {
+  {
+     let cache = BUILTIN_MODULE_CACHE.lock().unwrap();
+        if let Some(v) = cache.get(name) {
+            return Some(v.clone());
+        }
+    }
+    // Not cached yet — build it
+    let val = build_builtin_module(name)?;
+    BUILTIN_MODULE_CACHE.lock().unwrap().insert(name.to_owned(), val.clone());
+    Some(val)
+}
+
+/// Builds a built-in module map from scratch.
+/// Called only ONCE per module name — result is cached by get_builtin_module.
+fn build_builtin_module(name: &str) -> Option<DgnValue> {
     match name {
         "math" => {
             let mut map = HashMap::new();
@@ -3932,8 +4475,13 @@ impl LintReport {
     }
 }
 
+struct SymbolInfo {
+    is_used: bool,
+    sym_type: String,
+}
+
 struct LinterScope {
-    variables: HashMap<String, bool>,
+    variables: HashMap<String, SymbolInfo>,
 }
 
 struct Linter {
@@ -3954,7 +4502,7 @@ impl Linter {
          "alert"
         ];
         for b in builtins {
-            l.define(b, true); 
+            l.define(b, "built-in function", true);
         }
         l
     }
@@ -3967,38 +4515,63 @@ impl Linter {
         let is_global = self.scopes.len() == 1;
 
         if let Some(scope) = self.scopes.pop() {
-
             if !is_global { 
-                for (name, used) in scope.variables {
-                    if !used && !name.starts_with('_') { 
-                        self.report.warnings.push(format!("Unused variable '{}'", name));
+                for (name, info) in scope.variables {
+                    if !info.is_used && !name.starts_with('_') { 
+                        self.report.warnings.push(format!("Unused {} '{}'", info.sym_type, name));
                     }
                 }
             }
         }
     }
 
-    fn define(&mut self, name: &str, marked_used: bool) {
+    fn define(&mut self, name: &str, sym_type: &str, marked_used: bool) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.variables.insert(name.to_string(), marked_used);
+            let current_status = scope.variables.get(name).map(|s| s.is_used).unwrap_or(false);
+            if marked_used || !current_status {
+                scope.variables.insert(name.to_string(), SymbolInfo {
+                    is_used: marked_used,
+                    sym_type: sym_type.to_string(),
+                });
+            }
         }
     }
 
-    fn use_var(&mut self, name: &str, line: usize) {
+    fn use_identifier(&mut self, name: &str, line: usize, expected_type: &str) {
         for scope in self.scopes.iter_mut().rev() {
-            if scope.variables.contains_key(name) {
-                scope.variables.insert(name.to_string(), true); 
+            // We use get_mut to modify the SymbolInfo directly instead of inserting a bool
+            if let Some(info) = scope.variables.get_mut(name) {
+                info.is_used = true; 
                 return;
             }
         }
-        self.report.errors.push(format!("Undefined variable '{}' at line {}", name, line));
+        self.report.errors.push(format!("Undefined {} '{}' at line {}", expected_type, name, line));
     }
+
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.node {
             StmtNode::Block(stmts) => {
                 self.enter_scope();
-                for s in stmts { self.check_stmt(s); }
+                
+                // PASS 1: Hoist functions and classes in the linter
+                for s in stmts {
+                    match &s.node {
+                        StmtNode::FuncDef(name, ..) => {
+                            if !name.is_empty() { self.define(name, "function", false); }
+                        }
+                        StmtNode::ClassDef(name, ..) => {
+                            self.define(name, "class", false);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // PASS 2: Check standard execution flow
+                for s in stmts { 
+                    self.check_stmt(s); 
+                }
+                
                 self.exit_scope();
             },
             StmtNode::Expr(e) | StmtNode::Return(Some(e)) | StmtNode::Raise(e) => {
@@ -4021,7 +4594,7 @@ impl Linter {
             StmtNode::For(name, iter, body) => {
                 self.check_expr(iter);
                 self.enter_scope();
-                self.define(name, false); 
+                self.define(name, "variable", false);
                 self.check_stmt(body);
                 self.exit_scope();
             },
@@ -4034,22 +4607,22 @@ impl Linter {
                 self.exit_scope();
             },
             StmtNode::FuncDef(name, params, body,_is_async) => {
-                self.define(name, false);
+                self.define(name, "function", false);
                 self.enter_scope();
-                for p in params { self.define(p, false); }
+                for p in params { self.define(p, "variable", false); }
                 self.check_stmt(body);
                 self.exit_scope();
             },
             StmtNode::ClassDef(name, _, body) => {
-                self.define(name, false);
+                self.define(name, "class", false);
                 self.enter_scope();
-                self.define("this", true); 
+                self.define("this", "keyword", true); 
                 self.check_stmt(body);
                 self.exit_scope();
             },
             StmtNode::ConstDecl(name, expr) => {
                 self.check_expr(expr);
-                self.define(name, false);
+                self.define(name, "constant", false);
             },
                 StmtNode::Import(path, as_name) => {
                     // Determine the name the module is bound to (alias, or file stem)
@@ -4057,7 +4630,7 @@ impl Linter {
                         std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string()
                     });
                     // Define the module in the current scope so the linter knows it exists
-                    self.define(&bind, false);
+                    self.define(&bind, "module", false);
                 },
             StmtNode::Switch(expr, cases, default) => {
                 self.check_expr(expr);
@@ -4079,7 +4652,7 @@ impl Linter {
 
     fn check_expr(&mut self, expr: &Expr) {
         match &expr.node {
-            ExprNode::Var(name) => self.use_var(name, expr.line),
+            ExprNode::Var(name) => self.use_identifier(name, expr.line, "variable"),
             ExprNode::Assign(target, val) => {
                 self.check_expr(val);
 
@@ -4091,10 +4664,10 @@ impl Linter {
                     }
                     if !found {
 
-                        self.define(name, false);
+                        self.define(name, "variable", false);
                     } else {
 
-                        self.use_var(name, expr.line);
+                        self.use_identifier(name, expr.line, "variable");
                     }
                 } else {
                     self.check_expr(target);
@@ -4103,7 +4676,11 @@ impl Linter {
             ExprNode::Binary(_, l, r) => { self.check_expr(l); self.check_expr(r); },
             ExprNode::Unary(_, e) => self.check_expr(e),
             ExprNode::Call(callee, args) => {
-                self.check_expr(callee);
+                if let ExprNode::Var(name) = &callee.node {
+                    self.use_identifier(name, callee.line, "function");
+                } else {
+                    self.check_expr(callee);
+                }
                 for a in args { self.check_expr(a); }
             },
             ExprNode::List(items) => { for i in items { self.check_expr(i); } },
@@ -4112,12 +4689,16 @@ impl Linter {
             ExprNode::GetAttr(obj, _) => self.check_expr(obj),
             ExprNode::FuncExpr(params, body) => {
                 self.enter_scope();
-                for p in params { self.define(p, false); }
+                for p in params { self.define(p, "variable", false); }
                 self.check_stmt(body);
                 self.exit_scope();
             },
             ExprNode::New(cls_expr, args) => {
-                self.check_expr(cls_expr);
+                if let ExprNode::Var(name) = &cls_expr.node {
+                    self.use_identifier(name, cls_expr.line, "class");
+                } else {
+                    self.check_expr(cls_expr);
+                }
                 for a in args { self.check_expr(a); }
             },
             ExprNode::Super(_, args) => {

@@ -50,13 +50,21 @@ fn main() {
         let tokens = lex(entry);
         let mut parser = Parser::new(tokens);
         match parser.parse() {
-            Ok(ast) => { 
+            Ok(ast) => {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                if let Err(e) = rt.block_on(eval_stmt(&ast, env)) { 
-                    eprintln!("Runtime Error: {} at line {}", e.msg, e.line); 
-                    std::process::exit(1); 
-                } 
-            },   Err(e) => { eprintln!("Bundle Parse Error: {}", e); std::process::exit(1); }
+                let mut chunk = Chunk::new();
+                Compiler::compile_stmt(&mut chunk, &ast);
+                chunk.emit(Instruction::Halt, 0);
+
+                if let Err(e) = rt.block_on(async {
+                    let mut vm = Vm::new();
+                    vm.run(&chunk, env.clone()).await.map(|_| ())
+                }) {
+                    eprintln!("Runtime Error: {} at line {}", e.msg, e.line);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => { eprintln!("Bundle Parse Error: {}", e); std::process::exit(1); }
         }
         return;
     }
@@ -344,29 +352,45 @@ fn main() {
     if command == "--repl" {
         println!("Dragon v1.0.0");
         println!("Type 'exit' to quit.");
-        
+
         let env = Arc::new(Mutex::new(Env::new(None, None)));
         env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
         populate_builtins(env.clone());
-        
+
+        // The REPL shares one persistent VM so variables defined in one line
+        // are visible in the next — the env acts as the persistent scope.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
         loop {
             print!("> ");
             std::io::stdout().flush().unwrap();
             let mut line = String::new();
             if std::io::stdin().read_line(&mut line).unwrap() == 0 { break; }
             if line.trim() == "exit" { break; }
-            
+
             let tokens = lex(&line);
             let mut parser = Parser::new(tokens);
-            if let Ok(ast) = parser.parse_stmt() {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                match rt.block_on(eval_stmt(&ast, env.clone())) {
-                    Ok(EvalResult::Val(v)) | Ok(EvalResult::Return(v)) => println!("{}", val_to_string(&v)),
-                    Err(e) => println!("Error: {} at line {}", e.msg, e.line),
-                    _ => {}
+            match parser.parse_stmt() {
+                Ok(ast) => {
+                    let mut chunk = Chunk::new();
+                    Compiler::compile_repl_stmt(&mut chunk, &ast);
+                    chunk.emit(Instruction::Halt, 0);
+
+                    let result = rt.block_on(async {
+                        let mut vm = Vm::new();
+                        vm.run(&chunk, env.clone()).await
+                    });
+
+                    match result {
+                        Ok(v) => {
+                            if !matches!(v, DgnValue::Null) {
+                                println!("{}", val_to_string(&v));
+                            }
+                        }
+                        Err(e) => println!("Error: {} at line {}", e.msg, e.line),
+                    }
                 }
-            } else {
-                println!("Syntax Error");
+                Err(_) => println!("Syntax Error"),
             }
         }
         return;
@@ -422,9 +446,15 @@ fn main() {
                         }
                     }
 
+                    let mut chunk = Chunk::new();
+                    Compiler::compile_stmt(&mut chunk, &ast);
+                    chunk.emit(Instruction::Halt, 0);
 
                     let rt = tokio::runtime::Runtime::new().unwrap();
-                    if let Err(e) = rt.block_on(eval_stmt(&ast, env)) {
+                    if let Err(e) = rt.block_on(async {
+                        let mut vm = Vm::new();
+                        vm.run(&chunk, env.clone()).await.map(|_| ())
+                    }) {
                         eprintln!("Runtime Error: {} at line {}", e.msg, e.line);
                         std::process::exit(1);
                     }

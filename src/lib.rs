@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 
-mod engine;
+pub mod engine;
 use engine::*;
 use std::panic;
 
@@ -180,16 +180,15 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         
                         // 3. PRINT DRAGON RUNTIME ERRORS TO LOGCAT!
-                        if let StmtNode::Block(stmts) = ast.node {
-                            for s in stmts { 
-                                if let Err(err) = rt.block_on(eval_stmt(&s, env_arc.clone())) {
-                                    android_log(&format!("DRAGON CRASH: {} at line {}", err.msg, err.line));
-                                }
-                            }
-                        } else {
-                            if let Err(err) = rt.block_on(eval_stmt(&ast, env_arc.clone())) {
-                                android_log(&format!("DRAGON CRASH: {} at line {}", err.msg, err.line));
-                            }
+                        let mut chunk = Chunk::new();
+                        Compiler::compile_stmt(&mut chunk, &ast);
+                        chunk.emit(Instruction::Halt, 0);
+
+                        if let Err(err) = rt.block_on(async {
+                            let mut vm = Vm::new();
+                            vm.run(&chunk, env_arc.clone()).await
+                        }) {
+                            android_log(&format!("DRAGON CRASH: {} at line {}", err.msg, err.line));
                         }
                     } else {
                         android_log("DRAGON PARSE ERROR: Failed to parse bundle.");
@@ -259,16 +258,15 @@ pub extern "C" fn dragon_android_main(_argc: c_int, _argv: *const *const c_char)
                     if let Ok(ast) = parser.parse() {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         
-                        if let StmtNode::Block(stmts) = ast.node {
-                            for s in stmts { 
-                                if let Err(err) = rt.block_on(eval_stmt(&s, env_arc.clone())) {
-                                    android_log(&format!("DRAGON CRASH: {} at line {}", err.msg, err.line));
-                                }
-                            }
-                        } else {
-                            if let Err(err) = rt.block_on(eval_stmt(&ast, env_arc.clone())) {
-                                android_log(&format!("DRAGON CRASH: {} at line {}", err.msg, err.line));
-                            }
+                        let mut chunk = Chunk::new();
+                        Compiler::compile_stmt(&mut chunk, &ast);
+                        chunk.emit(Instruction::Halt, 0);
+
+                        if let Err(err) = rt.block_on(async {
+                            let mut vm = Vm::new();
+                            vm.run(&chunk, env_arc.clone()).await
+                        }) {
+                            android_log(&format!("DRAGON CRASH: {} at line {}", err.msg, err.line));
                         }
                     } else {
                         android_log("DRAGON PARSE ERROR: Failed to parse bundle.");
@@ -306,11 +304,14 @@ unsafe extern "C" fn native_run_script(mut env: JNIEnv, _: JClass, bundle_jstr: 
         let mut parser = Parser::new(tokens);
         if let Ok(ast) = parser.parse() {
              let rt = tokio::runtime::Runtime::new().unwrap();
-             if let StmtNode::Block(stmts) = ast.node {
-                for s in stmts { let _ = rt.block_on(eval_stmt(&s, env_lock.clone())); }
-             } else {
-                let _ = rt.block_on(eval_stmt(&ast, env_lock.clone()));
-             }
+             let mut chunk = Chunk::new();
+             Compiler::compile_stmt(&mut chunk, &ast);
+             chunk.emit(Instruction::Halt, 0);
+
+             let _ = rt.block_on(async {
+                 let mut vm = Vm::new();
+                 vm.run(&chunk, env_lock.clone()).await
+             });
         }
     }
 
@@ -378,7 +379,14 @@ pub fn dragon_run_wasm(encoded_payload: &str) -> String {
         match parser.parse() {
             Ok(ast) => {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                match rt.block_on(eval_stmt(&ast, env)) {
+                let mut chunk = Chunk::new();
+                Compiler::compile_stmt(&mut chunk, &ast);
+                chunk.emit(Instruction::Halt, 0);
+
+                match rt.block_on(async {
+                    let mut vm = Vm::new();
+                    vm.run(&chunk, env).await
+                }) {
                     Ok(_) => "Program Finished".to_string(),
                     Err(e) => format!("Runtime Error: {} at line {}", e.msg, e.line)
                 }
@@ -487,12 +495,15 @@ pub extern "C" fn Dragon_Init() -> c_int {
         let mut parser = Parser::new(tokens);
         if let Ok(ast) = parser.parse() {
             let rt = tokio::runtime::Runtime::new().unwrap(); 
-            if let StmtNode::Block(stmts) = ast.node {
-                for s in stmts {
-                    if rt.block_on(eval_stmt(&s, env.clone())).is_err() { return -3; }
-                }
-            } else {
-                if rt.block_on(eval_stmt(&ast, env.clone())).is_err() { return -3; } 
+            let mut chunk = Chunk::new();
+            Compiler::compile_stmt(&mut chunk, &ast);
+            chunk.emit(Instruction::Halt, 0);
+            
+            if rt.block_on(async {
+                let mut vm = Vm::new();
+                vm.run(&chunk, env.clone()).await
+            }).is_err() { 
+                return -3; 
             }
         } else { return -4; }
     }
