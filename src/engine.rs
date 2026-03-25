@@ -51,7 +51,7 @@ static ref BUILTIN_MODULE_CACHE: Mutex<HashMap<String, DgnValue>> =
         ("COMMENT_ML", Regex::new(r"(?s)^/\*.*?\*/").unwrap()), 
         ("COMMENT_SL", Regex::new(r"^//[^\n]*").unwrap()), 
         ("HEX", Regex::new(r"^0x[0-9a-fA-F]+").unwrap()),
-        ("NUMBER", Regex::new(r"^[0-9]+(\.[0-9]+)?").unwrap()), 
+        ("NUMBER", Regex::new(r"^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?").unwrap()),
         ("STRING", Regex::new(r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)+'"#).unwrap()), 
         ("NAME", Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*").unwrap()),
         ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|\?\?|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
@@ -126,7 +126,7 @@ pub enum ExprNode {
     Index(Box<Expr>, Box<Expr>),
     PreOp(String, Box<Expr>),
     PostOp(String, Box<Expr>),
-    FuncExpr(Vec<String>, Box<Stmt>),
+    FuncExpr(Vec<String>, usize, Box<Stmt>),
     New(Box<Expr>, Vec<Expr>),
     Super(String, Vec<Expr>),
     Await(Box<Expr>), // ADD THIS
@@ -147,7 +147,7 @@ pub enum StmtNode {
     CFor(Option<Expr>, Option<Expr>, Option<Expr>, Box<Stmt>),
     Switch(Expr, Vec<(Expr, Stmt)>, Option<Box<Stmt>>),
     Try(Box<Stmt>, Option<String>, Option<Box<Stmt>>, Option<Box<Stmt>>),
-    FuncDef(String, Vec<String>, Box<Stmt>, bool),
+    FuncDef(String, Vec<String>, usize, Box<Stmt>, bool),
     ClassDef(String, Option<String>, Box<Stmt>),
     Import(String, Option<String>),
     ConstDecl(String, Expr),
@@ -194,6 +194,7 @@ impl DgnValue {
 pub struct DgnFunc {
     pub name: Option<String>,
     pub params: Vec<String>,
+    pub req_params: usize,
     pub body: Option<Stmt>,
     pub closure: Arc<Mutex<Env>>,
     pub is_native: bool,
@@ -418,7 +419,7 @@ pub enum Instruction {
     DoWhileStart,              // marks do-while body start ip (patched after)
 
     // Functions / closures
-    MakeClosure(Vec<String>, bool, Box<Vec<Instruction>>, Box<Vec<usize>>), // params, is_async, instrs, lines
+    MakeClosure(Option<String>, Vec<String>, usize, bool, Box<Vec<Instruction>>, Box<Vec<usize>>),// params, is_async, instrs, lines
 
     // Classes / instances
     MakeClass(String, Option<String>, Box<Vec<Instruction>>, Box<Vec<usize>>),
@@ -553,15 +554,24 @@ impl Compiler {
             }
 
             StmtNode::ConstDecl(name, e) => {
-                Self::compile_expr(chunk, e);
+                if let ExprNode::FuncExpr(params, req_params, body) = &e.node {
+                    let (instrs, lines) = Self::compile_body(body);
+                    chunk.emit(Instruction::MakeClosure(
+                        Some(name.clone()), params.clone(), *req_params, false,
+                        Box::new(instrs), Box::new(lines),
+                    ), e.line);
+                } else {
+                    Self::compile_expr(chunk, e);
+                }
                 chunk.emit(Instruction::DefineConst(name.clone()), line);
             }
 
             // ── func definition ──────────────────────────────────────────────
-            StmtNode::FuncDef(name, params, body, is_async) => {
+            StmtNode::FuncDef(name, params, req_params, body, is_async) => {
                 let (instrs, lines) = Self::compile_body(body);
+                let opt_name = if name.is_empty() { None } else { Some(name.clone()) };
                 let instr = Instruction::MakeClosure(
-                    params.clone(), *is_async,
+                    opt_name, params.clone(), *req_params, *is_async,
                     Box::new(instrs), Box::new(lines),
                 );
                 chunk.emit(instr, line);
@@ -751,7 +761,23 @@ impl Compiler {
 
             // ── assignment ───────────────────────────────────────────────────
             ExprNode::Assign(target, val) => {
-                Self::compile_expr(chunk, val);
+                let mut inferred_name = None;
+                if let ExprNode::Var(n) = &target.node {
+                    inferred_name = Some(n.clone());
+                } else if let ExprNode::GetAttr(_, n) = &target.node {
+                    inferred_name = Some(n.clone()); // Handles obj.myFunc = () => {}
+                }
+
+                // If the RHS is a lambda, compile it directly with the inferred name
+                if let ExprNode::FuncExpr(params, req_params, body) = &val.node {
+                    let (instrs, lines) = Self::compile_body(body);
+                    chunk.emit(Instruction::MakeClosure(
+                        inferred_name, params.clone(), *req_params, false,
+                        Box::new(instrs), Box::new(lines),
+                    ), val.line);
+                } else {
+                    Self::compile_expr(chunk, val); // Normal compilation
+                }
                 match &target.node {
                     ExprNode::Var(n) => {
                         chunk.emit(Instruction::Dup, line);
@@ -859,16 +885,24 @@ impl Compiler {
             ExprNode::Obj(pairs) => {
                 for (k, v) in pairs {
                     chunk.emit(Instruction::LoadConst(DgnValue::String(k.clone())), line);
-                    Self::compile_expr(chunk, v);
+                    if let ExprNode::FuncExpr(params, req_params, body) = &v.node {
+                        let (instrs, lines) = Self::compile_body(body);
+                        chunk.emit(Instruction::MakeClosure(
+                            Some(k.clone()), params.clone(), *req_params, false,
+                            Box::new(instrs), Box::new(lines),
+                        ), v.line);
+                    } else {
+                        Self::compile_expr(chunk, v);
+                    }
                 }
                 chunk.emit(Instruction::MakeMap(pairs.len()), line);
             }
 
             // ── lambda / func expression ──────────────────────────────────────
-            ExprNode::FuncExpr(params, body) => {
+            ExprNode::FuncExpr(params, req_params, body) => {
                 let (instrs, lines) = Self::compile_body(body);
                 chunk.emit(Instruction::MakeClosure(
-                    params.clone(), false,
+                    None, params.clone(), *req_params, false,
                     Box::new(instrs), Box::new(lines),
                 ), line);
             }
@@ -1126,14 +1160,15 @@ impl Vm {
                 Instruction::Return => { return Ok(self.pop()); }
 
                 // ── closures ──────────────────────────────────────────────────
-                Instruction::MakeClosure(ref params, is_async, ref body_instrs, ref body_lines) => {
+                Instruction::MakeClosure(ref opt_name, ref params, req_params, is_async, ref body_instrs, ref body_lines) => {
                     let chunk_arc = Arc::new(Chunk {
                         instructions: *body_instrs.clone(),
                         source_lines:  *body_lines.clone(),
                     });
                     let func = DgnFunc {
-                        name: None,
+                        name: opt_name.clone(),
                         params: params.clone(),
+                        req_params, // NEW
                         body: None,
                         closure: env.clone(),   // capture env = true lexical closure
                         is_native: false,
@@ -1728,11 +1763,31 @@ pub fn lex(src: &str) -> Vec<Token> {
                 col += pos - start;
                 tokens.push(Token { typ: TokenType::Number, value: src[start..pos].to_string(), line, col: col_start, num_val: Some(n) });
             } else {
+                // 1. Parse whole number part
                 while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+                
+                // 2. Parse fractional part (e.g., .4028)
                 if pos < len && bytes[pos] == b'.' && pos+1 < len && bytes[pos+1].is_ascii_digit() {
                     pos += 1;
                     while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
                 }
+                
+                // 3. Parse scientific notation (e.g., e38, e-300, E+10)
+                if pos < len && (bytes[pos] == b'e' || bytes[pos] == b'E') {
+                    let mut e_pos = pos + 1;
+                    
+                    // Allow optional + or - after the E
+                    if e_pos < len && (bytes[e_pos] == b'+' || bytes[e_pos] == b'-') {
+                        e_pos += 1;
+                    }
+                    
+                    // Only consume if the exponent actually contains digits
+                    if e_pos < len && bytes[e_pos].is_ascii_digit() {
+                        pos = e_pos;
+                        while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+                    }
+                }
+
                 let n: f64 = src[start..pos].parse().unwrap_or(0.0);
                 col += pos - start;
                 tokens.push(Token { typ: TokenType::Number, value: src[start..pos].to_string(), line, col: col_start, num_val: Some(n) });
@@ -1985,15 +2040,43 @@ impl Parser {
         }
         self.expect("(")?;
         let mut params = Vec::new();
+        let mut default_inits = Vec::new();
+        let mut req_params = 0;
+        
         if self.current().value != ")" {
             loop {
-                params.push(self.expect("NAME")?.value);
+                let p_name = self.expect("NAME")?.value;
+                params.push(p_name.clone());
+                
+                if self.match_token("=") {
+                    let def_expr = self.parse_expr()?;
+                    let p_var = Expr { node: ExprNode::Var(p_name.clone()), line };
+                    let coalesce = Expr { node: ExprNode::Binary("??".to_string(), Box::new(p_var.clone()), Box::new(def_expr)), line };
+                    let assign_expr = Expr { node: ExprNode::Assign(Box::new(p_var), Box::new(coalesce)), line };
+                    default_inits.push(Stmt { node: StmtNode::Expr(assign_expr), line });
+                } else {
+                    if !default_inits.is_empty() {
+                        return Err(format!("Required parameter '{}' cannot follow optional parameters at line {}", p_name, line));
+                    }
+                    req_params += 1;
+                }
+                
                 if !self.match_token(",") { break; }
             }
         }
         self.expect(")")?;
-        let body = self.parse_block()?;
-        Ok(Stmt { node: StmtNode::FuncDef(name, params, Box::new(body), is_async), line })
+        let mut body = self.parse_block()?;
+
+        if !default_inits.is_empty() {
+            if let StmtNode::Block(ref mut stmts) = body.node {
+                for (i, stmt) in default_inits.into_iter().enumerate() {
+                    stmts.insert(i, stmt);
+                }
+            }
+        }
+
+        // FIX: Added req_params here!
+        Ok(Stmt { node: StmtNode::FuncDef(name, params, req_params, Box::new(body), is_async), line })
     }
 
     fn parse_bitwise(&mut self) -> Result<Expr, String> {
@@ -2084,6 +2167,7 @@ impl Parser {
         let line = self.current().line;
         self.expect("for")?;
         if self.match_token("(") {
+            self.match_token("var");
             if matches!(self.current().typ, TokenType::Name) && self.peek(1).value == "in" {
                 let name = self.advance().value;
                 self.expect("in")?;
@@ -2122,6 +2206,8 @@ impl Parser {
             let body = self.parse_block()?;
             return Ok(Stmt { node: StmtNode::CFor(init, cond, step, Box::new(body)), line });
         }
+        self.match_token("var");
+
         let name = self.expect("NAME")?.value;
         self.expect("in")?;
         let iter = self.parse_expr()?;
@@ -2413,15 +2499,40 @@ impl Parser {
                     self.advance();
                     self.expect("(")?;
                     let mut params = Vec::new();
+                    let mut default_inits = Vec::new();
+                    let mut req_params = 0; // FIX: Added
+                    
                     if self.current().value != ")" {
                         loop {
-                            params.push(self.expect("NAME")?.value);
+                            let p_name = self.expect("NAME")?.value;
+                            params.push(p_name.clone());
+                            
+                            if self.match_token("=") {
+                                let def_expr = self.parse_expr()?;
+                                let p_var = Expr { node: ExprNode::Var(p_name.clone()), line };
+                                let coalesce = Expr { node: ExprNode::Binary("??".to_string(), Box::new(p_var.clone()), Box::new(def_expr)), line };
+                                let assign_expr = Expr { node: ExprNode::Assign(Box::new(p_var), Box::new(coalesce)), line };
+                                default_inits.push(Stmt { node: StmtNode::Expr(assign_expr), line });
+                            } else {
+                                if !default_inits.is_empty() {
+                                    return Err(format!("Required parameter '{}' cannot follow optional parameters at line {}", p_name, line));
+                                }
+                                req_params += 1;
+                            }
                             if !self.match_token(",") { break; }
                         }
                     }
                     self.expect(")")?;
-                    let body = self.parse_block()?;
-                    Ok(Expr { node: ExprNode::FuncExpr(params, Box::new(body)), line })
+                    let mut body = self.parse_block()?;
+                    if !default_inits.is_empty() {
+                        if let StmtNode::Block(ref mut stmts) = body.node {
+                            for (i, stmt) in default_inits.into_iter().enumerate() {
+                                stmts.insert(i, stmt);
+                            }
+                        }
+                    }
+                    // FIX: Added req_params here!
+                    Ok(Expr { node: ExprNode::FuncExpr(params, req_params, Box::new(body)), line })
                 },
                 _ => { self.advance(); Ok(Expr { node: ExprNode::Var(t.value), line }) }
             },
@@ -2432,23 +2543,51 @@ impl Parser {
                     if self.is_lambda_start() {
                         self.advance(); // consume '('
                         let mut params = Vec::new();
+                        let mut default_inits = Vec::new();
+                        let mut req_params = 0; // FIX: Added
+                        
                         if self.current().value != ")" {
                             loop {
-                                params.push(self.expect("NAME")?.value);
+                                let p_name = self.expect("NAME")?.value;
+                                params.push(p_name.clone());
+                                
+                                if self.match_token("=") {
+                                    let def_expr = self.parse_expr()?;
+                                    let p_var = Expr { node: ExprNode::Var(p_name.clone()), line };
+                                    let coalesce = Expr { node: ExprNode::Binary("??".to_string(), Box::new(p_var.clone()), Box::new(def_expr)), line };
+                                    let assign_expr = Expr { node: ExprNode::Assign(Box::new(p_var), Box::new(coalesce)), line };
+                                    default_inits.push(Stmt { node: StmtNode::Expr(assign_expr), line });
+                                } else {
+                                    if !default_inits.is_empty() {
+                                        return Err(format!("Required parameter '{}' cannot follow optional parameters at line {}", p_name, line));
+                                    }
+                                    req_params += 1;
+                                }
                                 if !self.match_token(",") { break; }
                             }
                         }
                         self.expect(")")?;
                         self.expect("=>")?;
 
-                        // Support both block bodies `() => { ... }` and expression bodies `() => expr`
-                        let body = if self.current().value == "{" {
+                        let mut body = if self.current().value == "{" {
                             self.parse_block()?
                         } else {
                             let expr = self.parse_expr()?;
                             Stmt { node: StmtNode::Return(Some(expr)), line: self.current().line }
                         };
-                        return Ok(Expr { node: ExprNode::FuncExpr(params, Box::new(body)), line });
+
+                        if !default_inits.is_empty() {
+                            if !matches!(body.node, StmtNode::Block(_)) {
+                                body = Stmt { node: StmtNode::Block(vec![body]), line: line };
+                            }
+                            if let StmtNode::Block(ref mut stmts) = body.node {
+                                for (i, stmt) in default_inits.into_iter().enumerate() {
+                                    stmts.insert(i, stmt);
+                                }
+                            }
+                        }
+                        // FIX: Added req_params here!
+                        return Ok(Expr { node: ExprNode::FuncExpr(params, req_params, Box::new(body)), line });
                     }
 
                     self.advance();
@@ -2628,48 +2767,46 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
         },
 
         DgnValue::Map(m) => {
-            let val = m.lock().unwrap().get(name).cloned();
-            if val.is_none() {
-                 return match name {
-                     "keys" => Ok(native_method(m, |m, _| {
-                         let keys: Vec<DgnValue> = m.lock().unwrap().keys().map(|k| DgnValue::String(k.clone())).collect();
-                         Ok(DgnValue::List(Arc::new(Mutex::new(keys))))
-                     })),
-                     "values" => Ok(native_method(m, |m, _| {
-                        let vals: Vec<DgnValue> = m.lock().unwrap().values().cloned().collect();
-                        Ok(DgnValue::List(Arc::new(Mutex::new(vals))))
-                    })),
-                    "contains" => Ok(native_method(m, |m, args| {
-                        let key = args.get(0).map(val_to_string).unwrap_or_default();
-                        Ok(DgnValue::Bool(m.lock().unwrap().contains_key(&key)))
-                     })),
-                     "set" => Ok(native_method(m, |m, args| {
-                         if args.len() == 2 {
-                             if let DgnValue::String(k) = &args[0] {
-                                 m.lock().unwrap().insert(k.clone(), args[1].clone());
-                             }
-                         }
-                         Ok(DgnValue::Map(m))
-                     })),
-                     "get" => Ok(native_method(m, |m, args| {
-                            let key = args.get(0).map(val_to_string).unwrap_or_default();
-                            Ok(m.lock().unwrap().get(&key).cloned().unwrap_or(DgnValue::Null))
-                        })),
-                     "remove" => Ok(native_method(m, |m, args| {
-                        if let Some(DgnValue::String(k)) = args.get(0) {
-                            m.lock().unwrap().remove(k);
+            match name {
+                "keys" => return Ok(native_method(m, |m, _| {
+                    let keys: Vec<DgnValue> = m.lock().unwrap().keys().map(|k| DgnValue::String(k.clone())).collect();
+                    Ok(DgnValue::List(Arc::new(Mutex::new(keys))))
+                })),
+                "values" => return Ok(native_method(m, |m, _| {
+                    let vals: Vec<DgnValue> = m.lock().unwrap().values().cloned().collect();
+                    Ok(DgnValue::List(Arc::new(Mutex::new(vals))))
+                })),
+                "contains" => return Ok(native_method(m, |m, args| {
+                    let key = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(DgnValue::Bool(m.lock().unwrap().contains_key(&key)))
+                })),
+                "set" => return Ok(native_method(m, |m, args| {
+                    if args.len() == 2 {
+                        if let DgnValue::String(k) = &args[0] {
+                            m.lock().unwrap().insert(k.clone(), args[1].clone());
                         }
-                        Ok(DgnValue::Map(m))
-                    })),
-                     "clear" => Ok(native_method(m, |m, _| {
-                        m.lock().unwrap().clear();
-                        Ok(DgnValue::Map(m))
-                     })),
-                     "length" => Ok(DgnValue::Number(m.lock().unwrap().len() as f64)),
-                     _ => Ok(DgnValue::Null)
-                 };
+                    }
+                    Ok(DgnValue::Map(m))
+                })),
+                "get" => return Ok(native_method(m, |m, args| {
+                    let key = args.get(0).map(val_to_string).unwrap_or_default();
+                    Ok(m.lock().unwrap().get(&key).cloned().unwrap_or(DgnValue::Null))
+                })),
+                "remove" => return Ok(native_method(m, |m, args| {
+                    if let Some(DgnValue::String(k)) = args.get(0) {
+                        m.lock().unwrap().remove(k);
+                    }
+                    Ok(DgnValue::Map(m))
+                })),
+                "clear" => return Ok(native_method(m, |m, _| {
+                    m.lock().unwrap().clear();
+                    Ok(DgnValue::Map(m))
+                })),
+                "length" => return Ok(DgnValue::Number(m.lock().unwrap().len() as f64)),
+                _ => {}
             }
-            Ok(val.unwrap())
+            // Not a built-in — look up as a stored data key
+            Ok(m.lock().unwrap().get(name).cloned().unwrap_or(DgnValue::Null))
         },
         DgnValue::Instance(inst) => {
 
@@ -2688,7 +2825,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                          let f_clone = f.clone();
                      
                          return Ok(DgnValue::Func(DgnFunc {
-                             name: f.name.clone(), params: f.params.clone(), body: None,
+                             name: f.name.clone(), params: f.params.clone(), req_params: f.req_params, body: None,
                              closure: f.closure.clone(),
                              is_native: true,
                              is_async: f.is_async,
@@ -2936,7 +3073,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
 
 pub fn native_method<T: Send + Sync + 'static>(target: Arc<T>, f: impl Fn(Arc<T>, Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync + 'static) -> DgnValue {
     DgnValue::Func(DgnFunc {
-        name: Some("native_method".into()), params: vec![], body: None,
+        name: Some("native_method".into()), params: vec![], req_params: 0, body: None,
         closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true,
         is_async: false,
         compiled_chunk: None,
@@ -2946,7 +3083,7 @@ pub fn native_method<T: Send + Sync + 'static>(target: Arc<T>, f: impl Fn(Arc<T>
 
 pub fn native_fn(f: impl Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync + 'static) -> DgnValue {
     DgnValue::Func(DgnFunc {
-        name: Some("native".into()), params: vec![], body: None,
+        name: Some("native".into()), params: vec![], req_params: 0, body: None,
         closure: Arc::new(Mutex::new(Env::new(None, None))), is_native: true, is_async: false,
         compiled_chunk: None,
         native_fn: Some(Arc::new(f))
@@ -2966,6 +3103,12 @@ pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnVal
 
 #[async_recursion]
 pub async fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnValue>) -> Result<DgnValue, DgnError> {
+
+    if args.len() < f.req_params {
+        let fn_name = f.name.as_deref().unwrap_or("<anonymous>");
+        return Err(DgnError::new(&format!("Function '{}' expects at least {} argument(s), but got {}", fn_name, f.req_params, args.len()), 0));
+    }
+
     let scope = Arc::new(Mutex::new(Env::new(Some(f.closure.clone()), None)));
 
     for (i, param) in f.params.iter().enumerate() {
@@ -3600,6 +3743,107 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     Ok(DgnValue::Bool(true))
                 }));
              }
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
+
+        "zip" => {
+            let mut map = HashMap::new();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                map.insert("list".to_string(), native_fn(|args| {
+                    let archive_path = args.get(0).map(val_to_string).ok_or(DgnError::new("Archive path required", 0))?;
+                    
+                    let file = std::fs::File::open(&archive_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut archive = zip::ZipArchive::new(file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    let mut files = Vec::new();
+                    for i in 0..archive.len() {
+                        if let Ok(z_file) = archive.by_index(i) {
+                            files.push(DgnValue::String(z_file.name().to_string()));
+                        }
+                    }
+                    Ok(DgnValue::List(Arc::new(Mutex::new(files))))
+                }));
+
+                // Checks if a specific file exists inside the ZIP/JAR
+                // Checks if a specific file exists inside the ZIP/JAR
+                map.insert("exists".to_string(), native_fn(|args| {
+                    let archive_path = args.get(0).map(val_to_string).ok_or(DgnError::new("Archive path required", 0))?;
+                    let internal_path = args.get(1).map(val_to_string).ok_or(DgnError::new("Internal path required", 0))?;
+
+                    let file = std::fs::File::open(&archive_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut archive = zip::ZipArchive::new(file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    // FIX: Evaluate and drop the temporary borrow immediately
+                    let file_exists = archive.by_name(&internal_path).is_ok();
+                    
+                    Ok(DgnValue::Bool(file_exists))
+                }));
+                // Returns metadata about a file inside the archive (size, compressed size, type)
+                map.insert("info".to_string(), native_fn(|args| {
+                    let archive_path = args.get(0).map(val_to_string).ok_or(DgnError::new("Archive path required", 0))?;
+                    let internal_path = args.get(1).map(val_to_string).ok_or(DgnError::new("Internal path required", 0))?;
+
+                    let file = std::fs::File::open(&archive_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut archive = zip::ZipArchive::new(file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    let z_file = archive.by_name(&internal_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    
+                    let mut info_map = HashMap::new();
+                    info_map.insert("size".to_string(), DgnValue::Number(z_file.size() as f64));
+                    info_map.insert("compressed_size".to_string(), DgnValue::Number(z_file.compressed_size() as f64));
+                    info_map.insert("is_dir".to_string(), DgnValue::Bool(z_file.is_dir()));
+                    info_map.insert("is_file".to_string(), DgnValue::Bool(z_file.is_file()));
+
+                    Ok(DgnValue::Map(Arc::new(Mutex::new(info_map))))
+                }));
+
+                // Extracts a single file from the ZIP/JAR to the host disk
+                map.insert("extract".to_string(), native_fn(|args| {
+                    let archive_path = args.get(0).map(val_to_string).ok_or(DgnError::new("Archive path required", 0))?;
+                    let internal_path = args.get(1).map(val_to_string).ok_or(DgnError::new("Internal path required", 0))?;
+                    let dest_path = args.get(2).map(val_to_string).ok_or(DgnError::new("Destination path required", 0))?;
+
+                    let file = std::fs::File::open(&archive_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut archive = zip::ZipArchive::new(file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    let mut z_file = archive.by_name(&internal_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut out_file = std::fs::File::create(&dest_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    
+                    std::io::copy(&mut z_file, &mut out_file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    Ok(DgnValue::Bool(true))
+                }));
+                // Reads a file inside the ZIP/JAR as a String (Great for MANIFEST.MF)
+                map.insert("read_string".to_string(), native_fn(|args| {
+                    let archive_path = args.get(0).map(val_to_string).ok_or(DgnError::new("Archive path required", 0))?;
+                    let internal_path = args.get(1).map(val_to_string).ok_or(DgnError::new("Internal path required", 0))?;
+
+                    let file = std::fs::File::open(&archive_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut archive = zip::ZipArchive::new(file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    let mut z_file = archive.by_name(&internal_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut buffer = String::new();
+                    std::io::Read::read_to_string(&mut z_file, &mut buffer).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    Ok(DgnValue::String(buffer))
+                }));
+
+                // Reads a file inside the ZIP/JAR as raw bytes (Great for .class files)
+                map.insert("read_bytes".to_string(), native_fn(|args| {
+                    let archive_path = args.get(0).map(val_to_string).ok_or(DgnError::new("Archive path required", 0))?;
+                    let internal_path = args.get(1).map(val_to_string).ok_or(DgnError::new("Internal path required", 0))?;
+
+                    let file = std::fs::File::open(&archive_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut archive = zip::ZipArchive::new(file).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    let mut z_file = archive.by_name(&internal_path).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+                    let mut buffer = Vec::new();
+                    std::io::Read::read_to_end(&mut z_file, &mut buffer).map_err(|e| DgnError::new(&e.to_string(), 0))?;
+
+                    Ok(DgnValue::ByteArray(Arc::new(Mutex::new(buffer))))
+                }));
+            }
             Some(DgnValue::Map(Arc::new(Mutex::new(map))))
         },
         
@@ -4606,7 +4850,7 @@ impl Linter {
                 self.check_stmt(body);
                 self.exit_scope();
             },
-            StmtNode::FuncDef(name, params, body,_is_async) => {
+            StmtNode::FuncDef(name, params, _req_params, body, _is_async) => {
                 self.define(name, "function", false);
                 self.enter_scope();
                 for p in params { self.define(p, "variable", false); }
@@ -4687,7 +4931,7 @@ impl Linter {
             ExprNode::Obj(props) => { for (_, v) in props { self.check_expr(v); } },
             ExprNode::Index(obj, idx) => { self.check_expr(obj); self.check_expr(idx); },
             ExprNode::GetAttr(obj, _) => self.check_expr(obj),
-            ExprNode::FuncExpr(params, body) => {
+            ExprNode::FuncExpr(params, _req_params, body) => {
                 self.enter_scope();
                 for p in params { self.define(p, "variable", false); }
                 self.check_stmt(body);
