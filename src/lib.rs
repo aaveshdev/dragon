@@ -174,7 +174,10 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
 
                 if let Some(entry_code) = sources.get("__entry__") {
                     drop(e); 
-                    let tokens = lex(entry_code);
+                    let tokens = match lex(entry_code) {
+                        Ok(t) => t,
+                        Err(e) => return format!("Syntax Error: {} at line {}, col {}", e.msg, e.line, e.col),
+                    };
                     let mut parser = Parser::new(tokens);
                     if let Ok(ast) = parser.parse() {
                         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -491,7 +494,15 @@ pub extern "C" fn Dragon_Init() -> c_int {
     env.lock().unwrap().store.insert("__bundled_sources__".to_string(), DgnValue::Map(Arc::new(Mutex::new(bundle_map))));
 
     if let Some(entry_code) = sources.get("__entry__") {
-        let tokens = lex(entry_code);
+        let tokens = match lex(entry_code) {
+            Ok(t) => t,
+            Err(e) => {
+                // Print the error so the developer can see what went wrong
+                eprintln!("Syntax Error: {}", e.with_source(entry_code).format_pretty());
+                // Return -1 to the C caller to indicate failure
+                return -1;
+            }
+        };
         let mut parser = Parser::new(tokens);
         if let Ok(ast) = parser.parse() {
             let rt = tokio::runtime::Runtime::new().unwrap(); 
@@ -535,9 +546,34 @@ pub extern "C" fn Dragon_Call(func_name: *const c_char, json_args: *const c_char
     let mut dgn_args = Vec::new();
     for j in json_vals {
         match j {
-            serde_json::Value::Number(n) => dgn_args.push(DgnValue::Number(n.as_f64().unwrap_or(0.0))),
-            serde_json::Value::Bool(b) => dgn_args.push(DgnValue::Bool(b)),
-            _ => dgn_args.push(DgnValue::String(j.to_string().replace("\"", ""))),
+            serde_json::Value::Null       => dgn_args.push(DgnValue::Null),
+            serde_json::Value::Bool(b)    => dgn_args.push(DgnValue::Bool(b)),
+            serde_json::Value::Number(n)  => dgn_args.push(DgnValue::Number(n.as_f64().unwrap_or(0.0))),
+            serde_json::Value::String(s)  => dgn_args.push(DgnValue::String(s)),
+            serde_json::Value::Array(arr) => {
+                let items: Vec<DgnValue> = arr.into_iter().map(|v| match v {
+                    serde_json::Value::String(s) => DgnValue::String(s),
+                    serde_json::Value::Number(n) => DgnValue::Number(n.as_f64().unwrap_or(0.0)),
+                    serde_json::Value::Bool(b)   => DgnValue::Bool(b),
+                    serde_json::Value::Null      => DgnValue::Null,
+                    other => DgnValue::String(other.to_string()),
+                }).collect();
+                dgn_args.push(DgnValue::List(Arc::new(Mutex::new(items))));
+            },
+            serde_json::Value::Object(obj) => {
+                let mut map = std::collections::HashMap::new();
+                for (k, v) in obj {
+                    let dv = match v {
+                        serde_json::Value::String(s) => DgnValue::String(s),
+                        serde_json::Value::Number(n) => DgnValue::Number(n.as_f64().unwrap_or(0.0)),
+                        serde_json::Value::Bool(b)   => DgnValue::Bool(b),
+                        serde_json::Value::Null      => DgnValue::Null,
+                        other => DgnValue::String(other.to_string()),
+                    };
+                    map.insert(k, dv);
+                }
+                dgn_args.push(DgnValue::Map(Arc::new(Mutex::new(map))));
+            },
         }
     }
 

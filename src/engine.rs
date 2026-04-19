@@ -19,6 +19,12 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use async_recursion::async_recursion;
 
+use aes_gcm::{
+    aead::{Aead, KeyInit, OsRng},
+    Aes256Gcm, Nonce, Key
+};
+use aes_gcm::aead::rand_core::RngCore;
+
 use regex::Regex;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use tiny_http::{Server, Response, Header, Method};
@@ -54,7 +60,7 @@ static ref BUILTIN_MODULE_CACHE: Mutex<HashMap<String, DgnValue>> =
         ("NUMBER", Regex::new(r"^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?").unwrap()),
         ("STRING", Regex::new(r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)+'"#).unwrap()), 
         ("NAME", Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*").unwrap()),
-        ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|\?\?|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
+        ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|\?\?|\.\.\.|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
         ("NEWLINE", Regex::new(r"^\n").unwrap()),
         ("SKIP", Regex::new(r"^[ \t\r\u{FEFF}\x00]+").unwrap()), 
         ("MISMATCH", Regex::new(r"^.").unwrap()),
@@ -67,7 +73,7 @@ task_local! {
 
 struct FfiStructDef {
     size: usize,
-    fields: Vec<(String, usize, Type)>, // Name, Offset, LibFFI Type
+    fields: Vec<(String, usize, Type)>, // Name, Offset, LibFFI Type"
     libffi_type: Type, // The constructed Type::structure
 }
 // We need Send/Sync to store Type in a global Mutex, forcing unsafe impl if necessary
@@ -123,10 +129,11 @@ pub enum ExprNode {
     Assign(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     GetAttr(Box<Expr>, String),
+    OptionalGetAttr(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     PreOp(String, Box<Expr>),
     PostOp(String, Box<Expr>),
-    FuncExpr(Vec<String>, usize, Box<Stmt>),
+    FuncExpr(Vec<(String, Option<String>)>, usize, Box<Stmt>),
     New(Box<Expr>, Vec<Expr>),
     Super(String, Vec<Expr>),
     Await(Box<Expr>), // ADD THIS
@@ -135,6 +142,7 @@ pub enum ExprNode {
 #[derive(Debug, Clone)]
 pub enum StmtNode {
     Block(Vec<Stmt>),
+    Multi(Vec<Stmt>),
     Expr(Expr),
     Return(Option<Expr>),
     Break,
@@ -147,8 +155,9 @@ pub enum StmtNode {
     CFor(Option<Expr>, Option<Expr>, Option<Expr>, Box<Stmt>),
     Switch(Expr, Vec<(Expr, Stmt)>, Option<Box<Stmt>>),
     Try(Box<Stmt>, Option<String>, Option<Box<Stmt>>, Option<Box<Stmt>>),
-    FuncDef(String, Vec<String>, usize, Box<Stmt>, bool),
+    FuncDef(String, Vec<(String, Option<String>)>, usize, Box<Stmt>, bool),
     ClassDef(String, Option<String>, Box<Stmt>),
+    Augment(String, Vec<Stmt>),
     Import(String, Option<String>),
     ConstDecl(String, Expr),
 }
@@ -163,6 +172,7 @@ pub enum PromiseState {
 pub enum DgnValue {
     Null,
     Bool(bool),
+    Int(i64),
     Number(f64),
     String(String),
     List(Arc<Mutex<Vec<DgnValue>>>),
@@ -185,6 +195,15 @@ impl DgnValue {
     pub fn as_number(&self) -> Option<f64> {
         match self {
             DgnValue::Number(n) => Some(*n),
+            DgnValue::Int(n) => Some(*n as f64),
+            _ => None,
+        }
+    }
+
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            DgnValue::Int(n) => Some(*n),
+            DgnValue::Number(n) => Some(*n as i64),
             _ => None,
         }
     }
@@ -193,7 +212,7 @@ impl DgnValue {
 #[derive(Clone)]
 pub struct DgnFunc {
     pub name: Option<String>,
-    pub params: Vec<String>,
+    pub params: Vec<(String, Option<String>)>,
     pub req_params: usize,
     pub body: Option<Stmt>,
     pub closure: Arc<Mutex<Env>>,
@@ -352,11 +371,42 @@ impl fmt::Debug for DgnFunc {
 pub struct DgnError {
     pub msg: String,
     pub line: usize,
+    pub col: usize,
+    pub source_line: Option<String>,
 }
 
 impl DgnError {
     pub fn new(msg: &str, line: usize) -> Self {
-        DgnError { msg: msg.to_string(), line }
+        DgnError { msg: msg.to_string(), line, col: 0, source_line: None }
+    }
+
+    pub fn with_col(msg: &str, line: usize, col: usize) -> Self {
+        DgnError { msg: msg.to_string(), line, col, source_line: None }
+    }
+
+    pub fn with_source(mut self, src: &str) -> Self {
+        if self.line > 0 {
+            if let Some(line_text) = src.lines().nth(self.line - 1) {
+                self.source_line = Some(line_text.to_string());
+            }
+        }
+        self
+    }
+
+    pub fn format_pretty(&self) -> String {
+        let mut out = format!("Error at line {}", self.line);
+        if self.col > 0 { out.push_str(&format!(", column {}", self.col)); }
+        out.push_str(&format!(": {}", self.msg));
+        if let Some(src_line) = &self.source_line {
+            out.push('\n');
+            out.push_str(&format!("  | {}", src_line));
+            if self.col > 0 {
+                let spaces = self.col.saturating_sub(1);
+                out.push('\n');
+                out.push_str(&format!("  | {}^", " ".repeat(spaces)));
+            }
+        }
+        out
     }
 }
 
@@ -400,7 +450,7 @@ pub enum Instruction {
     Jump(usize),               // Unconditional jump
     JumpIfFalse(usize),        // Pop, jump if falsy
     JumpIfTrue(usize),         // Pop, jump if truthy (for `or` short-circuit)
-
+    JumpIfNotNull(usize),      // Pop, jump if not null (for `??` operator)
     // Functions
     // MakeFunc removed — replaced by MakeClosure
     Call(usize),               // Pop func + N args, call
@@ -408,6 +458,8 @@ pub enum Instruction {
 
     // Object access
     GetAttr(String),           // obj.name
+    GetOptionalAttr(String),   //
+    AddExtension(String),
     SetAttr(String),           // obj.name = val
     GetIndex,                  // obj[idx]
     SetIndex,                  // obj[idx] = val
@@ -419,8 +471,9 @@ pub enum Instruction {
     DoWhileStart,              // marks do-while body start ip (patched after)
 
     // Functions / closures
-    MakeClosure(Option<String>, Vec<String>, usize, bool, Box<Vec<Instruction>>, Box<Vec<usize>>),// params, is_async, instrs, lines
-
+    MakeClosure(Option<String>, Vec<(String, Option<String>)>, usize, bool, Box<Vec<Instruction>>, Box<Vec<usize>>),// params, is_async, instrs, lines
+    MakeClosureRef(String, String), 
+    MakeClassRef(String, String, String),
     // Classes / instances
     MakeClass(String, Option<String>, Box<Vec<Instruction>>, Box<Vec<usize>>),
     NewObject(usize),          // pops class + N args, creates instance
@@ -478,7 +531,14 @@ impl Chunk {
     // Patch a Jump/JumpIfFalse target after you know the destination
     pub fn patch_jump(&mut self, idx: usize, target: usize) {
         match &mut self.instructions[idx] {
-            Instruction::Jump(t) | Instruction::JumpIfFalse(t) | Instruction::JumpIfTrue(t) => {
+            Instruction::Jump(t) 
+            | Instruction::JumpIfFalse(t) 
+            | Instruction::JumpIfTrue(t) 
+            | Instruction::JumpIfNotNull(t)
+            | Instruction::PushTry(t) => {
+                *t = target;
+            }
+            Instruction::ForIter(_, t) => {
                 *t = target;
             }
             _ => {}
@@ -529,6 +589,12 @@ impl Compiler {
                     if !matches!(s.node, StmtNode::FuncDef(..) | StmtNode::ClassDef(..)) {
                         Self::compile_stmt(chunk, s);
                     }
+                }
+            }
+
+            StmtNode::Multi(stmts) => {
+                for s in stmts {
+                    Self::compile_stmt(chunk, s);
                 }
             }
 
@@ -727,6 +793,29 @@ impl Compiler {
                 chunk.emit(Instruction::StoreVar(name.clone()), line);
             }
 
+            // StmtNode::Augment(target_type, methods) => {
+            //     for method in methods {W
+            //         Self::compile_stmt(chunk, method);
+            //         chunk.emit(Instruction::AddExtension(target_type.clone()), line);
+            //     }
+            // }
+
+            StmtNode::Augment(target_type, methods) => {
+                for method in methods {
+                    if let StmtNode::FuncDef(name, params, req_params, body, is_async) = &method.node {
+                        // Manually compile the closure so we skip StoreVar (which pops it)
+                        let (instrs, lines) = Self::compile_body(body);
+                        chunk.emit(Instruction::MakeClosure(
+                            Some(name.clone()), params.clone(), *req_params, *is_async,
+                            Box::new(instrs), Box::new(lines),
+                        ), line);
+                        
+                        // Now the closure is guaranteed to be on top of the stack!
+                        chunk.emit(Instruction::AddExtension(target_type.clone()), line);
+                    }
+                }
+            }
+
             // ── import ────────────────────────────────────────────────────────
             StmtNode::Import(path, alias) => {
                 chunk.emit(Instruction::Import(path.clone(), alias.clone()), line);
@@ -752,7 +841,14 @@ impl Compiler {
         let line = expr.line;
         match &expr.node {
 
-            ExprNode::Number(n) => { chunk.emit(Instruction::LoadConst(DgnValue::Number(*n)), line); }
+            ExprNode::Number(n) => { 
+                // If it's a whole number and fits in an i64, compile it as an Int!
+                if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
+                    chunk.emit(Instruction::LoadConst(DgnValue::Int(*n as i64)), line);
+                } else {
+                    chunk.emit(Instruction::LoadConst(DgnValue::Number(*n)), line);
+                }
+            }
             ExprNode::String(s) => { chunk.emit(Instruction::LoadConst(DgnValue::String(s.clone())), line); }
             ExprNode::Bool(b)   => { chunk.emit(Instruction::LoadConst(DgnValue::Bool(*b)), line); }
             ExprNode::Null      => { chunk.emit(Instruction::LoadConst(DgnValue::Null), line); }
@@ -826,7 +922,7 @@ impl Compiler {
                     Self::compile_expr(chunk, l);
                     chunk.emit(Instruction::Dup, line);
                     // if not null, keep; else pop and eval rhs
-                    let not_null = chunk.emit(Instruction::JumpIfTrue(0), line);
+                    let not_null = chunk.emit(Instruction::JumpIfNotNull(0), line);
                     chunk.emit(Instruction::Pop, line);
                     Self::compile_expr(chunk, r);
                     chunk.patch_jump(not_null, chunk.instructions.len());
@@ -871,6 +967,12 @@ impl Compiler {
                 Self::compile_expr(chunk, obj);
                 chunk.emit(Instruction::GetAttr(name.clone()), line);
             }
+
+            ExprNode::OptionalGetAttr(obj, name) => {
+                Self::compile_expr(chunk, obj);
+                chunk.emit(Instruction::GetOptionalAttr(name.clone()), line);
+            }
+
             ExprNode::Index(obj, idx) => {
                 Self::compile_expr(chunk, obj);
                 Self::compile_expr(chunk, idx);
@@ -975,11 +1077,12 @@ pub struct Vm {
     pub stack: Vec<DgnValue>,
     try_frames: Vec<(usize, usize)>,
     for_iters: HashMap<usize, (Vec<DgnValue>, usize)>,
+    pub extensions: HashMap<String, HashMap<String, DgnValue>>,
 }
 
 impl Vm {
     pub fn new() -> Self {
-        Vm { stack: vec![], try_frames: vec![], for_iters: HashMap::new() }
+        Vm { stack: vec![], try_frames: vec![], for_iters: HashMap::new(), extensions: HashMap::new() }
     }
 
     fn pop(&mut self) -> DgnValue { self.stack.pop().unwrap_or(DgnValue::Null) }
@@ -1032,11 +1135,16 @@ impl Vm {
                 Instruction::Jump(t)        => { ip = t; continue; }
                 Instruction::JumpIfFalse(t) => { let v = self.pop(); if !is_truthy(&v) { ip = t; continue; } }
                 Instruction::JumpIfTrue(t)  => { let v = self.pop(); if  is_truthy(&v) { ip = t; continue; } }
+                Instruction::JumpIfNotNull(t)  => { let v = self.pop(); if !matches!(v, DgnValue::Null) { ip = t; continue; } }
 
                 // ── operators ─────────────────────────────────────────────────
                 Instruction::UnaryOp(ref op) => {
                     let v = self.pop();
                     let r = match (op.as_str(), v) {
+                        ("-",   DgnValue::Int(n))    => DgnValue::Int(-n),
+                        ("+",   DgnValue::Int(n))    => DgnValue::Int(n),
+                        ("~",   DgnValue::Int(n))    => DgnValue::Int(!n),
+                        
                         ("-",   DgnValue::Number(n)) => DgnValue::Number(-n),
                         ("+",   DgnValue::Number(n)) => DgnValue::Number(n),
                         ("not", x)                   => DgnValue::Bool(!is_truthy(&x)),
@@ -1075,10 +1183,70 @@ impl Vm {
                     self.stack.push(val);
                 }
 
+                    Instruction::MakeClosureRef(..) | Instruction::MakeClassRef(..) => {
+                            self.stack.push(DgnValue::Null);
+                        }
+
                 // ── attribute / index access ──────────────────────────────────
-                Instruction::GetAttr(ref name) => {
+                // ── attribute / index access ──────────────────────────────────
+                Instruction::GetAttr(ref name) | Instruction::GetOptionalAttr(ref name) => {
                     let obj = self.pop();
-                    self.stack.push(get_attr(obj, name).map_err(|mut e| { e.line = line; e })?);
+                    
+                    // 1. Handle Optional Chaining short-circuit
+                    if matches!(instr, Instruction::GetOptionalAttr(_)) && matches!(obj, DgnValue::Null) {
+                        self.stack.push(DgnValue::Null);
+                        ip += 1;
+                        continue;
+                    }
+
+                    // 2. Try standard GetAttr
+                    let mut val = get_attr(obj.clone(), name).map_err(|mut e| { e.line = line; e })?;
+
+                    // 3. Fallback to Extensions if Null
+                    if let DgnValue::Null = val {
+                        let type_name = match obj {
+                            DgnValue::String(_) => "string",
+                            DgnValue::Int(_) => "int",
+                            DgnValue::Number(_) => "number",
+                            DgnValue::List(_) => "list",
+                            DgnValue::Map(_) => "map",
+                            DgnValue::ByteArray(_) => "bytes",
+                            _ => "unknown",
+                        };
+
+                        if let Some(exts) = self.extensions.get(type_name) {
+                            if let Some(DgnValue::Func(f)) = exts.get(name) {
+                                // Bind the primitive to `this` context, exactly like Instance methods!
+                                let f_clone = f.clone();
+                                let obj_capture = obj.clone();
+                                val = DgnValue::Func(DgnFunc {
+                                    name: f.name.clone(), params: f.params.clone(), req_params: f.req_params, body: None,
+                                    closure: f.closure.clone(),
+                                    is_native: true,
+                                    is_async: f.is_async,
+                                    compiled_chunk: None,
+                                    native_fn: Some(Arc::new(move |args| {
+                                        let rt = tokio::runtime::Handle::current();
+                                        tokio::task::block_in_place(|| {
+                                            rt.block_on(call_dgn_func_impl(f_clone.clone(), args, Some(obj_capture.clone())))
+                                        })
+                                    }))
+                                });
+                            }
+                        }
+                    }
+                    self.stack.push(val);
+                }
+                
+                Instruction::AddExtension(ref target_type) => {
+                    let func_val = self.pop();
+                    if let DgnValue::Func(f) = &func_val {
+                        let name = f.name.clone().unwrap_or_default();
+                        self.extensions
+                            .entry(target_type.clone())
+                            .or_insert_with(HashMap::new)
+                            .insert(name, func_val);
+                    }
                 }
                 Instruction::SetAttr(ref name) => {
                     // compiler emits: [Dup val] -> [compile obj] -> SetAttr
@@ -1092,15 +1260,27 @@ impl Vm {
                 Instruction::GetIndex => {
                     let idx = self.pop();
                     let obj = self.pop();
-                    let r = match (obj, idx) {
-                        (DgnValue::List(l),   DgnValue::Number(n)) =>
-                            l.lock().unwrap().get(n as usize).cloned().unwrap_or(DgnValue::Null),
-                        (DgnValue::ByteArray(b), DgnValue::Number(n)) =>
-                            b.lock().unwrap().get(n as usize).map(|x| DgnValue::Number(*x as f64)).unwrap_or(DgnValue::Null),
-                        (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) =>
-                            m.lock().unwrap().get(&k).cloned().unwrap_or(DgnValue::Null),
-                        (DgnValue::String(s), DgnValue::Number(n)) =>
-                            s.chars().nth(n as usize).map(|c| DgnValue::String(c.to_string())).unwrap_or(DgnValue::Null),
+                    let r = match obj {
+                        DgnValue::List(l) => {
+                            if let Some(i) = idx.as_number() {
+                                l.lock().unwrap().get(i as usize).cloned().unwrap_or(DgnValue::Null)
+                            } else { DgnValue::Null }
+                        },
+                        DgnValue::ByteArray(b) => {
+                            if let Some(i) = idx.as_number() {
+                                b.lock().unwrap().get(i as usize).map(|x| DgnValue::Number(*x as f64)).unwrap_or(DgnValue::Null)
+                            } else { DgnValue::Null }
+                        },
+                        DgnValue::Map(m) | DgnValue::Instance(m) => {
+                            if let DgnValue::String(k) = idx {
+                                m.lock().unwrap().get(&k).cloned().unwrap_or(DgnValue::Null)
+                            } else { DgnValue::Null }
+                        },
+                        DgnValue::String(s) => {
+                            if let Some(i) = idx.as_number() {
+                                s.chars().nth(i as usize).map(|c| DgnValue::String(c.to_string())).unwrap_or(DgnValue::Null)
+                            } else { DgnValue::Null }
+                        },
                         _ => DgnValue::Null,
                     };
                     self.stack.push(r);
@@ -1108,22 +1288,27 @@ impl Vm {
                 Instruction::SetIndex => {
                     let idx = self.pop();
                     let obj = self.pop();
-                    // val was Dup'd by compiler so it stays on stack as expression result
                     let val = self.stack.last().cloned().unwrap_or(DgnValue::Null);
-                    match (obj, idx) {
-                        (DgnValue::List(l), DgnValue::Number(n)) => {
-                            let mut v = l.lock().unwrap();
-                            let i = n as usize;
-                            if i < v.len() { v[i] = val; }
+                    match obj {
+                        DgnValue::List(l) => {
+                            if let Some(n) = idx.as_number() {
+                                let mut v = l.lock().unwrap();
+                                let i = n as usize;
+                                if i < v.len() { v[i] = val; }
+                            }
                         }
-                        (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) => {
-                            m.lock().unwrap().insert(k, val);
+                        DgnValue::Map(m) | DgnValue::Instance(m) => {
+                            if let DgnValue::String(k) = idx {
+                                m.lock().unwrap().insert(k, val);
+                            }
                         }
-                        (DgnValue::ByteArray(b), DgnValue::Number(n)) => {
-                            let mut v = b.lock().unwrap();
-                            let i = n as usize;
-                            if i < v.len() {
-                                if let DgnValue::Number(bv) = val { v[i] = bv as u8; }
+                        DgnValue::ByteArray(b) => {
+                            if let Some(n) = idx.as_number() {
+                                let mut v = b.lock().unwrap();
+                                let i = n as usize;
+                                if i < v.len() {
+                                    if let Some(bv) = val.as_number() { v[i] = bv as u8; }
+                                }
                             }
                         }
                         _ => {}
@@ -1242,21 +1427,29 @@ impl Vm {
                     let this_val = env.lock().unwrap().get("this")
                         .ok_or(DgnError::new("super used outside class method", line))?;
 
-                    let result = if let DgnValue::Instance(ref inst) = this_val {
-                        let cls = inst.lock().unwrap().get("__class__").cloned()
-                            .ok_or(DgnError::new("Instance missing class metadata", line))?;
-                        if let DgnValue::Class(cls_env) = cls {
-                            let parent = cls_env.lock().unwrap().get("__parent_class__")
-                                .ok_or(DgnError::new("No parent class for super", line))?;
-                            if let DgnValue::Class(penv) = parent {
-                                let method = penv.lock().unwrap().get(method_name)
-                                    .ok_or(DgnError::new(&format!("Method '{}' not in parent", method_name), line))?;
-                                if let DgnValue::Func(f) = method {
-                                    call_dgn_func_impl(f, args, Some(this_val)).await?
-                                } else { DgnValue::Null }
-                            } else { return Err(DgnError::new("Parent is not a class", line)); }
-                        } else { return Err(DgnError::new("Invalid class metadata", line)); }
-                    } else { return Err(DgnError::new("super requires instance context", line)); };
+                    // Ensure we are operating on an instance
+                    if !matches!(this_val, DgnValue::Instance(_)) {
+                        return Err(DgnError::new("super requires instance context", line));
+                    }
+
+                    // LEXICAL LOOKUP: Get the parent of the class that DEFINED this method
+                    // By querying `env`, it climbs the scope chain to the enclosing class_env.
+                    let parent_cls = env.lock().unwrap().get("__parent_class__")
+                        .ok_or(DgnError::new("No parent class for super", line))?;
+
+                    let result = if let DgnValue::Class(penv) = parent_cls {
+                        let method = penv.lock().unwrap().get(method_name)
+                            .ok_or(DgnError::new(&format!("Method '{}' not in parent", method_name), line))?;
+                        
+                        if let DgnValue::Func(f) = method {
+                            // Call the method, but bind `this_val` so the instance context is preserved
+                            call_dgn_func_impl(f, args, Some(this_val)).await?
+                        } else { 
+                            DgnValue::Null 
+                        }
+                    } else { 
+                        return Err(DgnError::new("Parent is not a class", line)); 
+                    };
 
                     self.stack.push(result);
                 }
@@ -1346,76 +1539,125 @@ impl Vm {
                 }
 
                 // ── inc / dec ─────────────────────────────────────────────────
+                // ── inc / dec ─────────────────────────────────────────────────
                 Instruction::IncVar(ref n) => {
-                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
-                    if let DgnValue::Number(v) = cur {
-                        let nv = v + 1.0;
-                        env.lock().unwrap().set(n.clone(), DgnValue::Number(nv))
-                            .map_err(|e| DgnError::new(&e, line))?;
-                        self.stack.push(DgnValue::Number(nv));
-                    } else { return Err(DgnError::new("Cannot ++ non-number", line)); }
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
+                    match cur {
+                        DgnValue::Int(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Int(v + 1)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Int(v + 1));
+                        }
+                        DgnValue::Number(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Number(v + 1.0)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Number(v + 1.0));
+                        }
+                        _ => return Err(DgnError::new("Cannot ++ non-number", line)),
+                    }
                 }
                 Instruction::DecVar(ref n) => {
-                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
-                    if let DgnValue::Number(v) = cur {
-                        let nv = v - 1.0;
-                        env.lock().unwrap().set(n.clone(), DgnValue::Number(nv))
-                            .map_err(|e| DgnError::new(&e, line))?;
-                        self.stack.push(DgnValue::Number(nv));
-                    } else { return Err(DgnError::new("Cannot -- non-number", line)); }
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
+                    match cur {
+                        DgnValue::Int(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Int(v - 1)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Int(v - 1));
+                        }
+                        DgnValue::Number(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Number(v - 1.0)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Number(v - 1.0));
+                        }
+                        _ => return Err(DgnError::new("Cannot -- non-number", line)),
+                    }
                 }
                 Instruction::PostIncVar(ref n) => {
-                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
-                    if let DgnValue::Number(v) = cur {
-                        env.lock().unwrap().set(n.clone(), DgnValue::Number(v + 1.0))
-                            .map_err(|e| DgnError::new(&e, line))?;
-                        self.stack.push(DgnValue::Number(v)); // old value
-                    } else { return Err(DgnError::new("Cannot ++ non-number", line)); }
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
+                    match cur {
+                        DgnValue::Int(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Int(v + 1)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Int(v)); // push old value
+                        }
+                        DgnValue::Number(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Number(v + 1.0)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Number(v)); // push old value
+                        }
+                        _ => return Err(DgnError::new("Cannot ++ non-number", line)),
+                    }
                 }
                 Instruction::PostDecVar(ref n) => {
-                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Number(0.0));
-                    if let DgnValue::Number(v) = cur {
-                        env.lock().unwrap().set(n.clone(), DgnValue::Number(v - 1.0))
-                            .map_err(|e| DgnError::new(&e, line))?;
-                        self.stack.push(DgnValue::Number(v)); // old value
-                    } else { return Err(DgnError::new("Cannot -- non-number", line)); }
+                    let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
+                    match cur {
+                        DgnValue::Int(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Int(v - 1)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Int(v)); // push old value
+                        }
+                        DgnValue::Number(v) => {
+                            env.lock().unwrap().set(n.clone(), DgnValue::Number(v - 1.0)).map_err(|e| DgnError::new(&e, line))?;
+                            self.stack.push(DgnValue::Number(v)); // push old value
+                        }
+                        _ => return Err(DgnError::new("Cannot -- non-number", line)),
+                    }
                 }
                 Instruction::ReadModWriteAttr(ref attr, is_pre, is_dec) => {
                     // Stack: [..., obj] — compiler emitted obj expression before this op
                     let obj = self.pop();
-                    if let Ok(DgnValue::Number(n)) = get_attr(obj.clone(), attr) {
-                        let nv = if is_dec { n - 1.0 } else { n + 1.0 };
-                        if let DgnValue::Map(m) | DgnValue::Instance(m) = &obj {
-                            m.lock().unwrap().insert(attr.clone(), DgnValue::Number(nv));
+                    let cur = get_attr(obj.clone(), attr).unwrap_or(DgnValue::Null);
+                    match cur {
+                        DgnValue::Int(n) => {
+                            let nv = if is_dec { n - 1 } else { n + 1 };
+                            if let DgnValue::Map(m) | DgnValue::Instance(m) = &obj {
+                                m.lock().unwrap().insert(attr.clone(), DgnValue::Int(nv));
+                            }
+                            self.stack.push(DgnValue::Int(if is_pre { nv } else { n }));
                         }
-                        self.stack.push(DgnValue::Number(if is_pre { nv } else { n }));
-                    } else { return Err(DgnError::new("Cannot ++/-- non-number attr", line)); }
+                        DgnValue::Number(n) => {
+                            let nv = if is_dec { n - 1.0 } else { n + 1.0 };
+                            if let DgnValue::Map(m) | DgnValue::Instance(m) = &obj {
+                                m.lock().unwrap().insert(attr.clone(), DgnValue::Number(nv));
+                            }
+                            self.stack.push(DgnValue::Number(if is_pre { nv } else { n }));
+                        }
+                        _ => return Err(DgnError::new("Cannot ++/-- non-number attr", line)),
+                    }
                 }
+                // NEW
                 Instruction::ReadModWriteIndex(is_pre, is_dec) => {
-                    // Stack: [..., obj, idx] — compiler emitted both expressions before this op
                     let idx = self.pop();
                     let obj = self.pop();
-                    let cur = match (&obj, &idx) {
-                        (DgnValue::List(l), DgnValue::Number(i)) =>
-                            l.lock().unwrap().get(*i as usize).cloned().unwrap_or(DgnValue::Null),
-                        (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) =>
-                            m.lock().unwrap().get(k).cloned().unwrap_or(DgnValue::Null),
+                    
+                    let cur = match &obj {
+                        DgnValue::List(l) => {
+                            if let Some(i) = idx.as_number() {
+                                l.lock().unwrap().get(i as usize).cloned().unwrap_or(DgnValue::Null)
+                            } else { DgnValue::Null }
+                        },
+                        DgnValue::Map(m) | DgnValue::Instance(m) => {
+                            if let DgnValue::String(k) = &idx {
+                                m.lock().unwrap().get(k).cloned().unwrap_or(DgnValue::Null)
+                            } else { DgnValue::Null }
+                        },
                         _ => DgnValue::Null,
                     };
-                    if let DgnValue::Number(n) = cur {
+                    
+                    if let Some(n) = cur.as_number() {
+                        let is_int = matches!(cur, DgnValue::Int(_));
                         let nv = if is_dec { n - 1.0 } else { n + 1.0 };
-                        match (&obj, &idx) {
-                            (DgnValue::List(l), DgnValue::Number(i)) => {
-                                let mut v = l.lock().unwrap();
-                                let i = *i as usize;
-                                if i < v.len() { v[i] = DgnValue::Number(nv); }
+                        let nv_val = if is_int { DgnValue::Int(nv as i64) } else { DgnValue::Number(nv) };
+                        match &obj {
+                            DgnValue::List(l) => {
+                                if let Some(i) = idx.as_number() {
+                                    let mut v = l.lock().unwrap();
+                                    let i = i as usize;
+                                    if i < v.len() { v[i] = nv_val.clone(); }
+                                }
                             }
-                            (DgnValue::Map(m) | DgnValue::Instance(m), DgnValue::String(k)) => {
-                                m.lock().unwrap().insert(k.clone(), DgnValue::Number(nv));
+                            DgnValue::Map(m) | DgnValue::Instance(m) => {
+                                if let DgnValue::String(k) = &idx {
+                                    m.lock().unwrap().insert(k.clone(), nv_val.clone());
+                                }
                             }
                             _ => {}
                         }
-                        self.stack.push(DgnValue::Number(if is_pre { nv } else { n }));
+                        let result = if is_pre { nv_val } else { if is_int { DgnValue::Int(n as i64) } else { DgnValue::Number(n) } };
+                        self.stack.push(result);
                     } else { return Err(DgnError::new("Cannot ++/-- non-number index", line)); }
                 }
             }
@@ -1521,7 +1763,7 @@ pub async fn vm_do_import(
         m
     } else {
         // 5. Parse and compile module source
-        let tokens = lex(&code);
+        let tokens = lex(&code)?;
         let mut parser = Parser::new(tokens);
         let module_body = parser.parse().map_err(|e| DgnError::new(&e, line))?;
 
@@ -1558,38 +1800,89 @@ pub async fn vm_do_import(
 }
 
 pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result<DgnValue, DgnError> {
+    // Helper: coerce to f64
+    fn to_f(v: &DgnValue) -> Option<f64> { match v { DgnValue::Number(n) => Some(*n), DgnValue::Int(n) => Some(*n as f64), _ => None } }
+    // Helper: both are Int
+    fn both_int(l: &DgnValue, r: &DgnValue) -> Option<(i64, i64)> {
+        match (l, r) { (DgnValue::Int(a), DgnValue::Int(b)) => Some((*a, *b)), _ => None }
+    }
     match op {
         BinOp::Add => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a.wrapping_add(b))),
             (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Number(a + b)),
+            (DgnValue::Int(a), DgnValue::Number(b)) => Ok(DgnValue::Number(a as f64 + b)),
+            (DgnValue::Number(a), DgnValue::Int(b)) => Ok(DgnValue::Number(a + b as f64)),
             (DgnValue::String(a), b) => Ok(DgnValue::String(a + &val_to_string(&b))),
             (a, DgnValue::String(b)) => Ok(DgnValue::String(val_to_string(&a) + &b)),
             _ => Ok(DgnValue::Null),
         },
-        BinOp::Sub => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a-b)) } else { Ok(DgnValue::Null) },
-        BinOp::Mul => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a*b)) } else { Ok(DgnValue::Null) },
-        BinOp::Div => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a/b)) } else { Ok(DgnValue::Null) },
-        BinOp::Mod => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(a%b)) } else { Ok(DgnValue::Null) },
+        BinOp::Sub => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a.wrapping_sub(b))),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(a-b)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::Mul => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a.wrapping_mul(b))),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(a*b)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::Div => match (l, r) {
+            // int/int: integer division when evenly divisible, else float
+            (DgnValue::Int(a), DgnValue::Int(b)) => {
+                if b == 0 { return Err(DgnError::new("Division by zero", line)); }
+                if a % b == 0 { Ok(DgnValue::Int(a / b)) } else { Ok(DgnValue::Number(a as f64 / b as f64)) }
+            },
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(a/b)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::Mod => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => {
+                if b == 0 { return Err(DgnError::new("Modulo by zero", line)); }
+                Ok(DgnValue::Int(a % b))
+            },
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(a%b)) } else { Ok(DgnValue::Null) }
+        },
         BinOp::Eq  => match (l,r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Bool(a==b)),
             (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() < f64::EPSILON)),
+            (DgnValue::Int(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a as f64 - b).abs() < f64::EPSILON)),
+            (DgnValue::Number(a), DgnValue::Int(b)) => Ok(DgnValue::Bool((a - b as f64).abs() < f64::EPSILON)),
             (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a==b)),
             (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a==b)),
             (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(true)),
             _ => Ok(DgnValue::Bool(false)),
         },
         BinOp::Ne  => match (l,r) {
-            (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a-b).abs() >= f64::EPSILON)),
-            (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a!=b)),
+            (DgnValue::Int(a), DgnValue::Int(b))       => Ok(DgnValue::Bool(a != b)),
+            (DgnValue::Number(a), DgnValue::Number(b)) => Ok(DgnValue::Bool((a - b).abs() >= f64::EPSILON)),
+            (DgnValue::Int(a), DgnValue::Number(b))    => Ok(DgnValue::Bool((a as f64 - b).abs() >= f64::EPSILON)),
+            (DgnValue::Number(a), DgnValue::Int(b))    => Ok(DgnValue::Bool((a - b as f64).abs() >= f64::EPSILON)),
+            (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a != b)),
+            (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a != b)),
+            (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(false)),
             _ => Ok(DgnValue::Bool(true)),
         },
-        BinOp::Lt  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a<b))  } else { Ok(DgnValue::Bool(false)) },
-        BinOp::Gt  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a>b))  } else { Ok(DgnValue::Bool(false)) },
-        BinOp::Le  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a<=b)) } else { Ok(DgnValue::Bool(false)) },
-        BinOp::Ge  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Bool(a>=b)) } else { Ok(DgnValue::Bool(false)) },
-        BinOp::BitAnd => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number((a as i64 & b as i64) as f64)) } else { Ok(DgnValue::Null) },
-        BinOp::BitOr  => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number((a as i64 | b as i64) as f64)) } else { Ok(DgnValue::Null) },
-        BinOp::BitXor => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number((a as i64 ^ b as i64) as f64)) } else { Ok(DgnValue::Null) },
-        BinOp::Shl   => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(((a as i64) << (b as i64)) as f64)) } else { Ok(DgnValue::Null) },
-        BinOp::Shr   => if let (DgnValue::Number(a), DgnValue::Number(b)) = (l,r) { Ok(DgnValue::Number(((a as i64) >> (b as i64)) as f64)) } else { Ok(DgnValue::Null) },
+        BinOp::Lt  => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Bool(a<b)) } else { Ok(DgnValue::Bool(false)) },
+        BinOp::Gt  => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Bool(a>b)) } else { Ok(DgnValue::Bool(false)) },
+        BinOp::Le  => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Bool(a<=b)) } else { Ok(DgnValue::Bool(false)) },
+        BinOp::Ge  => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Bool(a>=b)) } else { Ok(DgnValue::Bool(false)) },
+        BinOp::BitAnd => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a & b)),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number((a as i64 & b as i64) as f64)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::BitOr  => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a | b)),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number((a as i64 | b as i64) as f64)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::BitXor => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a ^ b)),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number((a as i64 ^ b as i64) as f64)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::Shl   => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a << (b & 63))),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(((a as i64) << (b as i64)) as f64)) } else { Ok(DgnValue::Null) }
+        },
+        BinOp::Shr   => match (l, r) {
+            (DgnValue::Int(a), DgnValue::Int(b)) => Ok(DgnValue::Int(a >> (b & 63))),
+            (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(((a as i64) >> (b as i64)) as f64)) } else { Ok(DgnValue::Null) }
+        },
         BinOp::NullCoalesce => if let DgnValue::Null = l { Ok(r) } else { Ok(l) },
         BinOp::And | BinOp::Or => Ok(DgnValue::Null), // handled by JumpIfFalse/True
     }
@@ -1685,7 +1978,7 @@ pub const KEYWORDS: &[&str] = &[
     "super", "const", "var", "async", "await"
 ];
 
-pub fn lex(src: &str) -> Vec<Token> {
+pub fn lex(src: &str) -> Result<Vec<Token>, DgnError>{
     let mut tokens = Vec::new();
     let bytes = src.as_bytes();
     let len = src.len();
@@ -1697,6 +1990,29 @@ pub fn lex(src: &str) -> Vec<Token> {
         let start = pos;
         let col_start = col + 1;
         let b = bytes[pos];
+
+        // Raw Strings (e.g., r"\d+" or r'\w+')
+        if b == b'r' && pos + 1 < len && (bytes[pos+1] == b'"' || bytes[pos+1] == b'\'') {
+            let quote = bytes[pos+1];
+            pos += 2; // Consume 'r' and the opening quote
+            let mut s = String::new();
+            while pos < len && bytes[pos] != quote {
+                s.push(bytes[pos] as char);
+                if bytes[pos] == b'\n' { line += 1; col = 0; }
+                pos += 1;
+            }
+
+            if pos >= len {
+                return Err(DgnError::with_col("Unclosed raw string literal", line, col_start));
+            }
+            
+            pos += 1; // Consume closing quote
+            col += pos - start;
+            
+            // Output as a standard String token, but without ANY escape processing!
+            tokens.push(Token { typ: TokenType::String, value: s, line, col: col_start, num_val: None });
+            continue;
+        }
 
         // Skip whitespace fast
         if b == b' ' || b == b'\t' || b == b'\r' || b == b'\xEF' || b == 0 {
@@ -1726,6 +2042,38 @@ pub fn lex(src: &str) -> Vec<Token> {
             }
         }
 
+        // Backtick strings (interpolated): `Hello {name}!`
+        // We store the raw content in a String token with typ = TokenType::Name and value prefixed by `\x01`
+        // so parse_primary can reconstruct the interpolation chain.
+        if b == b'`' {
+            pos += 1;
+            let mut raw = String::new();
+            while pos < len && bytes[pos] != b'`' {
+                if bytes[pos] == b'\\' && pos + 1 < len {
+                    pos += 1;
+                    match bytes[pos] {
+                        b'n'  => raw.push('\n'),
+                        b't'  => raw.push('\t'),
+                        b'`'  => raw.push('`'),
+                        b'\\' => raw.push('\\'),
+                        c     => { raw.push('\\'); raw.push(c as char); }
+                    }
+                } else {
+                    if bytes[pos] == b'\n' { line += 1; col = 0; }
+                    raw.push(bytes[pos] as char);
+                }
+                pos += 1;
+            }
+            if pos >= len {
+                return Err(DgnError::with_col("Unclosed backtick string literal", line, col_start));
+            }
+            pos += 1; // closing backtick
+            col += pos - start;
+            // Prefix with \x01 so parse_primary knows this is an interpolated string
+            tokens.push(Token { typ: TokenType::String, value: format!("\x01{}", raw), line, col: col_start, num_val: None });
+            continue;
+        }
+
         // Strings
         if b == b'"' || b == b'\'' {
             pos += 1;
@@ -1745,6 +2093,10 @@ pub fn lex(src: &str) -> Vec<Token> {
                     s.push(bytes[pos] as char);
                 }
                 pos += 1;
+            }
+
+            if pos >= len {
+                return Err(DgnError::with_col("Unclosed string literal", line, col_start));
             }
             pos += 1; // closing quote
             col += pos - start;
@@ -1810,13 +2162,23 @@ pub fn lex(src: &str) -> Vec<Token> {
             continue;
         }
 
+        if pos + 2 < len {
+            let three = &src[pos..pos+3];
+            if three == "..." {
+                tokens.push(Token { typ: TokenType::Op, value: "...".to_string(), line, col: col_start, num_val: None });
+                pos += 3; col += 3;
+                continue;
+            }
+        }
+
         // Two-char operators
         if pos + 1 < len {
             let two = &src[pos..pos+2];
             let tok = match two {
                 "++" => Some(TokenType::Inc),
                 "--" => Some(TokenType::Dec),
-                "==" | "!=" | "<=" | ">=" | "=>" | "<<" | ">>" | "??" => Some(TokenType::Op),
+                "+=" | "-=" | "*=" | "/=" | "%=" => Some(TokenType::Op),
+                "==" | "!=" | "<=" | ">=" | "=>" | "<<" | ">>" | "??" | "?." => Some(TokenType::Op),
                 "//" | "/*" => None, // handled above
                 _ => None,
             };
@@ -1836,21 +2198,106 @@ pub fn lex(src: &str) -> Vec<Token> {
         }
 
         // Unrecognized
-        panic!("Unexpected character '{}' (Code: {}) at {}:{}", b as char, b, line, col);
+        return Err(DgnError::with_col(
+            &format!("Unexpected character '{}' (Code: {})", b as char, b), 
+            line, 
+            col
+        ));
     }
 
     tokens.push(Token { typ: TokenType::Eof, value: String::new(), line, col, num_val: None });
-    tokens
+    Ok(tokens)
+}
+
+/// Parse a backtick-interpolated string body (without the surrounding backticks).
+/// Segments like `Hello {name + "!"}` become: "Hello " + str(name + "!")
+/// Returns an Expr that is a chain of string concatenations.
+/// Parse a backtick-interpolated string body (without the surrounding backticks).
+/// Segments like `Hello ${name + "!"}` become: "Hello " + str(name + "!")
+/// Returns an Expr that is a chain of string concatenations.
+fn parse_interp_string(raw: &str, line: usize) -> Result<Expr, String> {
+    // Split raw into alternating literal and expression segments
+    let mut parts: Vec<Expr> = Vec::new();
+    let mut chars = raw.chars().peekable();
+    let mut cur = String::new();
+
+    while let Some(c) = chars.next() {
+        // Look for the '$' character followed by '{'
+        if c == '$' {
+            if let Some(&'{') = chars.peek() {
+                chars.next(); // Consume the '{'
+                
+                // Push the current literal segment (possibly empty)
+                if !cur.is_empty() {
+                    parts.push(Expr { node: ExprNode::String(cur.clone()), line });
+                    cur.clear();
+                }
+                
+                // Collect expression source up to matching '}'
+                let mut depth = 1usize;
+                let mut expr_src = String::new();
+                for ec in chars.by_ref() {
+                    match ec {
+                        '{' => { depth += 1; expr_src.push(ec); }
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                            expr_src.push(ec);
+                        }
+                        _ => expr_src.push(ec),
+                    }
+                }
+                
+                // Parse the expression, wrap in str() call
+                let toks = lex(&expr_src).map_err(|e| e.msg)?;
+                let mut p = Parser::new(toks);
+                let inner = p.parse_expr()?;
+                // Coerce to string via str() builtin
+                let str_call = Expr {
+                    node: ExprNode::Call(
+                        Box::new(Expr { node: ExprNode::Var("str".to_string()), line }),
+                        vec![inner],
+                    ),
+                    line,
+                };
+                parts.push(str_call);
+                
+                // Skip the default push below, move to next character
+                continue; 
+            }
+        }
+        
+        // If it's not `${`, just treat the character (including standalone '$' or '{') as plain text
+        cur.push(c);
+    }
+    
+    if !cur.is_empty() {
+        parts.push(Expr { node: ExprNode::String(cur), line });
+    }
+    if parts.is_empty() {
+        return Ok(Expr { node: ExprNode::String(String::new()), line });
+    }
+    
+    // Fold into left-associative "+" chain
+    let mut result = parts.remove(0);
+    for part in parts {
+        result = Expr {
+            node: ExprNode::Binary("+".to_string(), Box::new(result), Box::new(part)),
+            line,
+        };
+    }
+    Ok(result)
 }
 
 pub struct Parser {
     pub tokens: Vec<Token>,
     pub pos: usize,
+    destruct_counter: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, destruct_counter: 0 }
     }
 
     fn peek(&self, offset: usize) -> &Token {
@@ -1866,12 +2313,38 @@ impl Parser {
         let mut i = 1;
         loop {
             let t = self.peek(i);
-            // Stop looking if we hit EOF, a newline, or a block start
             if t.typ == TokenType::Eof || t.typ == TokenType::Newline || t.value == "{" { return false; }
             if t.value == ")" {
                 return self.peek(i + 1).value == "=>";
             }
+            if t.value == "..." { i += 1; continue; } // skip rest param prefix
             i += 1;
+        }
+    }
+
+
+    fn is_destructuring_assignment(&self) -> bool {
+        let cur = self.current().value.as_str();
+        if cur != "[" && cur != "{" { return false; }
+
+        let mut depth = 0;
+        let mut i = 0;
+        loop {
+            let t = self.peek(i);
+            if t.typ == TokenType::Eof { return false; }
+            
+            // Track bracket depth
+            if t.value == "[" || t.value == "{" || t.value == "(" { depth += 1; }
+            else if t.value == "]" || t.value == "}" || t.value == ")" {
+                depth -= 1;
+                // Once we close the outermost bracket, check if the next token is "="
+                if depth == 0 {
+                    return self.peek(i + 1).value == "=";
+                }
+            }
+            
+            i += 1;
+            if i > 200 { return false; } // Safety limit for infinite loops
         }
     }
 
@@ -1900,7 +2373,12 @@ impl Parser {
         if self.current().value == s || (s == "NAME" && matches!(self.current().typ, TokenType::Name)) {
             Ok(self.advance())
         } else {
-            Err(format!("Expected '{}', got '{}' at line {}", s, self.current().value, self.current().line))
+            let friendly_expected = if s == "NAME" { "identifier" } else { s };
+           Err(DgnError::with_col(
+                &format!("Expected '{}', got '{}'", friendly_expected, self.current().value),
+                self.current().line,
+                self.current().col
+            ).format_pretty())
         }
     }
 
@@ -1939,8 +2417,129 @@ impl Parser {
         let line = self.current().line;
         let cur = self.current().value.clone();
 
+        let is_var = cur == "var";
+        let is_destruct = self.is_destructuring_assignment();
+
+        if is_var || is_destruct {
+            if is_var { self.advance(); }
+            // Destructuring: let [a, b, ...rest] = expr  OR  let {x, y} = expr
+            if self.current().value == "[" {
+                self.advance();
+                let mut names: Vec<Option<String>> = Vec::new(); // None = skip slot (_)
+                let mut rest_name: Option<String> = None;
+                while self.current().value != "]" && self.current().typ != TokenType::Eof {
+                    if self.current().value == "," { self.advance(); continue; }
+                    if self.current().value == "..." {
+                        self.advance(); // consume "..."
+                        rest_name = Some(self.expect("NAME")?.value);
+                        break;
+                    }
+                    let n = self.expect("NAME")?.value;
+                    names.push(if n == "_" { None } else { Some(n) });
+                    if !self.match_token(",") { break; }
+                }
+                self.expect("]")?;
+                self.expect("=")?;
+                let rhs = self.parse_expr()?;
+                self.match_end_of_stmt()?;
+                // Build: tmp = rhs; a = tmp[0]; b = tmp[1]; ...rest = tmp.slice(N)
+                let tmp = { self.destruct_counter += 1; format!("__destruct_{}__", self.destruct_counter) };
+                let mut stmts = vec![
+                    Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
+                        Box::new(Expr { node: ExprNode::Var(tmp.clone()), line }),
+                        Box::new(rhs),
+                    ), line }), line }
+                ];
+                for (i, maybe_name) in names.iter().enumerate() {
+                    if let Some(n) = maybe_name {
+                        stmts.push(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
+                            Box::new(Expr { node: ExprNode::Var(n.clone()), line }),
+                            Box::new(Expr { node: ExprNode::Index(
+                                Box::new(Expr { node: ExprNode::Var(tmp.clone()), line }),
+                                Box::new(Expr { node: ExprNode::Number(i as f64), line }),
+                            ), line }),
+                        ), line }), line });
+                    }
+                }
+                if let Some(rn) = rest_name {
+                    let n = names.len();
+                    // rest = tmp.slice(n)
+                    stmts.push(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
+                        Box::new(Expr { node: ExprNode::Var(rn), line }),
+                        Box::new(Expr { node: ExprNode::Call(
+                            Box::new(Expr { node: ExprNode::GetAttr(
+                                Box::new(Expr { node: ExprNode::Var(tmp.clone()), line }),
+                                "slice".to_string(),
+                            ), line }),
+                            vec![Expr { node: ExprNode::Number(n as f64), line }],
+                        ), line }),
+                    ), line }), line });
+                }
+                return Ok(Stmt { node: StmtNode::Multi(stmts), line });
+            }
+            if self.current().value == "{" {
+                self.advance();
+                let mut bindings: Vec<(String, String)> = Vec::new(); // (key, local_name)
+                while self.current().value != "}" && self.current().typ != TokenType::Eof {
+                    if self.current().value == "," { self.advance(); continue; }
+                    let key = self.expect("NAME")?.value;
+                    let local = if self.match_token(":") {
+                        self.expect("NAME")?.value
+                    } else {
+                        key.clone()
+                    };
+                    bindings.push((key, local));
+                    if !self.match_token(",") { break; }
+                }
+                self.expect("}")?;
+                self.expect("=")?;
+                let rhs = self.parse_expr()?;
+                self.match_end_of_stmt()?;
+                let tmp = { self.destruct_counter += 1; format!("__destruct_{}__", self.destruct_counter) };
+                let mut stmts = vec![
+                    Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
+                        Box::new(Expr { node: ExprNode::Var(tmp.clone()), line }),
+                        Box::new(rhs),
+                    ), line }), line }
+                ];
+                for (key, local) in bindings {
+                    stmts.push(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
+                        Box::new(Expr { node: ExprNode::Var(local), line }),
+                        Box::new(Expr { node: ExprNode::Index(
+                            Box::new(Expr { node: ExprNode::Var(tmp.clone()), line }),
+                            Box::new(Expr { node: ExprNode::String(key), line }),
+                        ), line }),
+                    ), line }), line });
+                }
+                return Ok(Stmt { node: StmtNode::Multi(stmts), line });
+            }
+            // Plain `let name = expr`
+            if is_var {
+                let name = self.expect("NAME")?.value;
+                self.expect("=")?;
+                let val = self.parse_expr()?;
+                self.match_end_of_stmt()?;
+                return Ok(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
+                    Box::new(Expr { node: ExprNode::Var(name), line }),
+                    Box::new(val),
+                ), line }), line });
+            }
+        } // End of var block
+
+        if cur == "augment" {
+            self.advance();
+            let target_type = self.expect("NAME")?.value;
+            self.expect("{")?;
+            let mut methods = Vec::new();
+            while self.current().value != "}" && self.current().typ != TokenType::Eof {
+                methods.push(self.parse_func(false)?); 
+            }
+            self.expect("}")?;
+            return Ok(Stmt { node: StmtNode::Augment(target_type, methods), line });
+        }
+
         if cur == "const" { return self.parse_const(); }
-        if cur == "var" { self.advance(); } 
+        // if cur == "var" { self.advance(); } 
         if cur == "async" { 
             self.advance(); 
             return self.parse_func(true); // ADD THIS BLOCK
@@ -1987,6 +2586,23 @@ impl Parser {
              let rhs = self.parse_expr()?;
              self.match_end_of_stmt()?;
              return Ok(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(Box::new(expr), Box::new(rhs)), line }), line });
+        }
+
+        let current_val = self.current().value.clone();
+        if matches!(current_val.as_str(), "+=" | "-=" | "*=" | "/=" | "%=") {
+            let op = &current_val[..1]; // "+", "-", "*", "/", "%"
+            self.advance();
+            let rhs = self.parse_expr()?;
+            self.match_end_of_stmt()?;
+            // Desugar:  target OP= rhs  →  target = target OP rhs
+            let bin = Expr {
+                node: ExprNode::Binary(op.to_string(), Box::new(expr.clone()), Box::new(rhs)),
+                line,
+            };
+            return Ok(Stmt {
+                node: StmtNode::Expr(Expr { node: ExprNode::Assign(Box::new(expr), Box::new(bin)), line }),
+                line,
+            });
         }
 
         self.match_end_of_stmt()?;
@@ -2045,8 +2661,20 @@ impl Parser {
         
         if self.current().value != ")" {
             loop {
+                if self.current().value == "..." {
+                    self.advance();
+                    let rest_name = self.expect("NAME")?.value;
+                    params.push((format!("...{}", rest_name), None));
+                    self.match_token(",");
+                    break;
+                }
+
                 let p_name = self.expect("NAME")?.value;
-                params.push(p_name.clone());
+                let mut p_type = None;
+                if self.match_token(":") {
+                    p_type = Some(self.expect("NAME")?.value);
+                }
+                params.push((p_name.clone(), p_type));
                 
                 if self.match_token("=") {
                     let def_expr = self.parse_expr()?;
@@ -2447,6 +3075,13 @@ impl Parser {
                 }
                 self.expect(")")?;
                 node = Expr { node: ExprNode::Call(Box::new(node.clone()), args), line: node.line };
+            } else if self.match_token("?.") {
+                let t = self.advance();
+                let attr = match t.typ {
+                    TokenType::Name | TokenType::Keyword(_) => t.value,
+                    _ => return Err(format!("Expected property name after '?.', got '{}' at line {}", t.value, t.line))
+                };
+                node = Expr { node: ExprNode::OptionalGetAttr(Box::new(node.clone()), attr), line: node.line };
             } else if self.match_token(".") {
                 let t = self.advance();
                 let attr = match t.typ {
@@ -2474,7 +3109,17 @@ impl Parser {
         let line = t.line;
         match t.typ {
             TokenType::Number => { self.advance(); Ok(Expr { node: ExprNode::Number(t.num_val.unwrap()), line }) },
-            TokenType::String => { self.advance(); Ok(Expr { node: ExprNode::String(t.value), line }) },
+            TokenType::String => {
+                self.advance();
+                // Backtick interpolated strings are stored with \x01 prefix
+                if let Some(raw) = t.value.strip_prefix('\x01') {
+                    // Parse into a chain of string + expression concatenations
+                    let expr = parse_interp_string(raw, t.line)?;
+                    Ok(expr)
+                } else {
+                    Ok(Expr { node: ExprNode::String(t.value), line })
+                }
+            },
             TokenType::Keyword(ref k) => match k.as_str() {
                 "True" => { self.advance(); Ok(Expr { node: ExprNode::Bool(true), line }) },
                 "False" => { self.advance(); Ok(Expr { node: ExprNode::Bool(false), line }) },
@@ -2504,8 +3149,20 @@ impl Parser {
                     
                     if self.current().value != ")" {
                         loop {
+                            if self.current().value == "..." {
+                                self.advance();
+                                let rest_name = self.expect("NAME")?.value;
+                                params.push((format!("...{}", rest_name), None));
+                                self.match_token(",");
+                                break;
+                            }
+
                             let p_name = self.expect("NAME")?.value;
-                            params.push(p_name.clone());
+                            let mut p_type = None;
+                            if self.match_token(":") {
+                                p_type = Some(self.expect("NAME")?.value);
+                            }
+                            params.push((p_name.clone(), p_type));
                             
                             if self.match_token("=") {
                                 let def_expr = self.parse_expr()?;
@@ -2548,8 +3205,20 @@ impl Parser {
                         
                         if self.current().value != ")" {
                             loop {
+                                if self.current().value == "..." {
+                                    self.advance();
+                                    let rest_name = self.expect("NAME")?.value;
+                                    params.push((format!("...{}", rest_name), None));
+                                    self.match_token(",");
+                                    break;
+                                }
+
                                 let p_name = self.expect("NAME")?.value;
-                                params.push(p_name.clone());
+                                let mut p_type = None;
+                                if self.match_token(":") {
+                                    p_type = Some(self.expect("NAME")?.value);
+                                }
+                                params.push((p_name.clone(), p_type));
                                 
                                 if self.match_token("=") {
                                     let def_expr = self.parse_expr()?;
@@ -2638,6 +3307,7 @@ pub fn is_truthy(v: &DgnValue) -> bool {
     match v {
         DgnValue::Null => false,
         DgnValue::Bool(b) => *b,
+        DgnValue::Int(n) => *n != 0,
         DgnValue::Number(n) => *n != 0.0,
         DgnValue::String(s) => !s.is_empty(),
         DgnValue::List(l) => !l.lock().unwrap().is_empty(),
@@ -2651,6 +3321,7 @@ pub fn val_to_string(v: &DgnValue) -> String {
     match v {
         DgnValue::Null => "null".to_string(),
         DgnValue::Bool(b) => if *b { "True".to_string() } else { "False".to_string() },
+        DgnValue::Int(n) => format!("{}", n),
         DgnValue::Number(n) => if n.fract() == 0.0 { format!("{}", *n as i64) } else { format!("{}", n) },
         DgnValue::String(s) => s.clone(),
         DgnValue::List(l) => {
@@ -2767,6 +3438,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
         },
 
         DgnValue::Map(m) => {
+            if let Some(val) = m.lock().unwrap().get(name) {
+                return Ok(val.clone());
+            }
             match name {
                 "keys" => return Ok(native_method(m, |m, _| {
                     let keys: Vec<DgnValue> = m.lock().unwrap().keys().map(|k| DgnValue::String(k.clone())).collect();
@@ -2853,15 +3527,15 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                 "pop" => Ok(native_method(l, |l, _| { 
                     Ok(l.lock().unwrap().pop().unwrap_or(DgnValue::Null)) 
                 })),
-                "insert" => Ok(native_method(l, |l, args| {
-                    let idx = if let Some(DgnValue::Number(n)) = args.get(0) { *n as usize } else { 0 };
+               "insert" => Ok(native_method(l, |l, args| {
+                    let idx = if let Some(n) = args.get(0).and_then(|a| a.as_number()) { n as usize } else { 0 };
                     let val = args.get(1).cloned().unwrap_or(DgnValue::Null);
                     let mut vec = l.lock().unwrap();
                     if idx <= vec.len() { vec.insert(idx, val); }
                     Ok(DgnValue::Null)
                 })),
                 "remove_at" => Ok(native_method(l, |l, args| {
-                    let idx = if let Some(DgnValue::Number(n)) = args.get(0) { *n as usize } else { 0 };
+                    let idx = if let Some(n) = args.get(0).and_then(|a| a.as_number()) { n as usize } else { 0 };
                     let mut vec = l.lock().unwrap();
                     if idx < vec.len() { Ok(vec.remove(idx)) } else { Ok(DgnValue::Null) }
                 })),
@@ -2922,6 +3596,165 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let found = vec.iter().any(|x| val_to_string(x) == val_to_string(&val));
                     Ok(DgnValue::Bool(found))
                 })),
+
+                "reduce" => Ok(native_method(l, |l, args| {
+                    let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
+                    let vec = l.lock().unwrap().clone();
+                    if vec.is_empty() {
+                        return Ok(args.get(1).cloned().unwrap_or(DgnValue::Null));
+                    }
+                    let mut iter = vec.into_iter();
+                    // Use provided initial value, or default to the first element
+                    let mut acc = if args.len() > 1 { args[1].clone() } else { iter.next().unwrap() };
+                    
+                    let rt = tokio::runtime::Handle::current();
+                    for item in iter {
+                        acc = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![acc.clone(), item])))?;
+                    }
+                    Ok(acc)
+                })),
+
+                "find" => Ok(native_method(l, |l, args| {
+                    let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
+                    let vec = l.lock().unwrap().clone();
+                    let rt = tokio::runtime::Handle::current();
+                    for item in vec {
+                        let res = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item.clone()])))?;
+                        if is_truthy(&res) { return Ok(item); }
+                    }
+                    Ok(DgnValue::Null)
+                })),
+
+                "any" => Ok(native_method(l, |l, args| {
+                    let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
+                    let vec = l.lock().unwrap().clone();
+                    let rt = tokio::runtime::Handle::current();
+                    for item in vec {
+                        let res = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item])))?;
+                        if is_truthy(&res) { return Ok(DgnValue::Bool(true)); }
+                    }
+                    Ok(DgnValue::Bool(false))
+                })),
+
+                "all" => Ok(native_method(l, |l, args| {
+                    let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
+                    let vec = l.lock().unwrap().clone();
+                    let rt = tokio::runtime::Handle::current();
+                    for item in vec {
+                        let res = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item])))?;
+                        if !is_truthy(&res) { return Ok(DgnValue::Bool(false)); }
+                    }
+                    Ok(DgnValue::Bool(true))
+                })),
+
+                "flat" => Ok(native_method(l, |l, _| {
+                    let vec = l.lock().unwrap();
+                    let mut res = Vec::new();
+                    for item in vec.iter() {
+                        if let DgnValue::List(sub_l) = item {
+                            res.extend(sub_l.lock().unwrap().clone());
+                        } else {
+                            res.push(item.clone());
+                        }
+                    }
+                    Ok(DgnValue::List(Arc::new(Mutex::new(res))))
+                })),
+
+                "zip" => Ok(native_method(l, |l, args| {
+                    let other = args.get(0).cloned().unwrap_or(DgnValue::Null);
+                    if let DgnValue::List(other_l) = other {
+                        let vec1 = l.lock().unwrap();
+                        let vec2 = other_l.lock().unwrap();
+                        let mut res = Vec::new();
+                        let len = vec1.len().min(vec2.len()); // Zip up to the shortest list
+                        for i in 0..len {
+                            let pair = vec![vec1[i].clone(), vec2[i].clone()];
+                            res.push(DgnValue::List(Arc::new(Mutex::new(pair))));
+                        }
+                        Ok(DgnValue::List(Arc::new(Mutex::new(res))))
+                    } else {
+                        Err(DgnError::new("zip() expects a list as an argument", 0))
+                    }
+                })),
+
+                "sum" => Ok(native_method(l, |l, _| {
+                    let vec = l.lock().unwrap();
+                    let mut total = 0.0;
+                    let mut is_float = false;
+                    for item in vec.iter() {
+                        if let DgnValue::Number(n) = item { total += n; is_float = true; }
+                        else if let DgnValue::Int(n) = item { total += *n as f64; }
+                    }
+                    // Return as integer if no floats were encountered
+                    if is_float { Ok(DgnValue::Number(total)) } else { Ok(DgnValue::Int(total as i64)) }
+                })),
+
+                "first" => Ok(native_method(l, |l, _| {
+                    Ok(l.lock().unwrap().first().cloned().unwrap_or(DgnValue::Null))
+                })),
+
+                "last" => Ok(native_method(l, |l, _| {
+                    Ok(l.lock().unwrap().last().cloned().unwrap_or(DgnValue::Null))
+                })),
+
+                "slice" => Ok(native_method(l, |l, args| {
+                    let vec = l.lock().unwrap();
+                    let len = vec.len() as i64;
+                    let start = args.get(0).and_then(|a| a.as_int()).unwrap_or(0);
+                    let end = args.get(1).and_then(|a| a.as_int()).unwrap_or(len);
+                    
+                    // Support negative indices (e.g., -1 for the last item)
+                    let start_idx = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
+                    let end_idx = if end < 0 { (len + end).max(0) as usize } else { end.min(len) as usize };
+                    
+                    let mut res = Vec::new();
+                    if start_idx <= end_idx {
+                        res.extend_from_slice(&vec[start_idx..end_idx]);
+                    }
+                    Ok(DgnValue::List(Arc::new(Mutex::new(res))))
+                })),
+
+                "unique" => Ok(native_method(l, |l, _| {
+                    let vec = l.lock().unwrap();
+                    let mut res = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for item in vec.iter() {
+                        // Use stringification for deep-equality matching of nested objects/lists
+                        let key = val_to_string(item);
+                        if seen.insert(key) {
+                            res.push(item.clone());
+                        }
+                    }
+                    Ok(DgnValue::List(Arc::new(Mutex::new(res))))
+                })),
+
+                "sort_by" => Ok(native_method(l, |l, args| {
+                    let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
+                    let mut vec = l.lock().unwrap().clone();
+                    let rt = tokio::runtime::Handle::current();
+                    
+                    // Pre-compute the keys to avoid repeatedly calling the Dragon function during sort
+                    let mut pairs = Vec::new();
+                    for item in vec {
+                        let key = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item.clone()])))?;
+                        pairs.push((key, item));
+                    }
+                    
+                    pairs.sort_by(|(key_a, _), (key_b, _)| {
+                        match (key_a, key_b) {
+                            (DgnValue::Number(n1), DgnValue::Number(n2)) => n1.partial_cmp(n2).unwrap_or(std::cmp::Ordering::Equal),
+                            (DgnValue::Int(n1), DgnValue::Int(n2)) => n1.cmp(n2),
+                            (DgnValue::Int(n1), DgnValue::Number(n2)) => (*n1 as f64).partial_cmp(n2).unwrap_or(std::cmp::Ordering::Equal),
+                            (DgnValue::Number(n1), DgnValue::Int(n2)) => n1.partial_cmp(&(*n2 as f64)).unwrap_or(std::cmp::Ordering::Equal),
+                            (DgnValue::String(s1), DgnValue::String(s2)) => s1.cmp(s2),
+                            _ => std::cmp::Ordering::Equal
+                        }
+                    });
+                    
+                    let sorted_vec: Vec<DgnValue> = pairs.into_iter().map(|(_, v)| v).collect();
+                    *l.lock().unwrap() = sorted_vec;
+                    Ok(DgnValue::Null)
+                })),
                 _ => Ok(DgnValue::Null)
             }
         },
@@ -2962,8 +3795,8 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                      Ok(DgnValue::Number(s.find(sub).map(|i| i as f64).unwrap_or(-1.0)))
                  }))},
                  "substring" => { let s=s.clone(); Ok(native_fn(move |args| {
-                     let start = if let Some(DgnValue::Number(n)) = args.get(0) { *n as usize } else { 0 };
-                     let end = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { s.len() };
+                     let start = if let Some(n) = args.get(0).and_then(|a| a.as_number()) { n as usize } else { 0 };
+                     let end = if let Some(n) = args.get(1).and_then(|a| a.as_number()) { n as usize } else { s.len() };
                      if start < s.len() && end <= s.len() && start <= end {
                          Ok(DgnValue::String(s[start..end].to_string()))
                      } else {
@@ -2981,8 +3814,8 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     Ok(DgnValue::String(String::from_utf8_lossy(&v).to_string()))
                 })),
                 "push" => Ok(native_method(b, |b, args| {
-                    if let Some(DgnValue::Number(n)) = args.get(0) {
-                        b.lock().unwrap().push(*n as u8);
+                    if let Some(n) = args.get(0).and_then(|a| a.as_number()) {
+                        b.lock().unwrap().push(n as u8);
                     }
                     Ok(DgnValue::Null)
                 })),
@@ -3003,6 +3836,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
 
                 for arg in args {
                     match arg {
+                        DgnValue::Int(n) => raw_args.push(n as usize),
                         DgnValue::Number(n) => raw_args.push(n as usize),
                         DgnValue::Bool(b) => raw_args.push(if b { 1 } else { 0 }),
                         DgnValue::String(s) => {
@@ -3064,6 +3898,25 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let repl = args.get(1).map(val_to_string).unwrap_or_default();
                     Ok(DgnValue::String(r.replace_all(&s, &repl).to_string()))
                 })),
+                "find_all" => Ok(native_method(r, |r, args| {
+                    let s = args.get(0).map(val_to_string).unwrap_or_default();
+                    let matches: Vec<DgnValue> = r.find_iter(&s)
+                        .map(|m| DgnValue::String(m.as_str().to_string()))
+                        .collect();
+                    Ok(DgnValue::List(Arc::new(Mutex::new(matches))))
+                })),
+                "groups" => Ok(native_method(r, |r, args| {
+                    let s = args.get(0).map(val_to_string).unwrap_or_default();
+                    if let Some(caps) = r.captures(&s) {
+                        let groups: Vec<DgnValue> = caps.iter()
+                            .map(|m| m.map(|c| DgnValue::String(c.as_str().to_string()))
+                                    .unwrap_or(DgnValue::Null))
+                            .collect();
+                        Ok(DgnValue::List(Arc::new(Mutex::new(groups))))
+                    } else {
+                        Ok(DgnValue::Null)
+                    }
+                })),
                 _ => Ok(DgnValue::Null)
             }
         }
@@ -3104,17 +3957,61 @@ pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnVal
 #[async_recursion]
 pub async fn call_dgn_func_impl(f: DgnFunc, args: Vec<DgnValue>, this_ctx: Option<DgnValue>) -> Result<DgnValue, DgnError> {
 
-    if args.len() < f.req_params {
+    let has_rest = f.params.last().map(|(n, _)| n.starts_with("...")).unwrap_or(false);
+    if !has_rest && args.len() < f.req_params {
         let fn_name = f.name.as_deref().unwrap_or("<anonymous>");
         return Err(DgnError::new(&format!("Function '{}' expects at least {} argument(s), but got {}", fn_name, f.req_params, args.len()), 0));
     }
 
     let scope = Arc::new(Mutex::new(Env::new(Some(f.closure.clone()), None)));
 
-    for (i, param) in f.params.iter().enumerate() {
-        let v = args.get(i).cloned().unwrap_or(DgnValue::Null);
-        scope.lock().unwrap().store.insert(param.clone(), v);
-    }
+        for (i, (param_name, param_type)) in f.params.iter().enumerate() {
+            // Rest parameter: pack all remaining args into a List
+            if let Some(rest_name) = param_name.strip_prefix("...") {
+                let rest: Vec<DgnValue> = args.get(i..).unwrap_or(&[]).to_vec();
+                scope.lock().unwrap().store.insert(
+                    rest_name.to_string(),
+                    DgnValue::List(Arc::new(Mutex::new(rest))),
+                );
+                break;
+            }
+
+            let v = args.get(i).cloned().unwrap_or(DgnValue::Null);
+
+            // Enforce type if a hint was provided
+            if let Some(expected) = param_type {
+                let actual = match &v {
+                    DgnValue::Null => "null",
+                    DgnValue::Bool(_) => "bool",
+                    DgnValue::Number(_) => "number",
+                    DgnValue::Int(_) => "int",
+                    DgnValue::String(_) => "string",
+                    DgnValue::List(_) => "list",
+                    DgnValue::Map(_) => "map",
+                    DgnValue::ByteArray(_) => "bytes",
+                    DgnValue::Func(_) => "function",
+                    DgnValue::Class(_) => "class",
+                    DgnValue::Instance(_) => "instance",
+                    _ => "any",
+                };
+
+                let is_compatible = (expected == actual) ||
+                                    (expected == "any") ||
+                                    (expected == "number" && actual == "int");
+
+                if !is_compatible {
+                    let fn_name = f.name.as_deref().unwrap_or("<anonymous>");
+                    return Err(DgnError::new(&format!("TypeError in '{}': Parameter '{}' expects '{}', got '{}'", fn_name, param_name, expected, actual), 0));
+                }
+            }
+
+            scope.lock().unwrap().store.insert(param_name.clone(), v);
+        }
+
+    // for (i, param) in f.params.iter().enumerate() {
+    //     let v = args.get(i).cloned().unwrap_or(DgnValue::Null);
+    //     scope.lock().unwrap().store.insert(param.clone(), v);
+    // }
 
     if let Some(th) = this_ctx {
         scope.lock().unwrap().store.insert("this".to_string(), th);
@@ -3185,56 +4082,46 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
     match name {
         "math" => {
             let mut map = HashMap::new();
-            map.insert("sin".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.sin() } else { 0.0 }))));
-            map.insert("cos".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.cos() } else { 0.0 }))));
-            map.insert("sqrt".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.sqrt() } else { 0.0 }))));
-            map.insert("abs".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.abs() } else { 0.0 }))));
-            map.insert("floor".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.floor() } else { 0.0 }))));
-            map.insert("ceil".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.ceil() } else { 0.0 }))));
-            map.insert("round".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(DgnValue::Number(n)) = a.get(0) { n.round() } else { 0.0 }))));
+            map.insert("sin".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.sin() } else { 0.0 }))));
+            map.insert("cos".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.cos() } else { 0.0 }))));
+            map.insert("sqrt".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.sqrt() } else { 0.0 }))));
+            map.insert("abs".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.abs() } else { 0.0 }))));
+            map.insert("floor".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.floor() } else { 0.0 }))));
+            map.insert("ceil".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.ceil() } else { 0.0 }))));
+            map.insert("round".to_string(), native_fn(|a| Ok(DgnValue::Number(if let Some(n) = a.get(0).and_then(|v| v.as_number()) { n.round() } else { 0.0 }))));
             map.insert("pow".to_string(), native_fn(|args| {
-                let base = if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 };
-                let exp = if let Some(DgnValue::Number(n)) = args.get(1) { *n } else { 1.0 };
+                let base = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0);
+                let exp = args.get(1).and_then(|v| v.as_number()).unwrap_or(1.0);
                 Ok(DgnValue::Number(base.powf(exp)))
             }));
             map.insert("log".to_string(), native_fn(|args| {
-                let n = if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 };
+                let n = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0);
                 Ok(DgnValue::Number(n.ln()))
             }));
             map.insert("min".to_string(), native_fn(|args| {
                 let mut min = std::f64::INFINITY;
-                for arg in args { if let DgnValue::Number(n) = arg { if n < min { min = n; } } }
+                for arg in args { if let Some(n) = arg.as_number() { if n < min { min = n; } } }
                 Ok(DgnValue::Number(min))
             }));
             map.insert("max".to_string(), native_fn(|args| {
                 let mut max = std::f64::NEG_INFINITY;
-                for arg in args { if let DgnValue::Number(n) = arg { if n > max { max = n; } } }
+                for arg in args { if let Some(n) = arg.as_number() { if n > max { max = n; } } }
                 Ok(DgnValue::Number(max))
             }));
-
-             map.insert("range".to_string(), native_fn(|args| {
+            map.insert("range".to_string(), native_fn(|args| {
                 let (start, stop, step) = match args.len() {
                     1 => (0.0, args[0].as_number().unwrap_or(0.0), 1.0),
                     2 => (args[0].as_number().unwrap_or(0.0), args[1].as_number().unwrap_or(0.0), 1.0),
                     3 => (args[0].as_number().unwrap_or(0.0), args[1].as_number().unwrap_or(0.0), args[2].as_number().unwrap_or(1.0)),
                     _ => return Err(DgnError::new("range() expects 1 to 3 arguments", 0)),
                 };
-
                 let mut nums = Vec::new();
                 let mut curr = start;
-
                 if step > 0.0 {
-                    while curr < stop {
-                        nums.push(DgnValue::Number(curr));
-                        curr += step;
-                    }
+                    while curr < stop { nums.push(DgnValue::Number(curr)); curr += step; }
                 } else if step < 0.0 {
-                    while curr > stop {
-                        nums.push(DgnValue::Number(curr));
-                        curr += step;
-                    }
+                    while curr > stop { nums.push(DgnValue::Number(curr)); curr += step; }
                 }
-
                 Ok(DgnValue::List(Arc::new(Mutex::new(nums))))
             }));
             map.insert("random".to_string(), native_fn(|_| Ok(DgnValue::Number(rand::random::<f64>()))));
@@ -3846,6 +4733,147 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
             }
             Some(DgnValue::Map(Arc::new(Mutex::new(map))))
         },
+
+        "crypto" => {
+            let mut map = HashMap::new();
+
+            // Helper to extract bytes from a Dragon String or ByteArray
+            fn get_bytes(val: &DgnValue) -> Option<Vec<u8>> {
+                match val {
+                    DgnValue::String(s) => Some(s.as_bytes().to_vec()),
+                    DgnValue::ByteArray(b) => Some(b.lock().unwrap().clone()),
+                    _ => None,
+                }
+            }
+
+            // 1. Generate Random Bytes
+            map.insert("random_bytes".to_string(), native_fn(|args| {
+                let len = args.get(0).and_then(|v| v.as_int()).unwrap_or(32) as usize;
+                let mut bytes = vec![0u8; len];
+                OsRng.fill_bytes(&mut bytes);
+                Ok(DgnValue::ByteArray(Arc::new(Mutex::new(bytes))))
+            }));
+
+            // 2. AES-256-GCM Encryption
+            map.insert("aes_encrypt".to_string(), native_fn(move |args| {
+                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Data required (String or ByteArray)", 0))?;
+                let key_bytes = get_bytes(args.get(1).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Key required (String or ByteArray)", 0))?;
+
+                if key_bytes.len() != 32 { return Err(DgnError::new("AES-256 key must be exactly 32 bytes", 0)); }
+
+                let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+                let cipher = Aes256Gcm::new(key);
+
+                let mut nonce_bytes = [0u8; 12];
+                OsRng.fill_bytes(&mut nonce_bytes);
+                let nonce = Nonce::from_slice(&nonce_bytes);
+
+                match cipher.encrypt(nonce, data.as_ref()) {
+                    Ok(ciphertext) => {
+                        let mut out = Vec::with_capacity(12 + ciphertext.len());
+                        out.extend_from_slice(&nonce_bytes);
+                        out.extend_from_slice(&ciphertext);
+                        Ok(DgnValue::ByteArray(Arc::new(Mutex::new(out))))
+                    },
+                    Err(_) => Err(DgnError::new("AES Encryption failed", 0))
+                }
+            }));
+
+            // 3. AES-256-GCM Decryption
+            map.insert("aes_decrypt".to_string(), native_fn(move |args| {
+                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Encrypted data required (ByteArray)", 0))?;
+                let key_bytes = get_bytes(args.get(1).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Key required", 0))?;
+
+                if key_bytes.len() != 32 { return Err(DgnError::new("AES-256 key must be exactly 32 bytes", 0)); }
+                if data.len() < 12 + 16 { return Err(DgnError::new("Invalid ciphertext length", 0)); }
+
+                let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+                let cipher = Aes256Gcm::new(key);
+                let nonce = Nonce::from_slice(&data[..12]);
+                let ciphertext = &data[12..];
+
+                match cipher.decrypt(nonce, ciphertext) {
+                    Ok(plaintext) => Ok(DgnValue::ByteArray(Arc::new(Mutex::new(plaintext)))),
+                    Err(_) => Err(DgnError::new("AES Decryption failed", 0))
+                }
+            }));
+
+            // 4. SHA-256 Hashing
+            map.insert("sha256".to_string(), native_fn(|args| {
+                use sha2::{Sha256, Digest};
+                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Data required", 0))?;
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                let hex_str = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                Ok(DgnValue::String(hex_str))
+            }));
+
+            // 5. SHA-512 Hashing
+            map.insert("sha512".to_string(), native_fn(|args| {
+                use sha2::{Sha512, Digest};
+                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Data required", 0))?;
+                let mut hasher = Sha512::new();
+                hasher.update(&data);
+                let hex_str = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                Ok(DgnValue::String(hex_str))
+            }));
+
+            // 6. MD5 Hashing (Legacy, but often required for older APIs)
+            map.insert("md5".to_string(), native_fn(|args| {
+                use md5::{Md5, Digest};
+                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Data required", 0))?;
+                let mut hasher = Md5::new();
+                hasher.update(&data);
+                let hex_str = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                Ok(DgnValue::String(hex_str))
+            }));
+
+            // 7. HMAC-SHA256 (Used for API authentication / Webhooks)
+            map.insert("hmac_sha256".to_string(), native_fn(|args| {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                type HmacSha256 = Hmac<Sha256>;
+
+                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Data required", 0))?;
+                let key = get_bytes(args.get(1).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Key required", 0))?;
+
+                let mut mac = <HmacSha256 as Mac>::new_from_slice(&key).map_err(|_| DgnError::new("Invalid HMAC key", 0))?;
+                mac.update(&data);
+                let hex_str = mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                Ok(DgnValue::String(hex_str))
+            }));
+
+            // 8. PBKDF2 Password Key Derivation
+            map.insert("pbkdf2".to_string(), native_fn(|args| {
+                use pbkdf2::pbkdf2_hmac;
+                use sha2::Sha256;
+
+                let password = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Password required", 0))?;
+                let salt = get_bytes(args.get(1).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Salt required", 0))?;
+                
+                // Optional args for iterations and key length
+                let iterations = args.get(2).and_then(|v| v.as_int()).unwrap_or(100_000) as u32;
+                let key_len = args.get(3).and_then(|v| v.as_int()).unwrap_or(32) as usize;
+
+                let mut derived_key = vec![0u8; key_len];
+                pbkdf2_hmac::<Sha256>(&password, &salt, iterations, &mut derived_key);
+
+                Ok(DgnValue::ByteArray(Arc::new(Mutex::new(derived_key))))
+            }));
+
+            Some(DgnValue::Map(Arc::new(Mutex::new(map))))
+        },
         
         "ffi" => {
             let mut map = HashMap::new();
@@ -3922,10 +4950,10 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                 // 3. Return Address
                 let l = lib_arc.lock().unwrap();
                 unsafe {
-                    // We cast the symbol to a generic pointer, then to usize (number)
-                    let symbol: Symbol<*const c_void> = l.get(func_name.as_bytes())
+                    let symbol: Symbol<*const std::ffi::c_void> = l.get(func_name.as_bytes())
                         .map_err(|e| DgnError::new(&e.to_string(), 0))?;
-                    Ok(DgnValue::Number(*symbol as usize as f64))
+                    // FIX: Return as true Int!
+                    Ok(DgnValue::Int(*symbol as usize as i64))
                 }
             }));
 
@@ -3974,7 +5002,7 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                         "long" | "i64" => Type::i64(),
                         "float" | "f32" => Type::f32(),
                         "double" | "f64" => Type::f64(),
-                        "pointer" | "void*" => Type::pointer(),
+                        "pointer" | "void*" | "string" | "str" => Type::pointer(),
                         "bool" => Type::u8(),
                         _ => return Err(DgnError::new("Unknown return type", 0))
                     };
@@ -4004,11 +5032,11 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     for (i, val) in call_args_values.iter().enumerate() {
                         let t_str = arg_types_str.get(i).map(|s| s.as_str()).unwrap_or("int");
                         match t_str {
-                            "int" | "i32" => values.push(FfiValue::I32(val.as_number().unwrap_or(0.0) as i32)),
-                            "long" | "i64" => values.push(FfiValue::I64(val.as_number().unwrap_or(0.0) as i64)),
+                            "int" | "i32" => values.push(FfiValue::I32(val.as_int().unwrap_or(0) as i32)),
+                            "long" | "i64" => values.push(FfiValue::I64(val.as_int().unwrap_or(0) as i64)),
                             "float" | "f32" => values.push(FfiValue::F32(val.as_number().unwrap_or(0.0) as f32)),
                             "double" | "f64" => values.push(FfiValue::F64(val.as_number().unwrap_or(0.0) as f64)),
-                            "pointer" | "void*" => values.push(FfiValue::Ptr(val.as_number().unwrap_or(0.0) as usize)),
+                            "pointer" | "void*" => values.push(FfiValue::Ptr(val.as_int().unwrap_or(0) as usize)),
                             "string" | "char*" => {
                                 let s = val_to_string(val);
                                 let c_str = CString::new(s).unwrap_or_default();
@@ -4040,8 +5068,10 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     }
 
                     // 3. Create LibFFI Arguments
-                    // Arg::new() borrows the value from our 'values' vector
+                    // We keep a separate Vec of struct byte Vecs alive so their
+                    // pointers remain valid for the duration of the call.
                     let mut libffi_args = Vec::new();
+                    let mut struct_keep_alive: Vec<Vec<u8>> = Vec::new();
                     for v in &values {
                         match v {
                             FfiValue::I32(x) => libffi_args.push(Arg::new(x)),
@@ -4052,11 +5082,20 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                             FfiValue::U8(x) => libffi_args.push(Arg::new(x)),
                             FfiValue::Struct(data) => {
                                 if data.is_empty() {
-                                    // Edge case handling
                                     static EMPTY: u8 = 0;
                                     libffi_args.push(Arg::new(&EMPTY));
                                 } else {
-                                    libffi_args.push(Arg::new(&data[0]));
+                                    // Clone into keep_alive so the Vec (and its
+                                    // heap buffer) outlives the cif.call() below.
+                                    struct_keep_alive.push(data.clone());
+                                    let buf = struct_keep_alive.last().unwrap();
+                                    // Cast the slice pointer to *const usize so
+                                    // Arg::new stores a pointer-to-struct-memory,
+                                    // which is what libffi's struct ABI expects.
+                                    let ptr: *const usize = buf.as_ptr() as *const usize;
+                                    // SAFETY: buf is kept alive in struct_keep_alive
+                                    // until after cif.call() completes.
+                                    libffi_args.push(unsafe { Arg::new(&*ptr) });
                                 }
                             }
                         }
@@ -4071,11 +5110,11 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                             },
                             "int" | "i32" => {
                                 let res = cif.call::<i32>(code_ptr, &libffi_args);
-                                Ok(DgnValue::Number(res as f64))
+                                Ok(DgnValue::Int(res as i64))
                             },
                             "long" | "i64" => {
                                 let res = cif.call::<i64>(code_ptr, &libffi_args);
-                                Ok(DgnValue::Number(res as f64))
+                                Ok(DgnValue::Int(res))
                             },
                             "float" | "f32" => {
                                 let res = cif.call::<f32>(code_ptr, &libffi_args);
@@ -4087,12 +5126,25 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                             },
                             "pointer" | "void*" => {
                                 let res = cif.call::<usize>(code_ptr, &libffi_args);
-                                Ok(DgnValue::Number(res as f64))
+                                Ok(DgnValue::Int(res as i64))
                             },
                             "bool" => {
                                 let res = cif.call::<u8>(code_ptr, &libffi_args);
                                 Ok(DgnValue::Bool(res != 0))
                             },
+                            "string" | "str" => {
+                                // Retrieve the result as a raw C string pointer
+                                let res_ptr = cif.call::<*mut std::os::raw::c_char>(code_ptr, &libffi_args);
+                                
+                                if res_ptr.is_null() {
+                                    Ok(DgnValue::Null)
+                                } else {
+                                    // Safely read the C string from memory and convert it to a Rust String
+                                    let c_str = unsafe { std::ffi::CStr::from_ptr(res_ptr) };
+                                    Ok(DgnValue::String(c_str.to_string_lossy().into_owned()))
+                                }
+                            },
+                            
                             _ => Ok(DgnValue::Null)
                         }
                     }
@@ -4159,7 +5211,6 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     let name = val_to_string(args.get(0).unwrap());
                     let structs = FFI_STRUCTS.lock().unwrap();
                     let def = structs.get(&name).ok_or(DgnError::new("Struct not defined", 0))?;
-
                     // Allocate zeroed memory
                     let bytes = vec![0u8; def.size];
                     
@@ -4172,47 +5223,53 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
                 }));
 
-                map.insert("set".to_string(), native_fn(|args| {
+               map.insert("set".to_string(), native_fn(|args| {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let obj = if let DgnValue::Map(m) = &args[0] { m.lock().unwrap() } else { return Err(DgnError::new("Invalid struct", 0)); };
-                    let struct_name = val_to_string(obj.get("__struct_id__").unwrap());
-                    let buffer = if let DgnValue::ByteArray(b) = obj.get("__bytes__").unwrap() { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
-                    
-                    let field_name = val_to_string(&args[1]);
-                    let val = &args[2];
+                        // 1. SUPPORT BOTH MAP AND INSTANCE
+                        let mut obj = match &args[0] {
+                            DgnValue::Map(m) => m.lock().unwrap(),
+                            DgnValue::Instance(m) => m.lock().unwrap(),
+                            _ => return Err(DgnError::new("struct.set: expected struct instance or map", 0))
+                        };
 
-                    let structs = FFI_STRUCTS.lock().unwrap();
-                    let def = structs.get(&struct_name).unwrap();
-                    
-                    // Find field offset and type
-                    let (_, offset, type_info) = def.fields.iter().find(|(n, _, _)| n == &field_name)
-                        .ok_or(DgnError::new("Field not found", 0))?;
-
-                    // Write Data
-                    let mut b = buffer.lock().unwrap();
-                    let offset = *offset;
-                    
-                    // This is a simplified writer (Supports i32/f32 for now - expand for others)
-                    // You can copy the logic from `mem_write_int` here but adapt for floats
-                    match val {
-                        DgnValue::Number(n) => {
-                            let remaining = b.len().saturating_sub(offset);
-                            let bytes = (*n as f32).to_ne_bytes();
+                        let struct_id_val = obj.get("__struct_id__").ok_or(DgnError::new("Not a struct (missing __struct_id__)", 0))?;
+                        let struct_name = val_to_string(struct_id_val);
                         
+                        let buffer_val = obj.get("__bytes__").ok_or(DgnError::new("Not a struct (missing __bytes__)", 0))?;
+                        let buffer = if let DgnValue::ByteArray(b) = buffer_val { b.clone() } else { return Err(DgnError::new("Invalid bytes", 0)); };
+
+                        let field_name = if let DgnValue::String(s) = &args[1] { s.clone() } else { val_to_string(&args[1]) };
+                        let val = args[2].clone();
+                        let structs = FFI_STRUCTS.lock().unwrap();
+                        let def = structs.get(&struct_name).ok_or(DgnError::new("Struct not defined", 0))?;
+                        
+                        let (_, offset, _) = def.fields.iter().find(|(n, _, _)| n == &field_name)
+                            .ok_or(DgnError::new("Field not found", 0))?;
+
+                        let mut b = buffer.lock().unwrap();
+                        let offset = *offset;
+                        
+                        // 2. CONVERT INT TO FLOAT FOR C-BUFFER
+                        if let Some(n) = val.as_number() {
+                            let remaining = b.len().saturating_sub(offset);
+                            let bytes = (n as f32).to_ne_bytes();
                             let write_len = std::cmp::min(4, remaining);
-                            
                             for i in 0..write_len {
                                 b[offset + i] = bytes[i];
                             }
-                        },
-                        _ => {}
-                    }
+                        }
 
-                    Ok(DgnValue::Null)
+                        // 3. CRITICAL: SYNC DICTIONARY FOR ffi.call PACKER
+                        // We force Number(1.0) instead of Int(1) so the FFI doesn't get confused
+                        let sync_val = if let Some(n) = val.as_number() { DgnValue::Number(n) } else { val };
+                        obj.insert(field_name, sync_val);
+
+                        Ok(DgnValue::Null)
                     }));
+                    
                     match result {
-                        Ok(val) => val,
-                        Err(_) => Err(DgnError::new("Dragon: Memory access violation in struct.set", 0))
+                        Ok(v) => v,
+                        Err(e) => Err(DgnError::new("Dragon: Memory access violation in struct.set", 0))
                     }
                 }));
 
@@ -4233,7 +5290,6 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
 
                 let b = buffer.lock().unwrap();
                 let offset = *offset;
-                
                 // Read based on type size (Simplified for basics, expand logic as needed)
                 // We look at the 'size' of the field type to decide how to read
                 // Note: You might want to match on 'type_info' specifically for cleaner code
@@ -4259,51 +5315,56 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
             #[cfg(not(target_arch = "wasm32"))]
              {
               map.insert("alloc".to_string(), native_fn(|args| {
-                    let size = args.get(0).and_then(|v| if let DgnValue::Number(n) = v { Some(*n as usize) } else { None }).unwrap_or(0);
+                    // FIX: Safely accept both Ints and Numbers for allocation size!
+                    let size = args.get(0).and_then(|v| v.as_int()).unwrap_or(0) as usize;
                     let vec = vec![0u8; size];
                     Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec))))
                 }));
 
                 // Add this inside the "mem" map insertions
-map.insert("read_ptr".to_string(), native_fn(|args| {
-    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-    
-    if ptr == 0 { return Ok(DgnValue::Null); }
-
-    unsafe {
-        // Read 8 bytes for a 64-bit pointer
-        let target_addr = (ptr + offset) as *const usize;
-        let val = *target_addr;
-        Ok(DgnValue::Number(val as f64))
-    }
-}));
-
-map.insert("read_float".to_string(), native_fn(|args| {
-    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-    
-    if ptr == 0 { return Ok(DgnValue::Null); }
-
-    unsafe {
-        // Read 4 bytes as a float (f32)
-        let target_addr = (ptr + offset) as *const f32;
-        let val = *target_addr;
-        Ok(DgnValue::Number(val as f64))
-    }
-}));
-
-map.insert("read_mem_int".to_string(), native_fn(|args| {
-                    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                map.insert("read_ptr".to_string(), native_fn(|args| {
+                    let ptr = args.get(0).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                    let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
                     
                     if ptr == 0 { return Ok(DgnValue::Null); }
-
                     unsafe {
-                        // Read 4 bytes as a 32-bit integer from raw memory
-                        let target_addr = (ptr + offset) as *const u32;
+                        let target_addr = (ptr + offset) as *const usize;
+                        let val = *target_addr;
+                        // Return pointers as true Integers to prevent 53-bit float corruption!
+                        Ok(DgnValue::Int(val as i64)) 
+                    }
+                }));
+
+map.insert("read_float".to_string(), native_fn(|args| {
+                    let ptr = args.get(0).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                    let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                    
+                    if ptr == 0 { return Ok(DgnValue::Null); }
+                    unsafe {
+                        let target_addr = (ptr + offset) as *const f32;
                         let val = *target_addr;
                         Ok(DgnValue::Number(val as f64))
+                    }
+                }));
+
+                map.insert("read_mem_int".to_string(), native_fn(|args| {
+                    let ptr = args.get(0).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                    let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                    
+                    if ptr == 0 { return Ok(DgnValue::Null); }
+                    unsafe {
+                        let target_addr = (ptr + offset) as *const u32;
+                        let val = *target_addr;
+                        Ok(DgnValue::Int(val as i64))
+                    }
+                }));
+                
+                map.insert("read_string".to_string(), native_fn(|args| {
+                    let ptr = args.get(0).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+                    if ptr == 0 { return Ok(DgnValue::Null); }
+                    unsafe {
+                        let c_str = std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char);
+                        Ok(DgnValue::String(c_str.to_string_lossy().into_owned()))
                     }
                 }));
 
@@ -4311,11 +5372,12 @@ map.insert("read_mem_int".to_string(), native_fn(|args| {
                     match args.get(0) {
                         Some(DgnValue::ByteArray(b)) => {
                             let ptr = b.lock().unwrap().as_ptr() as usize;
-                            Ok(DgnValue::Number(ptr as f64))
+                            // FIX: Return as true Int to prevent float precision loss!
+                            Ok(DgnValue::Int(ptr as i64)) 
                         },
                         Some(DgnValue::String(s)) => {
                             let ptr = s.as_ptr() as usize;
-                            Ok(DgnValue::Number(ptr as f64))
+                            Ok(DgnValue::Int(ptr as i64))
                         }
                         _ => Ok(DgnValue::Null)
                     }
@@ -4323,23 +5385,20 @@ map.insert("read_mem_int".to_string(), native_fn(|args| {
 
                 map.insert("read_int".to_string(), native_fn(|args| {
                     let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    let offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                     
                     let b = buffer.lock().unwrap();
                     if offset + 4 <= b.len() {
                         let bytes: [u8; 4] = b[offset..offset+4].try_into().unwrap();
                         let val = u32::from_ne_bytes(bytes); 
                         Ok(DgnValue::Number(val as f64))
-                    } else {
-                        Ok(DgnValue::Null)
-                    }
+                    } else { Ok(DgnValue::Null) }
                 }));
-
 
                 map.insert("write_int".to_string(), native_fn(|args| {
                     let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-                    let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u32 } else { 0 };
+                    let offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                    let val = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
 
                     let mut b = buffer.lock().unwrap();
                     if offset + 4 <= b.len() {
@@ -4349,41 +5408,26 @@ map.insert("read_mem_int".to_string(), native_fn(|args| {
                     Ok(DgnValue::Null)
                 }));
 
-
-                map.insert("read_string".to_string(), native_fn(|args| {
-                    let ptr = args.get(0).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
-                    
-                    if ptr == 0 { return Ok(DgnValue::Null); }
-
-                    unsafe {
-                        let c_str = std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char);
-                        Ok(DgnValue::String(c_str.to_string_lossy().into_owned()))
-                    }
-                }));
-
                 map.insert("read_byte".to_string(), native_fn(|args| {
                     let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
+                    let offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
                     
                     let b = buffer.lock().unwrap();
-                    if offset < b.len() {
-                        Ok(DgnValue::Number(b[offset] as f64))
-                    } else {
-                        Ok(DgnValue::Null)
-                    }
+                    if offset < b.len() { Ok(DgnValue::Number(b[offset] as f64)) } else { Ok(DgnValue::Null) }
                 }));
 
                 map.insert("write_byte".to_string(), native_fn(|args| {
                     let buffer = if let Some(DgnValue::ByteArray(b)) = args.get(0) { b } else { return Ok(DgnValue::Null); };
-                    let offset = if let Some(DgnValue::Number(n)) = args.get(1) { *n as usize } else { 0 };
-                    let val = if let Some(DgnValue::Number(n)) = args.get(2) { *n as u8 } else { 0 };
+                    let offset = args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
+                    let val = args.get(2).and_then(|v| v.as_number()).unwrap_or(0.0) as u8;
 
                     let mut b = buffer.lock().unwrap();
-                    if offset < b.len() {
-                        b[offset] = val;
-                    }
+                    if offset < b.len() { b[offset] = val; }
                     Ok(DgnValue::Null)
                 }));
+
+
+              
              }
             Some(DgnValue::Map(Arc::new(Mutex::new(map))))
          },
@@ -4454,8 +5498,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
     }));
 
 
-    e.set("sleep", native_fn(|args| { thread::sleep(Duration::from_secs_f64(if let Some(DgnValue::Number(n)) = args.get(0) { *n } else { 0.0 })); Ok(DgnValue::Null) }));
-
+    e.set("sleep", native_fn(|args| { thread::sleep(Duration::from_secs_f64(args.get(0).and_then(|a| a.as_number()).unwrap_or(0.0))); Ok(DgnValue::Null) }));
     e.set("hashmap", native_fn(|_| {
         let val = DgnValue::Map(Arc::new(Mutex::new(HashMap::new())));
         gc_register(&val);
@@ -4475,12 +5518,12 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
 
             e.set("bytes", native_fn(|args| {
             if let Some(DgnValue::List(l)) = args.get(0) {
-     
                 let list = l.lock().unwrap();
                 let mut vec = Vec::with_capacity(list.len());
                 for val in list.iter() {
-                    if let DgnValue::Number(n) = val {
-                        vec.push(*n as u8);
+                    // Support both int and number inside the list
+                    if let Some(n) = val.as_int() {
+                        vec.push(n as u8);
                     } else {
                         vec.push(0);
                     }
@@ -4488,12 +5531,91 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
                 Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec))))
             } else if let Some(DgnValue::String(s)) = args.get(0) {
                 Ok(DgnValue::ByteArray(Arc::new(Mutex::new(s.as_bytes().to_vec()))))
-            } else if let Some(DgnValue::Number(n)) = args.get(0) {
-                Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec![0; *n as usize]))))
+            } else if let Some(n) = args.get(0).and_then(|v| v.as_int()) { // FIX: Use as_int here
+                Ok(DgnValue::ByteArray(Arc::new(Mutex::new(vec![0; n as usize]))))
             } else {
                 Ok(DgnValue::ByteArray(Arc::new(Mutex::new(Vec::new()))))
             }
         }));
+
+
+        e.set("format", native_fn(|args| {
+        if args.is_empty() { return Ok(DgnValue::String(String::new())); }
+        let fmt_str = val_to_string(&args[0]);
+        let mut out = String::new();
+        let mut arg_idx = 1;
+        let mut chars = fmt_str.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '{' {
+                // Handle escaped {{
+                if let Some(&'{') = chars.peek() {
+                    chars.next(); out.push('{'); continue;
+                }
+                
+                let mut spec = String::new();
+                let mut closed = false;
+                for sc in chars.by_ref() {
+                    if sc == '}' { closed = true; break; }
+                    spec.push(sc);
+                }
+                
+                if !closed { return Err(DgnError::new("Unclosed '{' in format string", 0)); }
+                
+                // Get the argument, default to null if missing
+                let arg = args.get(arg_idx).unwrap_or(&DgnValue::Null);
+                arg_idx += 1;
+                
+                if spec.is_empty() {
+                    out.push_str(&val_to_string(arg));
+                } else if spec.starts_with(':') {
+                    let rule = &spec[1..]; 
+                    
+                    if rule.ends_with('f') && rule.starts_with('.') { 
+                        // Float Precision: {:.2f}
+                        if let Ok(prec) = rule[1..rule.len()-1].parse::<usize>() {
+                            if let Some(n) = arg.as_number() {
+                                out.push_str(&format!("{:.*}", prec, n));
+                            } else { out.push_str(&val_to_string(arg)); }
+                        } else { out.push_str(&val_to_string(arg)); }
+                    } else if rule.starts_with('>') { 
+                        // Right Align: {:>10}
+                        if let Ok(width) = rule[1..].parse::<usize>() {
+                            let s = val_to_string(arg);
+                            if s.len() < width { out.push_str(&" ".repeat(width - s.len())); }
+                            out.push_str(&s);
+                        }
+                    } else if rule.starts_with('<') { 
+                        // Left Align: {:<10}
+                        if let Ok(width) = rule[1..].parse::<usize>() {
+                            let s = val_to_string(arg);
+                            out.push_str(&s);
+                            if s.len() < width { out.push_str(&" ".repeat(width - s.len())); }
+                        }
+                    } else if rule.starts_with('0') { 
+                        // Zero Padding: {:05}
+                        if let Ok(width) = rule.parse::<usize>() {
+                            let s = val_to_string(arg);
+                            if s.len() < width { out.push_str(&"0".repeat(width - s.len())); }
+                            out.push_str(&s);
+                        }
+                    } else { 
+                        // Unknown format, fallback to standard string
+                        out.push_str(&val_to_string(arg)); 
+                    }
+                } else { out.push_str(&val_to_string(arg)); }
+                
+            } else if c == '}' {
+                // Handle escaped }}
+                if let Some(&'}') = chars.peek() {
+                    chars.next(); out.push('}');
+                } else { return Err(DgnError::new("Unmatched '}' in format string", 0)); }
+            } else { 
+                out.push(c); 
+            }
+        }
+        Ok(DgnValue::String(out))
+    }));
 
      e.set("typeof", native_fn(|args| {
         let val = args.get(0).unwrap_or(&DgnValue::Null);
@@ -4501,6 +5623,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
             DgnValue::Null => "null",
             DgnValue::Bool(_) => "bool",
             DgnValue::Number(_) => "number",
+            DgnValue::Int(_) => "int",
             DgnValue::String(_) => "string",
             DgnValue::List(_) => "list",
             DgnValue::Map(_) => "map",
@@ -4521,25 +5644,37 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
 
 
      e.set("int", native_fn(|args| {
-        match args.get(0) {
-            Some(DgnValue::Number(n)) => Ok(DgnValue::Number(n.trunc())),
-            Some(DgnValue::String(s)) => {
-                match s.parse::<f64>() {
-                    Ok(n) => Ok(DgnValue::Number(n.trunc())),
-                    Err(_) => Ok(DgnValue::Null)
-                }
-            },
-            Some(DgnValue::Bool(b)) => Ok(DgnValue::Number(if *b { 1.0 } else { 0.0 })),
-            _ => Ok(DgnValue::Null)
+        if let Some(n) = args.get(0).and_then(|a| a.as_number()) {
+            return Ok(DgnValue::Int(n.trunc() as i64)); // Now explicitly returns Int!
         }
+        if let Some(DgnValue::String(s)) = args.get(0) {
+            if let Ok(n) = s.parse::<f64>() { return Ok(DgnValue::Int(n.trunc() as i64)); }
+        }
+        if let Some(DgnValue::Bool(b)) = args.get(0) {
+            return Ok(DgnValue::Int(if *b { 1 } else { 0 }));
+        }
+        Ok(DgnValue::Null)
     }));
 
-     e.set("float", native_fn(|args| {
-        match args.get(0) {
-            Some(DgnValue::Number(n)) => Ok(DgnValue::Number(*n)),
-            Some(DgnValue::String(s)) => Ok(DgnValue::Number(s.parse().unwrap_or(0.0))),
-            _ => Ok(DgnValue::Null)
+        e.set("float", native_fn(|args| {
+            if let Some(val) = args.get(0) {
+                if let Some(n) = val.as_number() {
+                    return Ok(DgnValue::Number(n));
+                }
+                if let DgnValue::String(s) = val {
+                    return Ok(DgnValue::Number(s.parse().unwrap_or(0.0)));
+                }
+            }
+            Ok(DgnValue::Null)
+        }));
+
+    e.set("chr", native_fn(|args| {
+        if let Some(n) = args.get(0).and_then(|a| a.as_number()) {
+            if let Some(c) = std::char::from_u32(n as u32) {
+                return Ok(DgnValue::String(c.to_string()));
+            }
         }
+        Ok(DgnValue::Null)
     }));
 
      e.set("str", native_fn(|args| {
@@ -4558,14 +5693,6 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
     }));
 
 
-    e.set("chr", native_fn(|args| {
-        if let Some(DgnValue::Number(n)) = args.get(0) {
-            if let Some(c) = std::char::from_u32(*n as u32) {
-                return Ok(DgnValue::String(c.to_string()));
-            }
-        }
-        Ok(DgnValue::Null)
-    }));
 
     e.set("ord", native_fn(|args| {
         if let Some(DgnValue::String(s)) = args.get(0) {
@@ -4639,12 +5766,8 @@ pub fn check_for_bundle(exe_path: &Path) -> Option<String> {
     if file.read_exact(&mut script_buf).is_err() { return None; }
 
 
-    let key = get_key(); 
-    for (i, b) in script_buf.iter_mut().enumerate() {
-        *b ^= key[i % key.len()];
-    }
-
-    Some(String::from_utf8_lossy(&script_buf).to_string())
+    let decrypted = decrypt_payload(&script_buf)?;
+    String::from_utf8(decrypted).ok()
 }
 
 pub fn gather_sources(path: &Path, sources: &mut HashMap<String, String>, is_root: bool) -> Result<(), String> {
@@ -4741,9 +5864,18 @@ impl Linter {
         };
         l.enter_scope();
         let builtins = vec![
-            "show", "showln", "readln", "exit", "time_now", "sleep", 
-            "hashmap", "list", "regex", "bytes", "typeof", "int", "float", "str", "len",  "chr", "ord", "parse_int", "parse_float", "gc","argv",
-         "alert"
+            // I/O
+            "show", "showln", "readln",
+            // Control
+            "exit", "sleep",
+            // Type conversions
+            "int", "float", "str", "bool", "chr", "ord", "parse_int", "parse_float", "typeof",
+            // Collections
+            "hashmap", "list", "bytes", "len",
+            // Utilities
+            "time_now", "gc", "format", "regex",
+            // Runtime globals
+            "argv", "PI", "E",
         ];
         for b in builtins {
             l.define(b, "built-in function", true);
@@ -4818,6 +5950,11 @@ impl Linter {
                 
                 self.exit_scope();
             },
+            StmtNode::Multi(stmts) => {
+                for s in stmts {
+                    self.check_stmt(s); 
+                }
+            }
             StmtNode::Expr(e) | StmtNode::Return(Some(e)) | StmtNode::Raise(e) => {
                 self.check_expr(e);
             },
@@ -4853,7 +5990,10 @@ impl Linter {
             StmtNode::FuncDef(name, params, _req_params, body, _is_async) => {
                 self.define(name, "function", false);
                 self.enter_scope();
-                for p in params { self.define(p, "variable", false); }
+                for (p, _) in params {
+                    let clean = p.strip_prefix("...").unwrap_or(p.as_str());
+                    self.define(clean, "variable", false);
+                }
                 self.check_stmt(body);
                 self.exit_scope();
             },
@@ -4863,6 +6003,9 @@ impl Linter {
                 self.define("this", "keyword", true); 
                 self.check_stmt(body);
                 self.exit_scope();
+            },
+            StmtNode::Augment(_, methods) => {  // <-- ADD THIS
+                for m in methods { self.check_stmt(m); }
             },
             StmtNode::ConstDecl(name, expr) => {
                 self.check_expr(expr);
@@ -4931,9 +6074,13 @@ impl Linter {
             ExprNode::Obj(props) => { for (_, v) in props { self.check_expr(v); } },
             ExprNode::Index(obj, idx) => { self.check_expr(obj); self.check_expr(idx); },
             ExprNode::GetAttr(obj, _) => self.check_expr(obj),
+            ExprNode::OptionalGetAttr(obj, _) => self.check_expr(obj),
             ExprNode::FuncExpr(params, _req_params, body) => {
                 self.enter_scope();
-                for p in params { self.define(p, "variable", false); }
+                for (p, _) in params {
+                        let clean = p.strip_prefix("...").unwrap_or(p.as_str());
+                        self.define(clean, "variable", false);
+                    }
                 self.check_stmt(body);
                 self.exit_scope();
             },
@@ -4961,23 +6108,68 @@ pub fn lint_ast(ast: &Stmt) -> LintReport {
     linter.report
 }
 
-pub fn get_key() -> Vec<u8> {
+// pub fn get_key() -> Vec<u8> {
 
-    let mut key = Vec::new();
+//     let mut key = Vec::new();
 
-    key.push(68);  
-    key.push(82);  
-    key.push(65);  
-    key.push(71); 
-    key.push(79); 
-    key.push(78); 
-    key.push(95); 
-    key.push(50);  
-    key.push(48);  
-    key.push(50);  
-    key.push(54); 
+//     key.push(68);  
+//     key.push(82);  
+//     key.push(65);  
+//     key.push(71); 
+//     key.push(79); 
+//     key.push(78); 
+//     key.push(95); 
+//     key.push(50);  
+//     key.push(48);  
+//     key.push(50);  
+//     key.push(54); 
     
-    key.push(10+20);
+//     key.push(10+20);
 
-    key
+//     key
+// }
+
+
+// engine.rs — replace get_key() and add these helpers
+
+
+
+// Hardcoded key — 32 bytes (256-bit). Change this to your own random bytes.
+// Generate with: python3 -c "import secrets; print(list(secrets.token_bytes(32)))"
+const AES_KEY: &[u8; 32] = &[
+    0x4A, 0x7F, 0x3C, 0x91, 0xB2, 0x5E, 0xD8, 0x0F,
+    0x6A, 0xC3, 0x17, 0xEE, 0x84, 0x29, 0x5B, 0xF0,
+    0x73, 0xA1, 0x9D, 0x46, 0x2C, 0x88, 0xF5, 0x1B,
+    0xE7, 0x60, 0x3A, 0xD4, 0x9E, 0x52, 0xC7, 0x08,
+];
+
+pub fn encrypt_payload(plaintext: &[u8]) -> Vec<u8> {
+    let key = Key::<Aes256Gcm>::from_slice(AES_KEY);
+    let cipher = Aes256Gcm::new(key);
+
+    // Random 12-byte nonce
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plaintext)
+        .expect("AES-GCM encryption failed");
+
+    // Format: [12-byte nonce] + [ciphertext + 16-byte auth tag]
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+pub fn decrypt_payload(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 12 + 16 { return None; } // nonce + min auth tag
+
+    let key = Key::<Aes256Gcm>::from_slice(AES_KEY);
+    let cipher = Aes256Gcm::new(key);
+
+    let nonce = Nonce::from_slice(&data[..12]);
+    let ciphertext = &data[12..];
+
+    cipher.decrypt(nonce, ciphertext).ok()
 }

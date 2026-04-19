@@ -1,5 +1,8 @@
 mod engine;
+// mod aot_compiler;
 use engine::*;
+// use engine::{Chunk, Compiler, Instruction, lint_ast, lex, Parser};
+// use aot_compiler::*;
 
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap};
@@ -9,8 +12,9 @@ use std::io::{Write, Read, Seek, SeekFrom};
 use std::env;
 use std::panic;
 
-const DGN_VERSION: &str = "Dragon Programming Language v1.0.3";
-const DGN_BUILD: &str = "Build 2026-02-22"; 
+macro_rules! VERSION { () => { "1.0.4" } }
+const DGN_VERSION: &str = concat!("Dragon Programming Language v", VERSION!());
+const DGN_BUILD: &str = "Build 2026-04-03"; 
 const DGN_AUTHOR: &str = "Aavesh Jilani";
 fn main() {
     panic::set_hook(Box::new(|info| {
@@ -47,7 +51,13 @@ fn main() {
         let _ = env.lock().unwrap().set("argv", DgnValue::List(Arc::new(Mutex::new(argv_list))));
 
         let entry = sources.get("__entry__").unwrap();
-        let tokens = lex(entry);
+        let tokens = match lex(entry) {
+            Ok(t) => t,
+            Err(e) => { 
+                eprintln!("Syntax Error: {}", e.with_source(entry).format_pretty()); 
+                std::process::exit(1); 
+            }
+        };
         let mut parser = Parser::new(tokens);
         match parser.parse() {
             Ok(ast) => {
@@ -60,7 +70,7 @@ fn main() {
                     let mut vm = Vm::new();
                     vm.run(&chunk, env.clone()).await.map(|_| ())
                 }) {
-                    eprintln!("Runtime Error: {} at line {}", e.msg, e.line);
+                    eprintln!("{}", e.with_source(entry).format_pretty());
                     std::process::exit(1);
                 }
             },
@@ -86,7 +96,7 @@ fn main() {
         println!("  dragon -c <in> -o <out>           Compile script to Executable");
         println!("  dragon -c <in> -o <out> --window  Compile script to run in background (No Console)");
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
-        println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
+        // println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("  dragon -v, --version              Show version information");
         println!("");
         return;
@@ -139,13 +149,11 @@ fn main() {
         }
 
         let payload = serde_json::to_string(&sources).expect("Serialization failed");
-        let mut payload_bytes = payload.into_bytes();
-        let payload_len = payload_bytes.len() as u64;
+        // let mut payload_bytes = payload.into_bytes();
+        // let payload_len = payload_bytes.len() as u64;
 
-        let key = get_key();
-        for (i, b) in payload_bytes.iter_mut().enumerate() {
-            *b ^= key[i % key.len()];
-        }
+        let payload_bytes = encrypt_payload(payload.as_bytes());
+        let payload_len = payload_bytes.len() as u64;
 
         // 3. Copy Template -> Destination
         println!("Installing Engine to: {:?}", output_so);
@@ -182,6 +190,7 @@ fn main() {
         let input_path = Path::new(&args[2]);
         let output_path = Path::new(&args[4]);
         let is_lib_mode = args.contains(&"--lib".to_string());
+        let is_aot_mode = args.contains(&"--aot".to_string());
         let is_web_mode = args.contains(&"--web".to_string());
         let is_window_mode = args.contains(&"--window".to_string());
         println!("Compiling {}...", input_path.display());
@@ -196,16 +205,186 @@ fn main() {
         
        let payload = serde_json::to_string(&sources).expect("Failed to serialize bundle");
         
-        let mut payload_bytes = payload.into_bytes();
+        let payload_bytes = encrypt_payload(payload.as_bytes());
         let payload_len = payload_bytes.len() as u64;
+//         if is_aot_mode {
+//             // ── AOT path ──────────────────────────────────────────────────
+//             println!("Compiling {} (AOT mode)...", input_path.display());
 
-        let key = get_key();
-        println!("Encrypting {} bytes...", payload_len);
-        for (i, b) in payload_bytes.iter_mut().enumerate() {
-            *b ^= key[i % key.len()];
-        }
+//             let src = match fs::read_to_string(input_path) {
+//                 Ok(s) => s,
+//                 Err(e) => { eprintln!("Error reading {}: {}", input_path.display(), e); std::process::exit(1); }
+//             };
 
-        if is_lib_mode {
+//             let tokens = lex(&src);
+//             let mut parser = Parser::new(tokens);
+//             let ast = match parser.parse() {
+//                 Ok(a) => a,
+//                 Err(e) => { eprintln!("Parse Error: {}", e); std::process::exit(1); }
+//             };
+
+//             // Lint first
+//             let report = lint_ast(&ast);
+//             if !report.is_clean() {
+//                 report.print();
+//                 if !report.errors.is_empty() { std::process::exit(1); }
+//             }
+
+//             // Compile AST → bytecode Chunk (reuse existing compiler)
+//             let mut chunk = Chunk::new();
+//             Compiler::compile_stmt(&mut chunk, &ast);
+//             chunk.emit(Instruction::Halt, 0);
+
+//             // Compile Chunk → .o via Cranelift
+//             let obj_path = output_path.with_extension("o");
+//             if let Err(e) = aot_compiler::compile_to_object(&chunk, &obj_path) {
+//                 eprintln!("AOT Compile Error: {}", e);
+//                 std::process::exit(1);
+//             }
+
+//             // Link: .o + dragon_runtime.a → final binary
+//             println!("Linking {}...", output_path.display());
+//          let link_status = if cfg!(target_os = "windows") {
+//     // ── Compile the C shim if the .obj is not already present ─────────
+//     // (Do this once; skip if already built)
+//     let shim_obj = std::path::Path::new("aot_main_shim.obj");
+//     if !shim_obj.exists() {
+//         let shim_c = std::path::Path::new("aot_main_shim.c");
+//         if shim_c.exists() {
+//             let status = std::process::Command::new("cl")
+//                 .args(["/c", "/MT", "aot_main_shim.c", "/Fo:aot_main_shim.obj"])
+//                 .status();
+//             if !matches!(status, Ok(s) if s.success()) {
+//                 eprintln!("AOT: Failed to compile aot_main_shim.c");
+//                 std::process::exit(1);
+//             }
+//         } else {
+//             eprintln!("AOT: aot_main_shim.c not found — cannot build entry point");
+//             eprintln!("     Place aot_main_shim.c in the same directory as dragon.exe");
+//             std::process::exit(1);
+//         }
+//     }
+
+//     if is_lib_mode {
+//         // ── Windows DLL ───────────────────────────────────────────────
+//         std::process::Command::new("cl")
+//             .args([
+//                 "/LD",                               // build a DLL
+//                 "/MT",                               // static CRT (no DLL dependency)
+//                 obj_path.to_str().unwrap(),          // user's .o from Cranelift
+//                 "dragon_runtime.lib",
+//                 &format!("/Fe:{}", output_path.to_str().unwrap()),
+//                 "/link",
+//                 "ws2_32.lib", "user32.lib", "advapi32.lib",
+//                 "bcrypt.lib", "ntdll.lib", "kernel32.lib",
+//                 "shell32.lib", "ole32.lib",
+//             ])
+//             .status()
+//     } else {
+//         // ── Windows EXE ───────────────────────────────────────────────
+//         std::process::Command::new("cl")
+//             .args([
+//                 "/MT",                               // static CRT — provides:
+//                                                      //   mainCRTStartup, memcpy,
+//                                                      //   memmove, memset, fmod,
+//                                                      //   __chkstk, __CxxFrameHandler3
+//                 obj_path.to_str().unwrap(),          // user's Cranelift .o
+//                 "aot_main_shim.obj",                 // C entry point (not Rust)
+//                 "dragon_runtime.lib",                // static runtime
+//                 &format!("/Fe:{}", output_path.to_str().unwrap()),
+//                 "/link",
+//                 // Windows system libs (cover all __imp_* symbols)
+//                 "ws2_32.lib",    // sockets
+//                 "user32.lib",    // UI / console
+//                 "advapi32.lib",  // registry / security
+//                 "bcrypt.lib",    // crypto
+//                 "ntdll.lib",     // NT internals
+//                 "kernel32.lib",  // HeapAlloc/Free/ReAlloc, GetProcess*, etc.
+//                 "shell32.lib",
+//                 "ole32.lib",
+//                 "/SUBSYSTEM:CONSOLE",
+//                 "/ENTRY:mainCRTStartup",
+//             ])
+//             .status()
+//     }
+// } else if cfg!(target_os = "macos") {
+//     // ── macOS ─────────────────────────────────────────────────────────
+//     if is_lib_mode {
+//         std::process::Command::new("cc")
+//             .args([
+//                 "-dynamiclib",
+//                 obj_path.to_str().unwrap(),
+//                 "aot_main_shim.o",
+//                 "-L.", "-ldragon_runtime",
+//                 "-lpthread", "-ldl", "-lm",
+//                 "-o", output_path.to_str().unwrap(),
+//             ])
+//             .status()
+//     } else {
+//         std::process::Command::new("cc")
+//             .args([
+//                 obj_path.to_str().unwrap(),
+//                 "aot_main_shim.o",
+//                 "-L.", "-ldragon_runtime",
+//                 "-lpthread", "-ldl", "-lm",
+//                 "-o", output_path.to_str().unwrap(),
+//             ])
+//             .status()
+//     }
+// } else {
+//     // ── Linux ─────────────────────────────────────────────────────────
+//     if is_lib_mode {
+//         std::process::Command::new("cc")
+//             .args([
+//                 "-shared", "-fPIC",
+//                 obj_path.to_str().unwrap(),
+//                 "-L.", "-ldragon_runtime",
+//                 "-lpthread", "-ldl", "-lm",
+//                 "-o", output_path.to_str().unwrap(),
+//             ])
+//             .status()
+//     } else {
+//         std::process::Command::new("cc")
+//             .args([
+//                 obj_path.to_str().unwrap(),
+//                 "aot_main_shim.o",
+//                 "-L.", "-ldragon_runtime",
+//                 "-lpthread", "-ldl", "-lm",
+//                 "-o", output_path.to_str().unwrap(),
+//             ])
+//             .status()
+//     }
+// };
+
+//             match link_status {
+//                 Ok(s) if s.success() => {
+//                     println!("Success! AOT binary: {}", output_path.display());
+//                     // Clean up intermediate .o
+//                     let _ = fs::remove_file(&obj_path);
+//                 }
+//                 Ok(s) => {
+//                     eprintln!("Linker exited with status {}", s);
+//                     std::process::exit(1);
+//                 }
+//                 Err(e) => {
+//                     eprintln!("Linker error: {}", e);
+//                     std::process::exit(1);
+//                 }
+//             }
+
+//             #[cfg(unix)]
+//             {
+//                 use std::os::unix::fs::PermissionsExt;
+//                 if let Ok(meta) = fs::metadata(output_path) {
+//                     let mut perms = meta.permissions();
+//                     perms.set_mode(0o755);
+//                     let _ = fs::set_permissions(output_path, perms);
+//                 }
+//             }
+//             return;
+//         }
+
+       if is_lib_mode {
             let mut template_dir = exe_path.parent().unwrap().to_path_buf();
 
             let out_name = output_path.file_name().unwrap().to_string_lossy();
@@ -228,95 +407,93 @@ fn main() {
             fs::copy(&template, output_path).expect("Copy failed");
             println!("Created Shared Library: {:?}", output_path);
         } 
-      else if is_web_mode {
-        println!("Compiling for Web Assembly (Protected Mode)...");
+//       else if is_web_mode {
+//         println!("Compiling for Web Assembly (Protected Mode)...");
 
-        let template_dir = exe_path.parent().unwrap();
-        let wasm_file = template_dir.join("dragon_lib_bg.wasm");
-        let js_file = template_dir.join("dragon_lib.js");
+//         let template_dir = exe_path.parent().unwrap();
+//         let wasm_file = template_dir.join("dragon_lib_bg.wasm");
+//         let js_file = template_dir.join("dragon_lib.js");
 
-        if !wasm_file.exists() || !js_file.exists() {
-             println!("Error: WASM templates not found.");
-             println!("Please build 'dragon_template' target wasm32-unknown-unknown and place .wasm and .js here.");
-             return;
-        }
+//         if !wasm_file.exists() || !js_file.exists() {
+//              println!("Error: WASM templates not found.");
+//              println!("Please build 'dragon_template' target wasm32-unknown-unknown and place .wasm and .js here.");
+//              return;
+//         }
 
-        let out_dir = output_path.with_extension(""); 
-        fs::create_dir_all(&out_dir).expect("Failed to create output dir");
+//         let out_dir = output_path.with_extension(""); 
+//         fs::create_dir_all(&out_dir).expect("Failed to create output dir");
 
-        fs::copy(&wasm_file, out_dir.join("dragon_lib_bg.wasm")).unwrap();
-        fs::copy(&js_file, out_dir.join("dragon.js")).unwrap();
+//         fs::copy(&wasm_file, out_dir.join("dragon_lib_bg.wasm")).unwrap();
+//         fs::copy(&js_file, out_dir.join("dragon.js")).unwrap();
 
-        // 1. Gather Sources
-        let mut sources = HashMap::new();
-        if let Err(e) = gather_sources(input_path, &mut sources, true) {
-             eprintln!("Error gathering sources: {}", e);
-             return;
-        }
+//         // 1. Gather Sources
+//         let mut sources = HashMap::new();
+//         if let Err(e) = gather_sources(input_path, &mut sources, true) {
+//              eprintln!("Error gathering sources: {}", e);
+//              return;
+//         }
 
-        // 2. Serialize to JSON
-        let payload_json = serde_json::to_string(&sources).expect("Failed to serialize");
-        let mut payload_bytes = payload_json.into_bytes();
+//         // 2. Serialize to JSON
+//         let payload_json = serde_json::to_string(&sources).expect("Failed to serialize");
+//         // let mut payload_bytes = payload_json.into_bytes();
 
-        // 3. Encrypt (XOR) - Same logic as Native
-        let key = get_key();
-        for (i, b) in payload_bytes.iter_mut().enumerate() {
-            *b ^= key[i % key.len()];
-        }
+//         // 3. Encrypt (XOR) - Same logic as Native
+//         let payload_bytes = encrypt_payload(payload_json.as_bytes());
+// let payload_len = payload_bytes.len() as u64;
 
-        // 4. Encode to Base64 (Safe for embedding in HTML string)
-        use base64::{Engine as _, engine::general_purpose};
-        let protected_payload = general_purpose::STANDARD.encode(&payload_bytes);
+//         // 4. Encode to Base64 (Safe for embedding in HTML string)
+//         use base64::{Engine as _, engine::general_purpose};
+//         let protected_payload = general_purpose::STANDARD.encode(&payload_bytes);
 
-        // 5. Generate HTML with Protected Payload
-        // Note: We now import `dragon_run_encrypted` instead of `dragon_run_wasm`
-        let html_content = format!(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Dragon App</title>
-    <style>
-        body {{ font-family: monospace; background: #222; color: #eee; padding: 20px; }}
-        #console {{ white-space: pre-wrap; }}
-    </style>
-</head>
-<body>
-    <h1>Dragon Output</h1>
-    <div id="console">Initializing System...</div>
-    <script type="module">
-        import init, {{ dragon_run_wasm }} from './dragon.js';
+//         // 5. Generate HTML with Protected Payload
+//         // Note: We now import `dragon_run_encrypted` instead of `dragon_run_wasm`
+//         let html_content = format!(r#"
+// <!DOCTYPE html>
+// <html>
+// <head>
+//     <meta charset="utf-8">
+//     <title>Dragon App</title>
+//     <style>
+//         body {{ font-family: monospace; background: #222; color: #eee; padding: 20px; }}
+//         #console {{ white-space: pre-wrap; }}
+//     </style>
+// </head>
+// <body>
+//     <h1>Dragon Output</h1>
+//     <div id="console">Initializing System...</div>
+//     <script type="module">
+//         import init, {{ dragon_run_wasm }} from './dragon.js';
 
-        async function run() {{
-            await init();
-            const outputDiv = document.getElementById("console");
+//         async function run() {{
+//             await init();
+//             const outputDiv = document.getElementById("console");
             
-            const oldLog = console.log;
-            console.log = (msg) => {{
-                outputDiv.innerText += msg + "\n";
-                oldLog(msg);
-            }};
+//             const oldLog = console.log;
+//             console.log = (msg) => {{
+//                 outputDiv.innerText += msg + "\n";
+//                 oldLog(msg);
+//             }};
 
-            const payload = "{}";
+//             const payload = "{}";
 
-            outputDiv.innerText = "> System Ready. Executing...\n";
-            try {{
-                const result = dragon_run_wasm(payload);
-                outputDiv.innerText += "\n[" + result + "]";
-            }} catch(e) {{
-                outputDiv.innerText += "\n[WASM Error: " + e + "]";
-            }}
-        }}
-        run();
-    </script>
-</body>
-</html>
-"#, protected_payload);
+//             outputDiv.innerText = "> System Ready. Executing...\n";
+//             try {{
+//                 const result = dragon_run_wasm(payload);
+//                 outputDiv.innerText += "\n[" + result + "]";
+//             }} catch(e) {{
+//                 outputDiv.innerText += "\n[WASM Error: " + e + "]";
+//             }}
+//         }}
+//         run();
+//     </script>
+// </body>
+// </html>
+// "#, protected_payload);
 
-        fs::write(out_dir.join("index.html"), html_content).unwrap();
-        println!("Success! Protected Web bundle created at: {:?}", out_dir);
-        return;
-    }
+//         fs::write(out_dir.join("index.html"), html_content).unwrap();
+//         println!("Success! Protected Web bundle created at: {:?}", out_dir);
+//         return;
+//     }
         else {
             fs::copy(&exe_path, output_path).expect("Copy failed");
             println!("Created Executable: {:?}", output_path);
@@ -350,7 +527,7 @@ fn main() {
     }
 
     if command == "--repl" {
-        println!("Dragon v1.0.0");
+        println!("Dragon version {} REPL", VERSION!());
         println!("Type 'exit' to quit.");
 
         let env = Arc::new(Mutex::new(Env::new(None, None)));
@@ -360,6 +537,7 @@ fn main() {
         // The REPL shares one persistent VM so variables defined in one line
         // are visible in the next — the env acts as the persistent scope.
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut repl_vm = Vm::new();
 
         loop {
             print!("> ");
@@ -368,7 +546,13 @@ fn main() {
             if std::io::stdin().read_line(&mut line).unwrap() == 0 { break; }
             if line.trim() == "exit" { break; }
 
-            let tokens = lex(&line);
+            let tokens = match lex(&line) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("Syntax Error: {} at line {}, col {}", e.msg, e.line, e.col);
+                    continue;
+                }
+            };
             let mut parser = Parser::new(tokens);
             match parser.parse_stmt() {
                 Ok(ast) => {
@@ -377,8 +561,7 @@ fn main() {
                     chunk.emit(Instruction::Halt, 0);
 
                     let result = rt.block_on(async {
-                        let mut vm = Vm::new();
-                        vm.run(&chunk, env.clone()).await
+                        repl_vm.run(&chunk, env.clone()).await
                     });
 
                     match result {
@@ -434,7 +617,13 @@ fn main() {
             for a in args.iter().skip(2) { argv_list.push(DgnValue::String(a.clone())); }
             let _ = env.lock().unwrap().set("argv", DgnValue::List(Arc::new(Mutex::new(argv_list))));
 
-            let tokens = lex(&src);
+            let tokens = match lex(&src) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Syntax Error: {}", e.with_source(&src).format_pretty());
+                    std::process::exit(1);
+                }
+            };
             let mut parser = Parser::new(tokens);
             match parser.parse() {
                 Ok(ast) => {
@@ -455,7 +644,7 @@ fn main() {
                         let mut vm = Vm::new();
                         vm.run(&chunk, env.clone()).await.map(|_| ())
                     }) {
-                        eprintln!("Runtime Error: {} at line {}", e.msg, e.line);
+                        eprintln!("{}", e.with_source(&src).format_pretty());
                         std::process::exit(1);
                     }
                 },
@@ -469,26 +658,26 @@ fn main() {
     }
 }
 
-fn get_key() -> Vec<u8> {
+// fn get_key() -> Vec<u8> {
 
-    let mut key = Vec::new();
+//     let mut key = Vec::new();
 
-    key.push(68);  
-    key.push(82);  
-    key.push(65);  
-    key.push(71); 
-    key.push(79); 
-    key.push(78); 
-    key.push(95); 
-    key.push(50);  
-    key.push(48);  
-    key.push(50);  
-    key.push(54); 
+//     key.push(68);  
+//     key.push(82);  
+//     key.push(65);  
+//     key.push(71); 
+//     key.push(79); 
+//     key.push(78); 
+//     key.push(95); 
+//     key.push(50);  
+//     key.push(48);  
+//     key.push(50);  
+//     key.push(54); 
     
-    key.push(10+20);
+//     key.push(10+20);
 
-    key
-}
+//     key
+// }
 
 fn hide_windows_console(path: &Path) -> std::io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
