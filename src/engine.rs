@@ -4136,6 +4136,7 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     DgnValue::Number(n) => serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
                     DgnValue::String(s) => serde_json::Value::String(s.clone()),
                     DgnValue::List(l) => serde_json::Value::Array(l.lock().unwrap().iter().map(dgn_to_json).collect()),
+                    DgnValue::Int(n) => serde_json::Value::Number((*n).into()), 
                     DgnValue::Map(m) | DgnValue::Instance(m) => {
                         let mut map = serde_json::Map::new();
                         for (k, v) in m.lock().unwrap().iter() { map.insert(k.clone(), dgn_to_json(v)); }
@@ -4442,6 +4443,13 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                                 map1.insert("body".to_string(), DgnValue::String(text));
                                 Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
                             },
+                             Err(ureq::Error::Status(code, resp)) => {
+                                let text = resp.into_string().unwrap_or_default();
+                                let mut map1 = HashMap::new();
+                                map1.insert("status".to_string(), DgnValue::Number(code as f64));
+                                map1.insert("body".to_string(), DgnValue::String(text));
+                                Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                            },
                             Err(e) => Err(DgnError::new(&format!("HTTP Request failed: {}", e), 0))
                         }
                     }))
@@ -4471,6 +4479,13 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                                 let text = resp.into_string().unwrap_or_default();
                                 let mut map1 = HashMap::new();
                                 map1.insert("status".to_string(), DgnValue::Number(status as f64));
+                                map1.insert("body".to_string(), DgnValue::String(text));
+                                Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
+                            },
+                             Err(ureq::Error::Status(code, resp)) => {
+                                let text = resp.into_string().unwrap_or_default();
+                                let mut map1 = HashMap::new();
+                                map1.insert("status".to_string(), DgnValue::Number(code as f64));
                                 map1.insert("body".to_string(), DgnValue::String(text));
                                 Ok(DgnValue::Map(Arc::new(Mutex::new(map1))))
                             },
@@ -4560,7 +4575,7 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                     map.insert("start_http_server".to_string(), native_fn(|args| {
                     let port = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u16 } else { 8080 };
                     let handler = args.get(1).cloned().ok_or(DgnError::new("Handler required", 0))?;
-                    
+                    let rt_handle = tokio::runtime::Handle::current();  
                     thread::spawn(move || {
                         let server = match Server::http(format!("0.0.0.0:{}", port)) {
                             Ok(s) => s,
@@ -4622,7 +4637,7 @@ fn build_builtin_module(name: &str) -> Option<DgnValue> {
                             }));
 
                             let handler_clone = handler.clone();
-                            rt.spawn(async move {
+                            rt_handle.spawn(async move {  
                                 let _ = call_dgn_func(handler_clone, vec![req_obj, DgnValue::Map(res_map)]).await;
                             });
                         }
