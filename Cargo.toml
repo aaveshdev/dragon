@@ -48,6 +48,13 @@ tokio = { version = "1.35", default-features = false, features = [
 ] }
 async-recursion = "1.0"
 futures = "0.3" # Helps with promise state sharing
+
+roxmltree = "0.20"
+ttf-parser = "0.25"
+fontdb = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+flate2 = "1"
+
 #cranelift-codegen  = { version = "0.113", features = ["x86", "arm64"] }
 #cranelift-frontend = "0.113"
 #cranelift-module   = "0.113"
