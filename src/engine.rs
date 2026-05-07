@@ -5715,7 +5715,7 @@ let widths = compute_widths(data, upem);
             }));
 
             map.insert("sleep_ms".to_string(), native_fn(|args| {
-                let ms = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u64 } else { 0 };
+               let ms = args.get(0).and_then(|v| v.as_number()).map(|n| n as u64).unwrap_or(0);
                 thread::sleep(Duration::from_millis(ms));
                 Ok(DgnValue::Null)
             }));
@@ -5870,9 +5870,8 @@ let widths = compute_widths(data, upem);
                 }));
 
                     map.insert("start_http_server".to_string(), native_fn(|args| {
-                    let port = if let Some(DgnValue::Number(n)) = args.get(0) { *n as u16 } else { 8080 };
+                    let port = args.get(0).and_then(|v| v.as_number()).map(|n| n as u16).unwrap_or(8080);
                     let handler = args.get(1).cloned().ok_or(DgnError::new("Handler required", 0))?;
-                    let rt_handle = tokio::runtime::Handle::current();  
                     thread::spawn(move || {
                         let server = match Server::http(format!("0.0.0.0:{}", port)) {
                             Ok(s) => s,
@@ -5914,7 +5913,7 @@ let widths = compute_widths(data, upem);
                             let rh = req_handle.clone();
                             res_map.lock().unwrap().insert("send".into(), native_method(rh, move |rh, args| {
                                 let body = val_to_string(args.get(0).unwrap_or(&DgnValue::String("".into())));
-                                let status = if let Some(DgnValue::Number(n)) = args.get(1) { *n as u16 } else { 200 };
+                                let status = args.get(1).and_then(|v| v.as_number()).map(|n| n as u16).unwrap_or(200);
                                 let headers_arg = args.get(2).cloned();
 
                                 if let Some(req) = rh.lock().unwrap().take() {
@@ -5934,7 +5933,7 @@ let widths = compute_widths(data, upem);
                             }));
 
                             let handler_clone = handler.clone();
-                            rt_handle.spawn(async move {  
+                            rt.block_on(async move {
                                 let _ = call_dgn_func(handler_clone, vec![req_obj, DgnValue::Map(res_map)]).await;
                             });
                         }
@@ -6803,7 +6802,7 @@ pub fn populate_builtins(env: Arc<Mutex<Env>>) {
         Err(e) => Err(DgnError::new(&e.to_string(), 0)),
     }
 }));
-    e.set("exit", native_fn(|args| { let c = if let Some(DgnValue::Number(n)) = args.get(0) { *n as i32 } else { 0 }; std::process::exit(c); }));
+    e.set("exit", native_fn(|args| { let c = args.get(0).and_then(|v| v.as_number()).map(|n| n as i32).unwrap_or(0); std::process::exit(c); }));
     e.set("gc", native_fn(move |_| {
         let count = gc_collect(gc_env.clone());
         Ok(DgnValue::Number(count as f64))
