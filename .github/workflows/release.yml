@@ -1,0 +1,148 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# Cancel older in-progress runs for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux glibc ─────────────────────────────────────────────────
+          - { target: x86_64-unknown-linux-gnu,    runner: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu,   runner: ubuntu-24.04-arm }
+
+          # ── Linux musl (fully static — runs on Alpine, distroless, etc.)
+          - { target: x86_64-unknown-linux-musl,   runner: ubuntu-24.04,     apt: musl-tools }
+          - { target: aarch64-unknown-linux-musl,  runner: ubuntu-24.04-arm, apt: musl-tools }
+
+          # ── Windows ─────────────────────────────────────────────────────
+          - { target: x86_64-pc-windows-msvc,      runner: windows-latest }
+          - { target: aarch64-pc-windows-msvc,     runner: windows-11-arm }
+
+          # ── macOS ───────────────────────────────────────────────────────
+          - { target: x86_64-apple-darwin,         runner: macos-13 }   # Intel
+          - { target: aarch64-apple-darwin,        runner: macos-14 }   # Apple Silicon
+
+          # ── WebAssembly (cdylib only — no binary) ───────────────────────
+          # - { target: wasm32-unknown-unknown,      runner: ubuntu-24.04, lib_only: true }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: APT deps (Linux only)
+        if: matrix.apt
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Read crate name from Cargo.toml
+        id: meta
+        shell: bash
+        run: |
+          NAME=$(grep -m1 -E '^[[:space:]]*name[[:space:]]*=' Cargo.toml \
+                 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
+          echo "lib=${NAME//-/_}" >> "$GITHUB_OUTPUT"
+          echo "Crate: $NAME (lib symbol: ${NAME//-/_})"
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.lib_only }}" = "true" ]; then
+            cargo build --release --target ${{ matrix.target }} --lib
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Stage artifacts
+        id: stage
+        shell: bash
+        run: |
+          set -e
+          NAME='${{ steps.meta.outputs.name }}'
+          LIB='${{ steps.meta.outputs.lib }}'
+          TARGET='${{ matrix.target }}'
+          OUT="target/$TARGET/release"
+          STAGE="$NAME-$TARGET"
+          mkdir -p "$STAGE"
+
+          case "$TARGET" in
+            *windows*)
+              [ -f "$OUT/$NAME.exe"     ] && cp "$OUT/$NAME.exe"     "$STAGE/" || true
+              [ -f "$OUT/$LIB.dll"      ] && cp "$OUT/$LIB.dll"      "$STAGE/" || true
+              [ -f "$OUT/$LIB.dll.lib"  ] && cp "$OUT/$LIB.dll.lib"  "$STAGE/" || true
+              ;;
+            *apple*)
+              [ -f "$OUT/$NAME"         ] && cp "$OUT/$NAME"         "$STAGE/" || true
+              [ -f "$OUT/lib$LIB.dylib" ] && cp "$OUT/lib$LIB.dylib" "$STAGE/" || true
+              ;;
+            *wasm*)
+              [ -f "$OUT/$LIB.wasm"     ] && cp "$OUT/$LIB.wasm"     "$STAGE/" || true
+              ;;
+            *)  # linux gnu + musl
+              [ -f "$OUT/$NAME"         ] && cp "$OUT/$NAME"         "$STAGE/" || true
+              [ -f "$OUT/lib$LIB.so"    ] && cp "$OUT/lib$LIB.so"    "$STAGE/" || true
+              ;;
+          esac
+
+          echo "Staged files:" && ls -la "$STAGE"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Archive
+        shell: bash
+        run: |
+          STAGE='${{ steps.stage.outputs.stage }}'
+          case '${{ matrix.target }}' in
+            *windows*) 7z a "$STAGE.zip" "./$STAGE/*" ;;
+            *)         tar -czf "$STAGE.tar.gz" "$STAGE" ;;
+          esac
+
+      - name: Upload (downloadable from this workflow run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.stage }}
+          path: |
+            ${{ steps.stage.outputs.stage }}.zip
+            ${{ steps.stage.outputs.stage }}.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -la artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: false

@@ -14,7 +14,7 @@ use std::panic;
 
 macro_rules! VERSION { () => { "1.0.5" } }
 const DGN_VERSION: &str = concat!("Dragon Programming Language v", VERSION!());
-const DGN_BUILD: &str = "Build 2026-04-03"; 
+const DGN_BUILD: &str = concat!("Build ", env!("DGN_BUILD_DATE"));
 const DGN_AUTHOR: &str = "Aavesh Jilani";
 fn main() {
     panic::set_hook(Box::new(|info| {
