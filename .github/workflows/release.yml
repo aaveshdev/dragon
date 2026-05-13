@@ -6,7 +6,6 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
-# Cancel older in-progress runs for the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,23 +18,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux glibc ─────────────────────────────────────────────────
+          # ── Linux glibc — native runners ────────────────────────────────
           - { target: x86_64-unknown-linux-gnu,    runner: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu,   runner: ubuntu-24.04-arm }
 
-          # ── Linux musl (fully static — runs on Alpine, distroless, etc.)
-          - { target: x86_64-unknown-linux-musl,   runner: ubuntu-24.04,     apt: musl-tools }
-          - { target: aarch64-unknown-linux-musl,  runner: ubuntu-24.04-arm, apt: musl-tools }
+          # ── Linux musl — via `cross` (kernel headers + C toolchain set up) ──
+          - { target: x86_64-unknown-linux-musl,   runner: ubuntu-24.04, use_cross: true }
+          - { target: aarch64-unknown-linux-musl,  runner: ubuntu-24.04, use_cross: true }
 
           # ── Windows ─────────────────────────────────────────────────────
           - { target: x86_64-pc-windows-msvc,      runner: windows-latest }
           - { target: aarch64-pc-windows-msvc,     runner: windows-11-arm }
 
           # ── macOS ───────────────────────────────────────────────────────
-          - { target: x86_64-apple-darwin,         runner: macos-13 }   # Intel
-          - { target: aarch64-apple-darwin,        runner: macos-14 }   # Apple Silicon
+          - { target: x86_64-apple-darwin,         runner: macos-13 }
+          - { target: aarch64-apple-darwin,        runner: macos-14 }
 
-          # ── WebAssembly (cdylib only — no binary) ───────────────────────
+          # ── WebAssembly (cdylib only) ───────────────────────────────────
           # - { target: wasm32-unknown-unknown,      runner: ubuntu-24.04, lib_only: true }
 
     steps:
@@ -51,27 +50,39 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
       - name: APT deps (Linux only)
         if: matrix.apt
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
 
-      - name: Read crate name from Cargo.toml
+      - name: Read bin/lib names from Cargo.toml
         id: meta
         shell: bash
         run: |
-          NAME=$(grep -m1 -E '^[[:space:]]*name[[:space:]]*=' Cargo.toml \
-                 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
-          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
-          echo "lib=${NAME//-/_}" >> "$GITHUB_OUTPUT"
-          echo "Crate: $NAME (lib symbol: ${NAME//-/_})"
+          PKG=$(awk -F'"' '/^\[/{s=$0} s=="[package]" && /^[[:space:]]*name[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          BIN=$(awk -F'"' '/^\[/{s=$0} s=="[[bin]]"    && /^[[:space:]]*name[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          LIB=$(awk -F'"' '/^\[/{s=$0} s=="[lib]"      && /^[[:space:]]*name[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          # Cargo defaults: bin falls back to package name; lib falls back to package name with - → _
+          BIN=${BIN:-$PKG}
+          LIB=${LIB:-${PKG//-/_}}
+          echo "name=$BIN" >> "$GITHUB_OUTPUT"
+          echo "lib=$LIB"  >> "$GITHUB_OUTPUT"
+          echo "Bin: $BIN   Lib: $LIB"
 
       - name: Build
         shell: bash
         run: |
+          TOOL=cargo
+          [ "${{ matrix.use_cross }}" = "true" ] && TOOL=cross
           if [ "${{ matrix.lib_only }}" = "true" ]; then
-            cargo build --release --target ${{ matrix.target }} --lib
+            $TOOL build --release --target ${{ matrix.target }} --lib
           else
-            cargo build --release --target ${{ matrix.target }}
+            $TOOL build --release --target ${{ matrix.target }}
           fi
 
       - name: Stage artifacts
