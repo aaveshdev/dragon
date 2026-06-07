@@ -1,4 +1,5 @@
 mod engine;
+mod codegen_c;
 // mod aot_compiler;
 use engine::*;
 // use engine::{Chunk, Compiler, Instruction, lint_ast, lex, Parser};
@@ -12,7 +13,7 @@ use std::io::{Write, Read, Seek, SeekFrom};
 use std::env;
 use std::panic;
 
-macro_rules! VERSION { () => { "1.0.5" } }
+macro_rules! VERSION { () => { "1.0.6" } }
 const DGN_VERSION: &str = concat!("Dragon Programming Language v", VERSION!());
 const DGN_BUILD: &str = concat!("Build ", env!("DGN_BUILD_DATE"));
 const DGN_AUTHOR: &str = "Aavesh Jilani";
@@ -96,6 +97,8 @@ fn main() {
         println!("  dragon -c <in> -o <out>           Compile script to Executable");
         println!("  dragon -c <in> -o <out> --window  Compile script to run in background (No Console)");
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
+        println!("  dragon -c <in> -o <out> --native  Compile script to native C binary (via gcc/clang/msvc) experimental");
+        println!("  dragon -c <in> -o <out> --native --lib     Native shared library experimental");
         // println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("  dragon -v, --version              Show version information");
         println!("");
@@ -189,11 +192,78 @@ fn main() {
 
         let input_path = Path::new(&args[2]);
         let output_path = Path::new(&args[4]);
-        let is_lib_mode = args.contains(&"--lib".to_string());
-        let is_aot_mode = args.contains(&"--aot".to_string());
-        let is_web_mode = args.contains(&"--web".to_string());
+        let is_lib_mode    = args.contains(&"--lib".to_string());
+        let is_aot_mode    = args.contains(&"--aot".to_string());
+        let is_web_mode    = args.contains(&"--web".to_string());
         let is_window_mode = args.contains(&"--window".to_string());
+        let is_native_mode = args.contains(&"--native".to_string());
+        let keep_c_mode    = args.contains(&"--keep-c".to_string());
         println!("Compiling {}...", input_path.display());
+
+        // ── --native path: transpile Dragon AST → C, then invoke gcc/clang/msvc ──
+        if is_native_mode {
+            let src = match fs::read_to_string(input_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading {}: {}", input_path.display(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let tokens = match lex(&src) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Syntax Error: {}", e.with_source(&src).format_pretty());
+                    std::process::exit(1);
+                }
+            };
+
+            let mut parser = Parser::new(tokens);
+            let ast = match parser.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("Parse Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Lint the AST
+            let report = lint_ast(&ast);
+            if !report.is_clean() {
+                report.print();
+                if !report.errors.is_empty() {
+                    std::process::exit(1);
+                }
+            }
+
+            println!("  [native] Transpiling to C...");
+            match codegen_c::compile_to_native_c(
+                &ast,
+                input_path,
+                output_path,
+                keep_c_mode,
+                is_lib_mode,
+                is_window_mode,
+            ) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = fs::metadata(output_path) {
+                            let mut perms = metadata.permissions();
+                            perms.set_mode(0o755);
+                            let _ = fs::set_permissions(output_path, perms);
+                        }
+                    }
+                    println!("Success! Native output: {}", output_path.display());
+                }
+                Err(e) => {
+                    eprintln!("Native compilation failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
 
 
        let mut sources = HashMap::new();
