@@ -1,5 +1,6 @@
 mod engine;
 mod codegen_c;
+mod tui;
 // mod aot_compiler;
 use engine::*;
 // use engine::{Chunk, Compiler, Instruction, lint_ast, lex, Parser};
@@ -13,7 +14,7 @@ use std::io::{Write, Read, Seek, SeekFrom};
 use std::env;
 use std::panic;
 
-macro_rules! VERSION { () => { "1.0.6" } }
+macro_rules! VERSION { () => { "1.0.7" } }
 const DGN_VERSION: &str = concat!("Dragon Programming Language v", VERSION!());
 const DGN_BUILD: &str = concat!("Build ", env!("DGN_BUILD_DATE"));
 const DGN_AUTHOR: &str = "Aavesh Jilani";
@@ -80,6 +81,14 @@ fn main() {
         return;
     }
 
+    if args.len() >= 2 && (args[1] == "--ide" || args[1] == "-ide") {
+    if let Err(e) = tui::run_tui_ide(VERSION!(), DGN_BUILD, DGN_AUTHOR) {
+        eprintln!("TUI Error: {}", e);
+        std::process::exit(1);
+    }
+    return;
+}
+
     if args.len() < 2 {
         println!("\n==============================================");
         println!("          Dragon Programming Language");
@@ -99,6 +108,7 @@ fn main() {
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
         println!("  dragon -c <in> -o <out> --native  Compile script to native C binary (via gcc/clang/msvc) experimental");
         println!("  dragon -c <in> -o <out> --native --lib     Native shared library experimental");
+        println!("  dragon --ide                      Launch TurboDragon IDE");
         // println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("  dragon -v, --version              Show version information");
         println!("");

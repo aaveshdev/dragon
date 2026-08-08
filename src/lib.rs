@@ -401,6 +401,78 @@ pub fn dragon_run_wasm(encoded_payload: &str) -> String {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn dragon_run_source(source_code: &str) -> String {
+    console_error_panic_hook::set_once();
+
+    // Shared output buffer that showln writes into
+    let output_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let env = Arc::new(Mutex::new(Env::new(None, None)));
+    env.lock().unwrap().store.insert(
+        "__modules__".into(),
+        DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))),
+    );
+    populate_builtins(env.clone());
+
+    // Override showln to capture output
+    let buf_clone = output_buf.clone();
+    env.lock().unwrap().set("showln", native_fn(move |args| {
+        let s = args.iter().map(val_to_string).collect::<Vec<_>>().join(" ");
+        buf_clone.lock().unwrap().push(s);
+        Ok(DgnValue::Null)
+    })).unwrap();
+
+    // Override show (no newline variant)
+    let buf_clone2 = output_buf.clone();
+    env.lock().unwrap().set("show", native_fn(move |args| {
+        let s = args.iter().map(val_to_string).collect::<Vec<_>>().join(" ");
+        buf_clone2.lock().unwrap().push(s);
+        Ok(DgnValue::Null)
+    })).unwrap();
+
+    let tokens = match lex(source_code) {
+        Ok(t) => t,
+        Err(e) => return format!("Syntax Error: {}", e.with_source(source_code).format_pretty()),
+    };
+
+    let mut parser = Parser::new(tokens);
+    match parser.parse() {
+        Ok(ast) => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let mut chunk = Chunk::new();
+            Compiler::compile_stmt(&mut chunk, &ast);
+            chunk.emit(Instruction::Halt, 0);
+
+            let result = rt.block_on(async {
+                let mut vm = Vm::new();
+                vm.run(&chunk, env).await
+            });
+
+            let captured = output_buf.lock().unwrap().join("\n");
+            match result {
+                Ok(_) => {
+                    if captured.is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        captured
+                    }
+                }
+                Err(e) => {
+                    let err = format!("Runtime Error: {} at line {}", e.msg, e.line);
+                    if captured.is_empty() {
+                        err
+                    } else {
+                        format!("{}\n{}", captured, err)
+                    }
+                }
+            }
+        }
+        Err(e) => format!("Parse Error: {}", e),
+    }
+}
+
 fn get_dll_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     unsafe {
