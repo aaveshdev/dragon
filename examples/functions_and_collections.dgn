@@ -1,0 +1,76 @@
+// ─────────────────────────────────────────────────────────────
+// functions_and_collections.dgn
+// Functions (incl. default/rest params), lambdas, lists, maps,
+// and string methods.
+// Run with:  dragon functions_and_collections.dgn
+// ─────────────────────────────────────────────────────────────
+
+// A normal function with a default parameter value.
+func greet(name, greeting = "Hello") {
+    return `${greeting}, ${name}!`
+}
+
+// A function using a rest parameter to accept any number of args.
+func sum_all(...numbers) {
+    total = 0
+    for n in numbers {
+        total = total + n
+    }
+    return total
+}
+
+func main() {
+    showln(greet("Ada"))
+    showln(greet("Grace", "Hey"))
+    showln(`sum_all(1,2,3,4,5) = {sum_all(1, 2, 3, 4, 5)}`)
+
+    // ── Lambdas (arrow functions) ───────────────────────────
+    square = (x) => x * x
+    add = (a, b) => a + b
+    showln(`square(6) = ${square(6)}`)
+    showln(`add(3, 4) = ${add(3, 4)}`)
+
+    // ── Lists ────────────────────────────────────────────────
+    numbers = [5, 3, 8, 1, 9, 2]
+    numbers.push(7)
+    showln("list:", numbers)
+    showln("length:", len(numbers))
+
+    doubled = numbers.map((x) => x * 2)
+    showln("doubled:", doubled)
+
+    evens = numbers.filter((x) => x % 2 == 0)
+    showln("evens:", evens)
+
+    total = numbers.reduce((acc, x) => acc + x, 0)
+    showln("sum:", total)
+
+    // .sort() compares floats, so use decimal values here
+    prices = [19.99, 5.50, 42.10, 3.75, 12.25]
+    prices.sort()
+    showln("sorted prices:", prices)
+
+    // ── Maps ─────────────────────────────────────────────────
+    person = {
+        name: "Ada Lovelace",
+        role: "Mathematician",
+        year: 1815
+    }
+    showln(`${person.name} was a ${person.role}, born ${person.year}`)
+
+    person.set("field", "Computer Science")
+    for key, value in person {
+        showln(`  ${key} -> ${value}`)
+    }
+
+    // ── Strings ──────────────────────────────────────────────
+    phrase = "  The Quick Brown Fox  "
+    showln(`trimmed: "${phrase.trim()}"`)
+    showln(`upper: ${phrase.trim().upper()}`)
+    showln(`lower: ${phrase.trim().lower()}`)
+    showln(`words: ${phrase.trim().split(" ")}`)
+    showln(`contains "Fox": ${phrase.contains("Fox")}`)
+    showln(`replaced: ${phrase.trim().replace("Fox", "Dragon")}`)
+}
+
+main()

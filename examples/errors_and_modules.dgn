@@ -1,0 +1,50 @@
+// ─────────────────────────────────────────────────────────────
+// errors_and_modules.dgn
+// try/catch/finally, raise, and built-in modules (math, json)
+// Run with:  dragon errors_and_modules.dgn
+// ─────────────────────────────────────────────────────────────
+
+import math
+import json
+
+func main() {
+    // ── try / catch / finally ───────────────────────────────
+    // Note: `raise` is only caught by a try/catch in the SAME
+    // function it's raised from, so we check + raise inline here
+    // rather than inside a separate helper function.
+    pairs = [[10, 2], [9, 0], [20, 4]]
+
+    for pair in pairs {
+        a = pair[0]
+        b = pair[1]
+        try {
+            if b == 0 {
+                raise "Cannot divide by zero!"
+            }
+            result = a / b
+            showln(`${a} / ${b} = ${result}`)
+        } catch (err) {
+            showln(`  error dividing ${a} by ${b}: ${err}`)
+        } finally {
+            showln(`  (finished attempt: ${a} / ${b})`)
+        }
+    }
+
+    // ── the math module ─────────────────────────────────────
+    showln("")
+    showln(`math.sqrt(144) = ${math.sqrt(144)}`)
+    showln(`math.abs(-7) = ${math.abs(-7)}`)
+    showln(`math.floor(9.8) = ${math.floor(9.8)}`)
+    showln(`PI = ${PI}`)
+
+    // ── the json module ─────────────────────────────────────
+    showln("")
+    profile = { name: "Ember", species: "Dragon", level: 42 }
+    encoded = json.encode(profile)
+    showln(`encoded: ${encoded}`)
+
+    decoded = json.decode(encoded)
+    showln(`decoded.name: ${decoded.name}, decoded.level: ${decoded.level}`)
+}
+
+main()

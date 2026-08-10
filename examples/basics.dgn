@@ -1,0 +1,44 @@
+// ─────────────────────────────────────────────────────────────
+// basics.dgn
+// Dragon language basics: variables, output, and string interpolation
+// Run with:  dragon basics.dgn
+// ─────────────────────────────────────────────────────────────
+
+func main() {
+    // Variables are dynamically typed — no keyword required.
+    name = "Dragon"
+    version = 1.0
+
+    // `showln` prints with a trailing newline, `show` prints without one.
+    // Backtick strings support {expr} interpolation.
+    showln(`Welcome to ${name} v${version}!`)
+
+    age = 5
+    is_awesome = True
+    showln("age:", age, "| awesome:", is_awesome)
+
+    // `const` values cannot be reassigned after they're set.
+    const GREETING = "Hello"
+    showln(GREETING + ", World!")
+
+    // Basic arithmetic
+    a = 10
+    b = 3
+    showln(`${a} + ${b} = ${a + b}`)
+    showln(`${a} - ${b} = ${a - b}`)
+    showln(`${a} * ${b} = ${a * b}`)
+    showln(`${a} / ${b} = ${a / b}`)
+    showln(`${a} % ${b} = ${a % b}`)
+
+    // format() gives you fine-grained control over output
+    pi = 3.14159
+    showln(format("Pi rounded to 2 places: {:.2f}", pi))
+    showln(format("Padded number: [{:>6}]", 42))
+
+    // typeof() and conversions
+    showln("typeof age:", typeof(age))
+    showln("str(age):", str(age))
+    showln("int(\"42\"):", int("42"))
+}
+
+main()
