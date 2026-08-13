@@ -1,0 +1,56 @@
+name: Feature Request
+description: Suggest a new feature for Dragon
+title: "[FEATURE]: "
+labels: ["enhancement"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature for Dragon!
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Please provide a clear and concise description of the feature you'd like to see.
+      placeholder: What problem does this feature solve?
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: What area of Dragon does this feature relate to?
+      options:
+        - Language
+        - Standard Library
+        - Compiler
+        - Virtual Machine
+        - IDE
+        - CLI
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this feature important to you or the community?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Please describe any alternative solutions or features you've considered.
+    validations:
+      required: false
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow the project's Code of Conduct
+      options:
+        - label: I agree to follow the project's Code of Conduct
+          required: true

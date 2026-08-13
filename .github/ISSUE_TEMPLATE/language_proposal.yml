@@ -1,0 +1,56 @@
+name: Language Proposal
+description: Propose a change to the Dragon language specification
+title: "[LANGUAGE PROPOSAL]: "
+labels: ["language", "proposal"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a change to the Dragon language!
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Provide a brief summary of the proposal.
+      placeholder: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Explain why this change is needed.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal Details
+      description: Describe the proposed change in detail, including syntax and semantics if applicable.
+      placeholder: |
+        Specify the exact change you propose to the language.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions you've considered.
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Discuss the potential impact (backward compatibility, implementation complexity, etc.).
+    validations:
+      required: true
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow the project's Code of Conduct
+      options:
+        - label: I agree to follow the project's Code of Conduct
+          required: true
