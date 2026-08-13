@@ -12,6 +12,8 @@ All notable changes to the Dragon programming language will be documented in thi
 - Contributor documentation
 - Deployment guides
 - Governance documentation
+### Contributed by
+- Smit Shetye (repository architecture)
 
 ## [v0.1.3] - 2026-08-12
 ### Added

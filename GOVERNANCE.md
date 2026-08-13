@@ -18,6 +18,10 @@ Anyone who contributes code, documentation, tests, or other valuable contributio
 ### Users
 Anyone who uses the Dragon programming language.
 
+## Contributor Attribution
+
+Contributors are credited according to the work they contribute. Original Dragon implementation authors retain attribution for their original work, while subsequent contributors retain attribution for their independent modifications, documentation, infrastructure, and other contributions.
+
 ## Decision Making
 
 ### Technical Decisions

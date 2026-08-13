@@ -294,3 +294,14 @@ Dragon is licensed under the MIT License — see the [LICENSE](LICENSE) file for
 - [Documentation Index](./DOCUMENTATION_INDEX.md) — Guide to all documentation
 - [Changelog](./CHANGELOG.md) — Notable changes for each version
 - [Code of Conduct](./CODE_OF_CONDUCT.md) — Our community standards
+
+## Repository Architecture
+
+The Dragon repository architecture includes contributions from Smit Shetye
+covering language specification organization, documentation architecture,
+governance and contributor infrastructure, security/compliance
+documentation, testing organization, tooling structure, and ecosystem
+organization.
+
+These contributions do not claim authorship of the original Dragon language
+or its pre-existing implementation.
