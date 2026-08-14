@@ -2,29 +2,20 @@
 
 **Dragon** is an innovative, practical, general-purpose programming language. It's designed to be simple, small, flexible, and fast, with an expressive, readable syntax that's easy to pick up. Dragon supports multiple programming paradigms (imperative, object-oriented, functional, and declarative) and is portable across Windows, Linux, and macOS, and can be used to build console applications.
 
-This repository contains the official Rust implementation of Dragon: a lexer, parser, bytecode compiler, and virtual machine, plus a C transpiler for native/AOT-style builds, a batteries-included standard library, and a terminal-based IDE ("TurboDragon IDE").
-
 > Official website & documentation: [dragon-lang.org](https://www.dragon-lang.org/)
+> Language specification: [spec/](./spec/)
 
-## Features
+## What is Dragon?
+
+Dragon is a dynamically-typed programming language that combines simplicity with powerful features. It features a clean syntax, first-class functions, closures, classes, async/await capabilities, and a rich standard library. Dragon code is compiled to bytecode and executed by a fast virtual machine, with options for native compilation and executable bundling.
+
+## Key Features
 
 - **Simple, readable syntax** — spend less time fighting the language, more time solving problems.
 - **Dynamic typing** with first-class functions, closures, and classes (`func`, `class`, `extends`, `this`, `super`, `new`).
 - **Familiar control flow** — `if` / `elif` / `else`, `while`, `for ... in`, `switch` / `case`, `try` / `catch` / `finally` / `raise`.
 - **Async/await & threading** — built-in `async` / `await` support plus a `thread` module for spawning concurrent work.
-- **Rich standard library** available via `import`, including:
-  - `math` — numeric and math utilities
-  - `json` — encode/decode JSON
-  - `file` / `path` — filesystem access
-  - `os` — environment and system info
-  - `time` — dates, timers, sleeping
-  - `net` — HTTP client/server utilities
-  - `crypto` — hashing (SHA-2, MD5), HMAC, PBKDF2, AES-GCM
-  - `zip` — archive creation/extraction
-  - `xml` — XML parsing
-  - `uuid` — UUID generation
-  - `pdf` / `font` — PDF and font/text rendering
-  - `ffi` / `struct` / `mem` — native interop with C libraries
+- **Rich standard library** available via `import`, including math, JSON, file/I/O, networking, cryptography, and more.
 - **Bytecode VM** for fast interpreted execution.
 - **Native compilation (experimental)** — transpile Dragon source to C and build it with your system's C compiler (gcc/clang/MSVC).
 - **Self-contained executables** — bundle a script (and its dependencies) into a single encrypted, distributable binary.
@@ -32,24 +23,24 @@ This repository contains the official Rust implementation of Dragon: a lexer, pa
 - **TurboDragon IDE** — a built-in terminal UI editor/runner, launched with `--ide`.
 - **Package-based projects** — run a project directly from a `package.json` manifest with `dragon run`.
 
-## Example
+## Small Example
 
 ```dragon
-import "thread";
-import "math";
+import "std/thread";
+import "std/math";
 
 class Animal {
     func init(name) {
         this.name = name;
     }
     func speak() {
-        showln(this.name, "speaks");
+        println(this.name + " speaks");
     }
 }
 
 func worker(id) {
     sleep(0.5);
-    showln("Task", id, "done");
+    println("Task " + id + " done");
 }
 
 animal = new Animal("Dragon");
@@ -59,16 +50,16 @@ for i in math.range(5) {
     thread.spawn(worker, [i]);
 }
 
-showln("All tasks started");
+println("All tasks started");
 ```
 
-## Building
+## Installation
 
-Dragon is built with Cargo and requires a recent stable [Rust toolchain](https://www.rust-lang.org/tools/install) (edition 2021).
+Dragon is built with Cargo and requires a recent stable [Rust toolchain](https://www.rust-lang.org/tools/install) (edition 2021 or later).
 
 ```bash
 # Clone the repository
-git clone https://github.com/aaveshdev/dragon.git
+git clone https://github.com/smitshetye/dragon.git
 cd dragon
 
 # Build the CLI in debug mode
@@ -79,130 +70,238 @@ cargo build --release
 ```
 
 The compiled CLI binary is produced as `dragon` (or `dragon.exe` on Windows) at:
-
 ```
 target/release/dragon
 ```
 
-Dragon also builds a shared library (`dragon_lib`, i.e. `dragon_lib.dll` / `libdragon_lib.so` / `libdragon_lib.dylib`) from `src/lib.rs`, since the `[lib]` target uses `crate-type = ["cdylib", "rlib"]`. This is produced automatically alongside the CLI whenever you run `cargo build`.
-
-### Optional: install the CLI globally
-
+Optional: install the CLI globally
 ```bash
 cargo install --path .
 ```
 
 This installs the `dragon` binary onto your `PATH`.
 
-### Feature/target notes
+## Quick Start
 
-- **Native codegen** (`--native`) shells out to a system C compiler (`gcc`, `clang`, or `cl` on Windows), so one of these must be available on your `PATH` for that feature to work.
-- **Android** targets pull in `jni` / `ndk` dependencies automatically via the `cfg(target_os = "android")` block in `Cargo.toml`.
-- **WASM** targets pull in `wasm-bindgen` / `web-sys` / `getrandom` (`js` feature) automatically.
-- On `aarch64-unknown-linux-gnu`, OpenSSL is vendored and built from source, so a C toolchain is required there as well.
-
-## Running
-
-Once built, invoke the binary directly (or via `cargo run --`) followed by a command:
+Once built, invoke the binary directly:
 
 ```bash
-dragon <file.dgn> [args...]        # Run a Dragon script
-dragon --repl                      # Start the interactive REPL
-dragon run                         # Run the project defined by ./package.json
-dragon --ide                       # Launch the TurboDragon terminal IDE
-dragon -v | --version              # Print version info
-```
+# Run a Dragon script
+dragon hello.dragon
 
-### Run a script
-
-```bash
-dragon hello.dgn
-```
-
-Any extra arguments after the filename are passed through to the script and are accessible as `argv` inside Dragon code.
-
-### Interactive REPL
-
-```bash
+# Start the interactive REPL
 dragon --repl
+
+# Run the project defined by ./package.json
+dragon run
+
+# Launch the TurboDragon terminal IDE
+dragon --ide
+
+# Print version info
+dragon --version
 ```
 
-Starts a persistent session — variables and functions defined on one line remain available on the next. Type `exit` to quit.
+## Command Line Interface (CLI)
 
-### Run a project via `package.json`
+The Dragon CLI provides several commands:
+
+- `dragon <file.dragon> [args...]` - Run a Dragon script
+- `dragon --repl` - Start the interactive REPL
+- `dragon run` - Run project from package.json
+- `dragon --ide` - Launch TurboDragon IDE
+- `dragon -v | --version` - Print version information
+- `dragon -c input.dragon -o output` - Bundle script into executable
+- `dragon -c input.dragon -o output.dll --lib` - Build shared library
+- `dragon -c input.dragon -o output --native` - Experimental native compilation
+
+## Read-Eval-Print Loop (REPL)
+
+Start an interactive Dragon session with `dragon --repl`:
 
 ```bash
-dragon run
+$ dragon --repl
+Dragon REPL v0.1.0
+Type '.help' for help, '.exit' to quit
+> let x = 42
+> x * 2
+84
+> func greet(name) { return "Hello, " + name; }
+> greet("World")
+"Hello, World"
+> .exit
 ```
 
-Looks for a `package.json` in the current directory and runs the file referenced by its `"main"` (or `"entry"`) field, e.g.:
+## TurboDragon IDE
+
+Dragon includes a built-in terminal-based IDE launched with `dragon --ide`:
+
+- Keyboard-driven interface
+- Syntax highlighting
+- File browser
+- Integrated debugger
+- One-click run/build
+- Works over SSH (terminal-only)
+
+## Packages
+
+Dragon supports package-based projects using a `package.json` manifest:
 
 ```json
 {
   "name": "my-dragon-app",
-  "main": "src/main.dgn"
+  "version": "1.0.0",
+  "main": "src/main.dragon",
+  "dependencies": {
+    "std/math": "^1.0.0",
+    "std/io": "^1.0.0"
+  }
 }
 ```
 
-### Compile a script
+Run with: `dragon run`
+
+## Native Compilation
+
+Experimental feature to transpile Dragon to C and compile natively:
 
 ```bash
-# Bundle a script (and any included files) into a single distributable executable
-dragon -c input.dgn -o output
-
-# Same, but hide the console window on Windows (background/GUI mode)
-dragon -c input.dgn -o output --window
-
-# Compile into a shared library (.dll / .so / .dylib)
-dragon -c input.dgn -o output.dll --lib
-
-# (Experimental) Transpile to C and build a native binary via gcc/clang/MSVC
-dragon -c input.dgn -o output --native
-
-# (Experimental) Native shared library
-dragon -c input.dgn -o output --native --lib
-
-# Keep the intermediate generated C source when using --native
-dragon -c input.dgn -o output --native --keep-c
+dragon -c script.dragon -o output --native
+# For Windows GUI application (no console):
+dragon -c script.dragon -o output --native --window
+# Keep intermediate C source:
+dragon -c script.dragon -o output --native --keep-c
 ```
 
-### TurboDragon IDE
+## Standard Library
 
+Dragon's standard library provides batteries-included functionality:
+
+- **std/math** — Mathematical functions and constants
+- **std/json** — JSON parsing and serialization
+- **std/file** / **std/path** — File system access and path manipulation
+- **std/os** — Environment variables, process info, system commands
+- **std/time** — Date/time functions, timers, sleep
+- **std/net** — HTTP client/server, DNS, sockets
+- **std/crypto** — Cryptographic hashing (SHA-2, MD5), HMAC, PBKDF2, AES
+- **std/zip** — ZIP archive creation and extraction
+- **std/xml** — XML parsing and manipulation
+- **std/uuid** — UUID generation and parsing
+- **std/pdf** / **std/font** — PDF generation and font/text rendering
+- **std/ffi** / **std/struct** / **std/mem** — Foreign Function Interface and manual memory management
+
+## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+- **Getting Started** — Installation, quick start, tutorials
+- **Language Guide** — Complete guide to Dragon syntax and features
+- **API Reference** — Detailed documentation of all standard library modules
+- **CLI Reference** — Complete reference of command-line options
+- **IDE Guide** — Using the TurboDragon terminal IDE
+- **Native Compilation** — Guide to experimental native compilation features
+- **Packaging** — Creating and distributing Dragon packages
+- **Debugging** — Debugging Dragon applications
+- **Performance** — Performance optimization tips
+
+## Language Specification
+
+The formal language specification is maintained in the `spec/` directory:
+
+- **spec/language/** — Dragon language syntax and semantics
+- **spec/runtime/** — Runtime behavior and memory model
+- **spec/bytecode/** — Bytecode instruction set and execution
+- **spec/standard-library/** — Standard library module specifications
+- **spec/compatibility/** — Versioning and compatibility policies
+
+See [SPECIFICATION.md](./SPECIFICATION.md) for details on how the specification relates to the implementation.
+
+## Contributing
+
+We welcome contributions to the Dragon project! Please see our contributing guidelines:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes
+4. Commit your changes (`git commit -m 'Add amazing feature'`)
+5. Push to the branch (`git push origin feature/amazing-feature`)
+6. Open a Pull Request
+
+Please read [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed information on:
+- Code of conduct
+- Development setup
+- Pull request process
+- Coding standards
+- Testing guidelines
+
+## Development
+
+For developers interested in contributing to the Dragon implementation:
+
+### Building from Source
 ```bash
-dragon --ide
+# Install Rust if not already installed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Clone and build
+git clone https://github.com/smitshetye/dragon.git
+cd dragon
+cargo build --release
 ```
 
-Launches a lightweight, keyboard-driven terminal IDE (built with `crossterm`) for editing and running Dragon scripts without leaving the terminal.
+### Running Tests
+```bash
+# Run the test suite
+cargo test
 
-## Project Structure
+# Run specific tests
+cargo test test_name
+```
 
-```
-src/
-├── main.rs           # CLI entry point (run, repl, compile, bundle, ide)
-├── lib.rs             # Library entry point (cdylib/rlib target)
-├── tui.rs             # TurboDragon terminal IDE
-├── engine/            # Core language implementation
-│   ├── lexer.rs        # Tokenizer
-│   ├── parser.rs       # Parser -> AST
-│   ├── ast.rs           # AST node definitions
-│   ├── compiler.rs     # AST -> bytecode compiler
-│   ├── bytecode.rs     # Bytecode instruction set
-│   ├── vm.rs             # Bytecode virtual machine
-│   ├── value.rs         # Runtime value types
-│   ├── environment.rs  # Variable/scope environment
-│   ├── builtins.rs      # Standard library (math, json, file, net, crypto, ...)
-│   ├── linter.rs         # Static AST linting
-│   ├── crypto.rs         # Cryptography helpers
-│   ├── bundle.rs         # Executable bundling/packaging
-│   ├── gc.rs               # Memory/garbage-collection helpers
-│   └── error.rs           # Error types and pretty-printing
-└── codegen_c/          # Experimental Dragon -> C transpiler ("--native")
-    ├── transpiler.rs
-    ├── runtime.rs
-    ├── native.rs
-    └── mangle.rs
-```
+### Documentation
+- See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup
+- See [docs/development/](./docs/development/) for contributor documentation
+- API documentation is generated with `cargo doc --open`
+
+## Security
+
+Dragon takes security seriously. While the language provides powerful features, it's important to use them responsibly:
+
+### Capabilities
+Dragon provides access to system capabilities including:
+- File system read/write
+- Network communication
+- Process spawning
+- Foreign function interface (FFI)
+- Native code execution
+
+### Best Practices
+- Validate all external input
+- Use least privilege principles when possible
+- Be cautious when using FFI or native compilation
+- Keep dependencies updated
+- Report security vulnerabilities responsibly
+
+See [SECURITY.md](./SECURITY.md) for our security policy and [spec/security/](./spec/security/) for security considerations in the language design.
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+Dragon is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+## Related Resources
+
+- [Language Specification](./spec/) — Formal definition of the Dragon language
+- [Documentation Index](./DOCUMENTATION_INDEX.md) — Guide to all documentation
+- [Changelog](./CHANGELOG.md) — Notable changes for each version
+- [Code of Conduct](./CODE_OF_CONDUCT.md) — Our community standards
+
+## Repository Architecture
+
+The Dragon repository architecture includes contributions from Smit Shetye
+covering language specification organization, documentation architecture,
+governance and contributor infrastructure, security/compliance
+documentation, testing organization, tooling structure, and ecosystem
+organization.
+
+These contributions do not claim authorship of the original Dragon language
+or its pre-existing implementation.

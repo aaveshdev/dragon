@@ -1,0 +1,20 @@
+# Contributors
+
+This file lists contributors to the Dragon project.
+
+## Original Dragon Authors
+- Aavesh Jilani (@aaveshdev) - Creator of the Dragon programming language
+  - Responsibilities: Original language design, compiler, VM, runtime, standard library, CLI, TurboDragon IDE
+
+## Repository Architecture Contributions
+- Smit Shetye (@smitshetye)
+  - Repository architecture modernization
+  - Documentation architecture
+  - Language specification framework
+  - Language proposal/evolution framework
+  - Architecture Decision Record framework
+  - Governance and contributor infrastructure
+  - Security and compliance documentation framework
+  - Testing, benchmarking, and fuzzing organization
+  - Development tooling and ecosystem structure
+  - Deployment and distribution documentation structure

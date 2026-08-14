@@ -1,0 +1,38 @@
+# Credits
+
+## Dragon Programming Language
+The Dragon programming language was originally created by Aavesh Jilani (@aaveshdev).
+
+## Repository Architecture & Project Infrastructure
+Smit Shetye
+
+Contributed the repository architecture and project infrastructure
+surrounding the Dragon programming-language implementation, including:
+
+- Repository architecture modernization
+- Language specification organization
+- Language proposal and evolution framework
+- Architecture Decision Record (ADR) framework
+- Documentation architecture
+- Contributor documentation structure
+- Governance documentation structure
+- Security documentation structure
+- Compliance and regulatory documentation structure
+- Accessibility documentation structure
+- Testing and conformance-test organization
+- Benchmarking and fuzzing organization
+- Development tooling and ecosystem organization
+- Deployment and distribution documentation structure
+- GitHub repository workflow organization
+- Documentation index and project navigation structure
+
+These contributions concern repository architecture, documentation,
+development infrastructure, and project organization. They do not claim
+authorship of the original Dragon programming language or its
+pre-existing implementation.
+
+## AI-Assisted Development
+Some repository architecture and documentation work was developed with
+AI-assisted tooling under the direction, review, and authorship of Smit
+Shetye. AI tools are treated as development assistants and are not
+represented as copyright holders or project maintainers.
