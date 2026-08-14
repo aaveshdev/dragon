@@ -2,9 +2,33 @@
 
 use super::*;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Transpiler state
-// ─────────────────────────────────────────────────────────────────────────────
+fn collect_field_defaults(s: &Stmt, out: &mut Vec<Stmt>) {
+    match &s.node {
+        StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
+            for st in stmts { collect_field_defaults(st, out); }
+        }
+        StmtNode::FuncDef(..) => { /* handled separately as a method */ }
+        StmtNode::Expr(e) => {
+            if let ExprNode::Assign(target, value) = &e.node {
+                if let ExprNode::Var(name) = &target.node {
+                    let this_expr = Expr { node: ExprNode::This, line: e.line };
+                    let new_target = Expr {
+                        node: ExprNode::GetAttr(Box::new(this_expr), name.clone()),
+                        line: target.line,
+                    };
+                    let new_assign = Expr {
+                        node: ExprNode::Assign(Box::new(new_target), value.clone()),
+                        line: e.line,
+                    };
+                    out.push(Stmt { node: StmtNode::Expr(new_assign), line: s.line });
+                    return;
+                }
+            }
+            out.push(s.clone());
+        }
+        _ => { out.push(s.clone()); }
+    }
+}
 
 struct Transpiler {
     out: String,
@@ -60,15 +84,12 @@ impl Transpiler {
         self.declared.pop();
     }
 
-    // --- ADD THIS HELPER METHOD ---
     fn is_declared(&self, c_name: &str) -> bool {
         self.declared.iter().any(|scope| scope.contains(c_name))
     }
 
-    // --- REPLACE YOUR EXISTING decl_var WITH THIS ---
     fn decl_var(&mut self, name: &str) -> String {
         let c_name = mangle(name);
-        // Check all parent scopes to prevent shadowing outer variables!
         if !self.is_declared(&c_name) {
             if let Some(current) = self.declared.last_mut() {
                 current.insert(c_name.clone());
@@ -78,7 +99,6 @@ impl Transpiler {
         c_name
     }
 
-    // ── statement codegen ────────────────────────────────────────────────────
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match &stmt.node {
@@ -153,11 +173,6 @@ impl Transpiler {
             StmtNode::FuncDef(name, params, _req, body, _is_async) => {
                 let c_name = mangle(name);
 
-                // Hoist the C-level function. For recursive nested functions the body
-                // refers to the function's own DgnVal by name. We inject a self-binding
-                // as the very first line of the hoisted body so the recursive call resolves.
-                // Strategy: emit_named_fn writes into self.hoisted; we patch in the
-                // self-binding by temporarily prepending it to the body via a wrapper.
                 {
                     let saved_indent = self.indent;
                     self.indent = 0;
@@ -474,7 +489,7 @@ impl Transpiler {
             ExprNode::Unary(op, operand) => {
                 let (pre, val) = self.emit_expr(operand);
                 let result = match op.as_str() {
-                    "!" => format!("dgn_not({})", val),
+                    "!" | "not" => format!("dgn_not({})", val),
                     "-" => format!("dgn_neg({})", val),
                     "~" => format!("dgn_bitnot({})", val),
                     _ => format!("dgn_unary(\"{}\", {})", op, val),
@@ -708,6 +723,48 @@ impl Transpiler {
                         (pre, c_name)
                     }
                 }
+                ExprNode::GetAttr(obj, attr) => {
+                    let (opre, oval) = self.emit_expr(obj);
+                    let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
+                    let indent = "    ".repeat(self.indent);
+                    let mut pre = opre;
+                    let is_call = oval.contains('(');
+                    let obj_lval = if is_call {
+                        let tmp = self.fresh_tmp();
+                        writeln!(pre, "{}DgnVal {} = {};", indent, tmp, oval).unwrap();
+                        tmp
+                    } else { oval };
+                    let old_tmp = self.fresh_tmp();
+                    writeln!(pre, "{}DgnVal {} = dgn_get_attr({}, \"{}\");", indent, old_tmp, obj_lval, escape_c_string(attr)).unwrap();
+                    let new_tmp = self.fresh_tmp();
+                    let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
+                    writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, old_tmp).unwrap();
+                    writeln!(pre, "{}dgn_set_attr(&{}, \"{}\", {});", indent, obj_lval, escape_c_string(attr), new_tmp).unwrap();
+                    (pre, new_tmp)
+                }
+                ExprNode::Index(obj, idx) => {
+                    let (opre, oval) = self.emit_expr(obj);
+                    let (ipre, ival) = self.emit_expr(idx);
+                    let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
+                    let indent = "    ".repeat(self.indent);
+                    let mut pre = opre;
+                    pre.push_str(&ipre);
+                    let is_call = oval.contains('(');
+                    let obj_lval = if is_call {
+                        let tmp = self.fresh_tmp();
+                        writeln!(pre, "{}DgnVal {} = {};", indent, tmp, oval).unwrap();
+                        tmp
+                    } else { oval };
+                    let idx_tmp = self.fresh_tmp();
+                    writeln!(pre, "{}DgnVal {} = {};", indent, idx_tmp, ival).unwrap();
+                    let old_tmp = self.fresh_tmp();
+                    writeln!(pre, "{}DgnVal {} = dgn_get_index({}, {});", indent, old_tmp, obj_lval, idx_tmp).unwrap();
+                    let new_tmp = self.fresh_tmp();
+                    let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
+                    writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, old_tmp).unwrap();
+                    writeln!(pre, "{}dgn_set_index(&{}, {}, {});", indent, obj_lval, idx_tmp, new_tmp).unwrap();
+                    (pre, new_tmp)
+                }
                 _ => {
                     let (pre, val) = self.emit_expr(operand);
                     let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
@@ -739,6 +796,48 @@ impl Transpiler {
                         }
                         (pre, tmp)
                     }
+                }
+                ExprNode::GetAttr(obj, attr) => {
+                    let (opre, oval) = self.emit_expr(obj);
+                    let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
+                    let indent = "    ".repeat(self.indent);
+                    let mut pre = opre;
+                    let is_call = oval.contains('(');
+                    let obj_lval = if is_call {
+                        let tmp = self.fresh_tmp();
+                        writeln!(pre, "{}DgnVal {} = {};", indent, tmp, oval).unwrap();
+                        tmp
+                    } else { oval };
+                    let old_tmp = self.fresh_tmp();
+                    writeln!(pre, "{}DgnVal {} = dgn_get_attr({}, \"{}\");", indent, old_tmp, obj_lval, escape_c_string(attr)).unwrap();
+                    let new_tmp = self.fresh_tmp();
+                    let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
+                    writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, old_tmp).unwrap();
+                    writeln!(pre, "{}dgn_set_attr(&{}, \"{}\", {});", indent, obj_lval, escape_c_string(attr), new_tmp).unwrap();
+                    (pre, old_tmp) // PostOp returns old value
+                }
+                ExprNode::Index(obj, idx) => {
+                    let (opre, oval) = self.emit_expr(obj);
+                    let (ipre, ival) = self.emit_expr(idx);
+                    let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
+                    let indent = "    ".repeat(self.indent);
+                    let mut pre = opre;
+                    pre.push_str(&ipre);
+                    let is_call = oval.contains('(');
+                    let obj_lval = if is_call {
+                        let tmp = self.fresh_tmp();
+                        writeln!(pre, "{}DgnVal {} = {};", indent, tmp, oval).unwrap();
+                        tmp
+                    } else { oval };
+                    let idx_tmp = self.fresh_tmp();
+                    writeln!(pre, "{}DgnVal {} = {};", indent, idx_tmp, ival).unwrap();
+                    let old_tmp = self.fresh_tmp();
+                    writeln!(pre, "{}DgnVal {} = dgn_get_index({}, {});", indent, old_tmp, obj_lval, idx_tmp).unwrap();
+                    let new_tmp = self.fresh_tmp();
+                    let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
+                    writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, old_tmp).unwrap();
+                    writeln!(pre, "{}dgn_set_index(&{}, {}, {});", indent, obj_lval, idx_tmp, new_tmp).unwrap();
+                    (pre, old_tmp) // PostOp returns old value
                 }
                 _ => {
                     let (pre, val) = self.emit_expr(operand);
@@ -1248,6 +1347,19 @@ impl Transpiler {
                     .unwrap();
                 }
             }
+            let mut field_stmts = Vec::new();
+            for s in stmts { collect_field_defaults(s, &mut field_stmts); }
+            let fi_fn_c = format!("{}___fieldinit__", mangle(name));
+            let fi_body = Stmt { node: StmtNode::Block(field_stmts), line: body.line };
+            let fi_params = vec![("this".to_string(), None)];
+            self.emit_named_fn(&fi_fn_c, &fi_params, &fi_body);
+            let c_name = mangle(name);
+            writeln!(
+                self.out,
+                "{}dgn_class_add_method(&{}, \"__field_init__\", _fn_{}, 1);",
+                indent, c_name, fi_fn_c
+            )
+            .unwrap();
         }
 
         if let Some(p) = parent {
@@ -1806,6 +1918,12 @@ fn hoist_top_level(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
                         t.emit_named_fn(&fn_c, &all_params, mbody);
                     }
                 }
+                let mut field_stmts = Vec::new();
+                for s in stmts { collect_field_defaults(s, &mut field_stmts); }
+                let fi_fn_c = format!("{}___fieldinit__", mangle(name));
+                let fi_body = Stmt { node: StmtNode::Block(field_stmts), line: body.line };
+                let fi_params = vec![("this".to_string(), None)];
+                t.emit_named_fn(&fi_fn_c, &fi_params, &fi_body);
             }
         }
         // ── NEW: hoist functions from user .dgn modules ──────────────────
@@ -2118,6 +2236,11 @@ fn emit_top_level_body(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
                         writeln!(t.out, "{}dgn_class_add_method(&{}, \"{}\", _fn_{}, {});", indent, c_name, escape_c_string(mname), fn_c, params.len()).unwrap();
                     }
                 }
+            }
+            {
+                let c_name = mangle(name);
+                let fi_fn_c = format!("{}___fieldinit__", mangle(name));
+                writeln!(t.out, "{}dgn_class_add_method(&{}, \"__field_init__\", _fn_{}, 1);", indent, c_name, fi_fn_c).unwrap();
             }
             if let Some(p) = parent {
                 let c_name = mangle(name);

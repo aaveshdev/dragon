@@ -207,8 +207,15 @@ static void dgn_gc_collect() {
 }
 
 static void* dgn_gc_alloc(size_t size, DgnTag tag) {
-    static int alloc_count = 0;
-    if(++alloc_count > 1000) { dgn_gc_collect(); alloc_count = 0; }
+    /* The old auto-trigger here ran a conservative stack-scanning collector
+       every 1000 allocations. That technique is unsound once the C source
+       is compiled with optimizations (-O2 is always used by --native): the
+       compiler is free to keep live DgnVal pointers purely in registers,
+       which are invisible to the stack scanner, so live objects could be
+       freed while still in use. For short-lived CLI programs it's much
+       safer to just let allocations accumulate and let the OS reclaim
+       everything at process exit. Call dgn_gc_collect() manually/explicitly
+       if you ever need to reduce peak memory in a long-running program. */
     GcHeader* hdr = (GcHeader*)malloc(sizeof(GcHeader) + size);
     hdr->marked = 0;
     hdr->tag = tag;
@@ -962,6 +969,14 @@ static DgnVal dgn_new_instance(DgnVal cls, DgnVal* args, int n) {
     DgnVal inst; inst.tag=DGN_INSTANCE;
     inst.map=(DgnMap*)dgn_gc_alloc(sizeof(DgnMap), DGN_INSTANCE); inst.map->cap=8; inst.map->entries=(DgnMapEntry*)calloc(8,sizeof(DgnMapEntry));
     if(cls.tag==DGN_CLASS||cls.tag==DGN_MAP){ for(int i=0;i<cls.map->cap;i++) if(cls.map->entries[i].used) dgn_map_set(&inst,cls.map->entries[i].key,cls.map->entries[i].val); }
+    /* Run the synthesized field-default initializer (from bare `name = expr;`
+       declarations in the class body) fresh for this instance, BEFORE init()
+       so an explicit init() can still override any of them. This must be a
+       real per-instance call (not a value copied from the class map) so that
+       mutable defaults like `threads = list();` don't get shared across
+       every instance of the class. */
+    DgnVal field_init_fn=dgn_map_get(inst,"__field_init__");
+    if(field_init_fn.tag==DGN_FUNC){ DgnVal fi_args[1]; fi_args[0]=inst; dgn_call_val(field_init_fn,fi_args,1); }
     DgnVal init_fn=dgn_map_get(inst,"init");
     if(init_fn.tag==DGN_FUNC){ DgnVal* nargs=(DgnVal*)malloc((size_t)(n+1)*sizeof(DgnVal)); nargs[0]=inst; memcpy(nargs+1,args,(size_t)n*sizeof(DgnVal)); dgn_call_val(init_fn,nargs,n+1); free(nargs); }
     return inst;
