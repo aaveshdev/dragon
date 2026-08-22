@@ -240,7 +240,7 @@ impl Editor {
                 Buffer::from_str("config.dgn",
                     "\n APP  = \"MyDragonApp\"\nVER  = \"1.0.0\"\nDEBUG = false\n\nfunc get_config() {\n  return { name: APP, version: VER }\n}\n get_config() "),
             ],
-            active:     0,s
+            active:     0,
             cur_row:    0,
             cur_col:    0,
             scroll_top: 0,
