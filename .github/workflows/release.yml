@@ -83,6 +83,8 @@ jobs:
           stage="dragon-${{ inputs.version }}-${{ matrix.name }}"
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
+          [ -f "target/${{ matrix.target }}/release/libdragon_lib.so" ] && cp "target/${{ matrix.target }}/release/libdragon_lib.so" "$stage/"
+          [ -f "target/${{ matrix.target }}/release/libdragon_lib.dylib" ] && cp "target/${{ matrix.target }}/release/libdragon_lib.dylib" "$stage/"
           [ -f README.md ] && cp README.md "$stage/"
           [ -f ANDROID_DEVELOPMENT.md ] && cp ANDROID_DEVELOPMENT.md "$stage/"
           [ -f LICENSE ] && cp LICENSE "$stage/"
@@ -96,6 +98,8 @@ jobs:
           $stage = "dragon-${{ inputs.version }}-${{ matrix.name }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" -Destination $stage
+          $dll_path = "target/${{ matrix.target }}/release/dragon_lib.dll"
+          if (Test-Path $dll_path) { Copy-Item $dll_path -Destination $stage }
           foreach ($f in @("README.md", "ANDROID_DEVELOPMENT.md", "LICENSE")) {
             if (Test-Path $f) { Copy-Item $f -Destination $stage }
           }
@@ -109,30 +113,9 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
-  source:
-    name: Source archive
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build source archive
-        run: |
-          set -euo pipefail
-          name="dragon-${{ inputs.version }}-src"
-          git archive --format=tar.gz --prefix="${name}/" -o "${name}.tar.gz" HEAD
-          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: source
-          path: ${{ env.ASSET }}
-          if-no-files-found: error
-
   release:
     name: Publish release
-    needs: [build, source]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
