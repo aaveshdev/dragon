@@ -1,0 +1,367 @@
+
+func widget_array(children: strlist) {
+    out = "";
+    first = True;
+    for child in children {
+        if (first) {
+            out = child;
+            first = False;
+        } else {
+            out = out + "," + child;
+        }
+    }
+    return "[" + out + "]";
+}
+
+
+func Text(content: str) {
+    return "{\"type\":\"text\",\"text\":\"" + json_escape(content) + "\"}";
+}
+
+
+func StyledText(content: str, color: str, size: int, align: str) {
+    return "{\"type\":\"text\",\"text\":\"" + json_escape(content) + "\",\"color\":\"" + json_escape(color)
+        + "\",\"size\":" + size + ",\"align\":\"" + json_escape(align) + "\"}";
+}
+
+func Icon(name: str) {
+    return "{\"type\":\"icon\",\"name\":\"" + json_escape(name) + "\"}";
+}
+func StyledIcon(name: str, color: str) {
+    return "{\"type\":\"icon\",\"name\":\"" + json_escape(name) + "\",\"color\":\"" + json_escape(color) + "\"}";
+}
+
+func Image(url: str) {
+    return "{\"type\":\"image\",\"url\":\"" + json_escape(url) + "\"}";
+}
+func SizedImage(url: str, height_dp: int) {
+    return "{\"type\":\"image\",\"url\":\"" + json_escape(url) + "\",\"height\":" + height_dp + "}";
+}
+
+
+func ElevatedButton(label: str, event: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+func ColoredButton(label: str, event: str, bg: str, fg: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
+        + "\",\"bg\":\"" + json_escape(bg) + "\",\"fg\":\"" + json_escape(fg) + "\"}";
+}
+
+
+func LongPressButton(label: str, event: str, long_event: str, bg: str, fg: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
+        + "\",\"longEvent\":\"" + json_escape(long_event) + "\",\"bg\":\"" + json_escape(bg)
+        + "\",\"fg\":\"" + json_escape(fg) + "\"}";
+}
+
+func TextField(value: str, placeholder: str, event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+func FocusTextField(value: str, placeholder: str, change_event: str, focus_event: str, blur_event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(change_event) + "\",\"focusEvent\":\"" + json_escape(focus_event)
+        + "\",\"blurEvent\":\"" + json_escape(blur_event) + "\"}";
+}
+
+func Checkbox(checked: bool, label: str, event: str) {
+    checked_str = "false";
+    if (checked) {
+        checked_str = "true";
+    }
+    return "{\"type\":\"checkbox\",\"checked\":" + checked_str + ",\"label\":\"" + json_escape(label)
+        + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+func Switch(checked: bool, event: str) {
+    checked_str = "false";
+    if (checked) {
+        checked_str = "true";
+    }
+    return "{\"type\":\"switch\",\"checked\":" + checked_str + ",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+func Slider(value: float, min_val: float, max_val: float, event: str) {
+    return "{\"type\":\"slider\",\"value\":" + value + ",\"min\":" + min_val + ",\"max\":" + max_val
+        + ",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+
+func Column(children: strlist) {
+    return "{\"type\":\"column\",\"children\":" + widget_array(children) + "}";
+}
+
+func Row(children: strlist) {
+    return "{\"type\":\"row\",\"children\":" + widget_array(children) + "}";
+}
+
+func Stack(children: strlist) {
+    return "{\"type\":\"stack\",\"children\":" + widget_array(children) + "}";
+}
+
+func ListView(children: strlist) {
+    return "{\"type\":\"list_view\",\"children\":" + widget_array(children) + "}";
+}
+
+func GridView(children: strlist, columns: int) {
+    return "{\"type\":\"grid\",\"children\":" + widget_array(children) + ",\"columns\":" + columns + "}";
+}
+
+func Divider() {
+    return "{\"type\":\"divider\"}";
+}
+
+
+func SizedBox(child: str, width_dp: int, height_dp: int) {
+    return "{\"type\":\"sized_box\",\"width\":" + width_dp + ",\"height\":" + height_dp + ",\"child\":" + child + "}";
+}
+
+func Center(child: str) {
+    return Align(child, "center");
+}
+
+func Align(child: str, alignment: str) {
+    return "{\"type\":\"align\",\"alignment\":\"" + json_escape(alignment) + "\",\"child\":" + child + "}";
+}
+
+func Padding(child: str, all: int) {
+    return "{\"type\":\"padding\",\"all\":" + all + ",\"child\":" + child + "}";
+}
+
+
+func Container(child: str, width_dp: int, height_dp: int, bg: str) {
+    return "{\"type\":\"container\",\"width\":" + width_dp + ",\"height\":" + height_dp
+        + ",\"bg\":\"" + json_escape(bg) + "\",\"child\":" + child + "}";
+}
+
+func Expanded(child: str) {
+    return Flexible(child, 1);
+}
+
+func Flexible(child: str, flex: int) {
+    return "{\"type\":\"flexible\",\"flex\":" + flex + ",\"child\":" + child + "}";
+}
+
+func Spacer() {
+    return Flexible("{\"type\":\"spacer_content\"}", 1);
+}
+
+
+func Card(children: strlist) {
+    return "{\"type\":\"card\",\"children\":" + widget_array(children) + "}";
+}
+func ColoredCard(children: strlist, bg: str) {
+    return "{\"type\":\"card\",\"children\":" + widget_array(children) + ",\"bg\":\"" + json_escape(bg) + "\"}";
+}
+
+func AppBar(title: str) {
+    return "{\"type\":\"app_bar\",\"title\":\"" + json_escape(title) + "\"}";
+}
+
+func FloatingActionButton(label: str, event: str) {
+    return "{\"type\":\"fab\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+func WebView(url: str) {
+    return "{\"type\":\"webview\",\"url\":\"" + json_escape(url) + "\"}";
+}
+
+func Scaffold(drawer_children: strlist, body: str, open_event: str) {
+    return "{\"type\":\"drawer_scaffold\",\"drawer\":" + widget_array(drawer_children) + ",\"content\":" + body
+        + ",\"event\":\"" + json_escape(open_event) + "\"}";
+}
+
+func MenuButton() {
+    return ElevatedButton("=", "__toggle_drawer__");
+}
+
+
+storage_dir = "";
+asset_dir = "";
+
+func set_storage_dir(path: str) {
+    storage_dir = path;
+    return 0;
+}
+func set_asset_dir(path: str) {
+    asset_dir = path;
+    return 0;
+}
+
+func doc_path(filename: str) {
+    return storage_dir + "/" + filename;
+}
+func asset_path(filename: str) {
+    return asset_dir + "/" + filename;
+}
+
+func read_doc(filename: str) {
+    return file_read(doc_path(filename));
+}
+func write_doc(filename: str, content: str) {
+    return file_write(doc_path(filename), content);
+}
+func append_doc(filename: str, content: str) {
+    return file_append(doc_path(filename), content);
+}
+func doc_exists(filename: str) {
+    return file_exists(doc_path(filename));
+}
+func delete_doc(filename: str) {
+    return file_delete(doc_path(filename));
+}
+
+func read_asset(filename: str) {
+    return file_read(asset_path(filename));
+}
+func asset_exists(filename: str) {
+    return file_exists(asset_path(filename));
+}
+
+
+func GestureDetector(child: str, event: str) {
+    return "{\"type\":\"gesture_detector\",\"event\":\"" + json_escape(event) + "\",\"child\":" + child + "}";
+}
+
+func LongPressDetector(child: str, event: str, long_event: str) {
+    return "{\"type\":\"gesture_detector\",\"event\":\"" + json_escape(event) + "\",\"longEvent\":\"" + json_escape(long_event)
+        + "\",\"child\":" + child + "}";
+}
+
+
+func Positioned(child: str, top: int, left: int, right: int, bottom: int) {
+    return "{\"type\":\"positioned\",\"top\":" + top + ",\"left\":" + left + ",\"right\":" + right
+        + ",\"bottom\":" + bottom + ",\"child\":" + child + "}";
+}
+
+
+func Wrap(children: strlist) {
+    return "{\"type\":\"wrap\",\"children\":" + widget_array(children) + "}";
+}
+
+
+func AspectRatio(child: str, width_ratio: int, height_ratio: int) {
+    return "{\"type\":\"aspect_ratio\",\"widthRatio\":" + width_ratio + ",\"heightRatio\":" + height_ratio
+        + ",\"child\":" + child + "}";
+}
+
+// percent: 0-100. 0 = fully invisible, 100 = fully opaque (default).
+func Opacity(child: str, percent: int) {
+    return "{\"type\":\"opacity\",\"percent\":" + percent + ",\"child\":" + child + "}";
+}
+
+func Visibility(child: str, visible: bool) {
+    visible_str = "false";
+    if (visible) {
+        visible_str = "true";
+    }
+    return "{\"type\":\"visibility\",\"visible\":" + visible_str + ",\"child\":" + child + "}";
+}
+
+// A small rounded pill, typically for tags/filters/categories.
+func Chip(label: str, event: str) {
+    return "{\"type\":\"chip\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+// A small numbered overlay pinned to the top-right corner of `child` --
+// e.g. an unread-count badge on a notification Icon(). count <= 0 hides
+// the badge entirely (shows just `child`, unbadged).
+func Badge(child: str, count: int) {
+    return "{\"type\":\"badge\",\"count\":" + count + ",\"child\":" + child + "}";
+}
+
+// ── Selection ────────────────────────────────────────────────────────────
+
+// A single-select group, rendered as a column of radio options. `options`
+// are the labels shown; `selected` is which one is currently checked
+// (must match one of `options` exactly, or none will show checked); fires
+// "<event>:<label>" when a different option is tapped -- same convention
+// as TextField's change event.
+func RadioGroup(options: strlist, selected: str, event: str) {
+    return "{\"type\":\"radio_group\",\"options\":" + widget_array_of_strings(options)
+        + ",\"selected\":\"" + json_escape(selected) + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+// A tap-to-open list of options. `selected` is the currently shown value
+// (must match one of `options`, or the field just shows blank); fires
+// "<event>:<label>" when a different option is chosen.
+func DropdownButton(options: strlist, selected: str, event: str) {
+    return "{\"type\":\"dropdown\",\"options\":" + widget_array_of_strings(options)
+        + ",\"selected\":\"" + json_escape(selected) + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+// Shared plumbing for RadioGroup()/DropdownButton() -- a JSON array of
+// plain (escaped) strings, as opposed to widget_array()'s array of
+// already-built widget JSON objects.
+func widget_array_of_strings(items: strlist) {
+    out = "";
+    first = True;
+    for item in items {
+        piece = "\"" + json_escape(item) + "\"";
+        if (first) {
+            out = piece;
+            first = False;
+        } else {
+            out = out + "," + piece;
+        }
+    }
+    return "[" + out + "]";
+}
+
+// ── Feedback ─────────────────────────────────────────────────────────────
+
+// A spinning, indeterminate loading indicator.
+func CircularProgress() {
+    return "{\"type\":\"circular_progress\"}";
+}
+
+// value: 0.0-1.0. A determinate horizontal progress bar (e.g. a download
+// or upload's actual percentage) -- use CircularProgress() instead for
+// "working, but no known duration/percentage" states.
+func LinearProgress(value: float) {
+    return "{\"type\":\"linear_progress\",\"value\":" + value + "}";
+}
+
+// A modal popup, found anywhere in your tree (like FloatingActionButton,
+// it doesn't need to be a direct child of anything specific) and shown
+// when `visible` is True, blocking interaction with the rest of the
+// screen until dismissed. confirm_event/dismiss_event fire when their
+// respective button is tapped -- your on_event should set `visible` back
+// to False in response to whichever one fires (the dialog doesn't close
+// itself; Dragon's state is always the source of truth for what's on
+// screen, same as everything else in this schema).
+func AlertDialog(visible: bool, title: str, message: str, confirm_label: str, confirm_event: str, dismiss_label: str, dismiss_event: str) {
+    visible_str = "false";
+    if (visible) {
+        visible_str = "true";
+    }
+    return "{\"type\":\"alert_dialog\",\"visible\":" + visible_str + ",\"title\":\"" + json_escape(title)
+        + "\",\"message\":\"" + json_escape(message) + "\",\"confirmLabel\":\"" + json_escape(confirm_label)
+        + "\",\"confirmEvent\":\"" + json_escape(confirm_event) + "\",\"dismissLabel\":\"" + json_escape(dismiss_label)
+        + "\",\"dismissEvent\":\"" + json_escape(dismiss_event) + "\"}";
+}
+
+// A transient bottom message, found anywhere in your tree. Same
+// visible-is-the-source-of-truth convention as AlertDialog -- your
+// on_event should set `visible` back to False when action_event fires (or
+// on a timer via whatever periodic-tick mechanism your app already uses,
+// if you want it to auto-dismiss).
+func Snackbar(visible: bool, message: str, action_label: str, action_event: str) {
+    visible_str = "false";
+    if (visible) {
+        visible_str = "true";
+    }
+    return "{\"type\":\"snackbar\",\"visible\":" + visible_str + ",\"message\":\"" + json_escape(message)
+        + "\",\"actionLabel\":\"" + json_escape(action_label) + "\",\"actionEvent\":\"" + json_escape(action_event) + "\"}";
+}
+
+
+// A bottom tab bar. `labels` are the tab names; `selected_index` is which
+// one is currently active; fires "<event>:<index>" when a different tab
+// is tapped.
+func BottomNavigationBar(labels: strlist, selected_index: int, event: str) {
+    return "{\"type\":\"bottom_nav\",\"labels\":" + widget_array_of_strings(labels)
+        + ",\"selected\":" + selected_index + ",\"event\":\"" + json_escape(event) + "\"}";
+}

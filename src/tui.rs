@@ -1,8 +1,3 @@
-// ============================================================
-//  src/tui.rs — TurboDragon IDE  (drop-in, no engine changes)
-//  Dependency: crossterm = "0.27"  (add to Cargo.toml)
-// ============================================================
-
 use std::io::{self, Write};
 use std::fs;
 use std::path::Path;
@@ -15,7 +10,6 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 
-// ── Palette ──────────────────────────────────────────────────────
 const C_DKBLUE: Color = Color::DarkBlue;
 const C_BLUE:   Color = Color::Blue;
 const C_GREY:   Color = Color::Grey;
@@ -27,7 +21,6 @@ const C_GREEN:  Color = Color::Green;
 const C_RED:    Color = Color::Red;
 const C_MGNT:   Color = Color::Magenta;
 
-// ── Public entry point ───────────────────────────────────────────
 pub fn run_tui_ide(version: &str, build: &str, author: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
@@ -45,14 +38,13 @@ pub fn run_tui_ide(version: &str, build: &str, author: &str) -> io::Result<()> {
     result
 }
 
-// ── Data structures ──────────────────────────────────────────────
 struct Buffer {
     name:    String,
     lines:   Vec<Vec<char>>,
     dirty:   bool,
     path:    Option<String>,
-    undo_stack: Vec<(Vec<Vec<char>>, usize, usize)>,  // Add this
-    redo_stack: Vec<(Vec<Vec<char>>, usize, usize)>,  // Add this
+    undo_stack: Vec<(Vec<Vec<char>>, usize, usize)>, 
+    redo_stack: Vec<(Vec<Vec<char>>, usize, usize)>, 
 }
 
 impl Buffer {
@@ -62,8 +54,8 @@ impl Buffer {
             lines: src.lines().map(|l| l.chars().collect()).collect(),
             dirty: false,
             path:  None,
-            undo_stack: Vec::new(), // Fix: initialize with Vec::new()
-            redo_stack: Vec::new(), // Fix: initialize with Vec::new()
+            undo_stack: Vec::new(), 
+            redo_stack: Vec::new(), 
         }
     }
 
@@ -218,19 +210,19 @@ impl Modal {
     fn hide(&mut self) { self.visible = false; }
 }
 
-// ── Editor state ─────────────────────────────────────────────────
 struct Editor {
     buffers:    Vec<Buffer>,
     active:     usize,
     cur_row:    usize,
     cur_col:    usize,
-    scroll_top: usize,   // first visible line in editor
+    scroll_top: usize,   
     output:     OutputLog,
     modal:      Modal,
     status:     String,
-    menu_focus: bool,    // whether menu bar is highlighted
+    menu_focus: bool,   
     search_term:   String,
-    search_pos:    Option<(usize, usize)>,   // last found (row, col)
+    search_pos:    Option<(usize, usize)>,   
+    version:       String,
 }
 
 impl Editor {
@@ -242,13 +234,13 @@ impl Editor {
         Editor {
             buffers: vec![
                 Buffer::from_str("main.dgn",
-                    "\nfunc main() {\n  showln(\"Hello, Dragon World!\")\n   greeting = greet(\"World\")\n  showln(greeting)\n}\n\nfunc greet(name) {\n  return \"Hello, \" + name\n}"),
+                    "\nfunc main() {\n  showln(\"Hello, Dragon World!\")\n   greeting = greet(\"World\")\n  showln(greeting)\n}\n\nfunc greet(name) {\n  return \"Hello, \" + name\n}\n main() "),
                 Buffer::from_str("utils.dgn",
                     "\nfunc add(a, b) {\n  return a + b\n}\n\nfunc max(a, b) {\n  if a > b {\n    return a\n  }\n  return b\n}"),
                 Buffer::from_str("config.dgn",
-                    "\n APP  = \"MyDragonApp\"\nlet VER  = \"1.0.0\"\nlet DEBUG = false\n\nfunc get_config() {\n  return { name: APP, version: VER }\n}"),
+                    "\n APP  = \"MyDragonApp\"\nVER  = \"1.0.0\"\nDEBUG = false\n\nfunc get_config() {\n  return { name: APP, version: VER }\n}\n get_config() "),
             ],
-            active:     0,
+            active:     0,s
             cur_row:    0,
             cur_col:    0,
             scroll_top: 0,
@@ -257,7 +249,8 @@ impl Editor {
             status: "Ready".to_string(),
             menu_focus: false,
             search_term: String::new(),
-             search_pos: None,
+            search_pos: None,
+            version: version.to_string(),
         }
     }
 
@@ -302,11 +295,9 @@ impl Editor {
         self.output.push(C_YELLOW, "Running...");
         self.status = format!("Run: {}", name);
 
-        // 1. Get the source code of the current buffer
         let src = self.buf().text();
         let file_path = self.buf().path.clone().unwrap_or_else(|| name.clone());
 
-        // 2. Lexical Analysis
         let tokens = match crate::engine::lex(&src) {
             Ok(t) => t,
             Err(e) => {
@@ -315,7 +306,6 @@ impl Editor {
             }
         };
 
-        // 3. Parsing
         let mut parser = crate::engine::Parser::new(tokens);
         let ast = match parser.parse() {
             Ok(stmt) => stmt,
@@ -325,18 +315,15 @@ impl Editor {
             }
         };
 
-        // 4. Compilation
         let mut chunk = crate::engine::Chunk::new();
         crate::engine::Compiler::compile_stmt(&mut chunk, &ast);
         chunk.emit(crate::engine::Instruction::Halt, 0);
 
-        // 5. Environment & Built-ins Setup
         let env = std::sync::Arc::new(std::sync::Mutex::new(
             crate::engine::Env::new(None, Some(std::path::PathBuf::from(file_path)))
         ));
         crate::engine::populate_builtins(env.clone());
 
-        // 6. Hook standard output (show/showln) to capture text into the TUI
         let output_cap = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         
         let cap_clone1 = output_cap.clone();
@@ -357,22 +344,19 @@ impl Editor {
         let (tx_reply,  rx_reply)  = std::sync::mpsc::channel::<String>();
 
         let tx_p = tx_prompt.clone();
-        // Wrap the receiver in Arc<Mutex<...>> to make it Sync
         let rx_r_arc = std::sync::Arc::new(std::sync::Mutex::new(rx_reply));          
 
         let _ = env.lock().unwrap().set("readln", crate::engine::native_fn(move |args| {
             let prompt = args.get(0)
                 .map(crate::engine::val_to_string)
                 .unwrap_or_default();
-            // send prompt to TUI thread
             let _ = tx_p.send(prompt);
             
-            // Lock the mutex to receive the reply
             let reply = rx_r_arc.lock().unwrap().recv().unwrap_or_default();
             
             Ok(crate::engine::DgnValue::String(reply))
         }));
-        // 7. Execution (Requires Tokio since engine VM is async)
+    
         let mut vm = crate::engine::Vm::new();
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -386,24 +370,18 @@ impl Editor {
         let chunk_for_task = chunk_arc.clone();
         let env_for_task   = env.clone();
 
-        // Spawn the VM on a background thread so the main thread can
-        // service readln prompts without blocking.
         let vm_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let mut vm = crate::engine::Vm::new();
             rt.block_on(vm.run(&chunk_for_task, env_for_task))
         });
 
-        // Pump readln requests while VM runs
         loop {
-            // Check if VM finished
             if vm_handle.is_finished() { break; }
 
-            // Check for a pending readln prompt (non-blocking)
             if let Ok(prompt) = rx_prompt.try_recv() {
                 let typed = tui_readln(stdout, &prompt, cols, rows)
                     .unwrap_or_default();
-                // Log the interaction to the output panel
                 self.output.push(C_CYAN,  &format!("> {}{}", prompt, typed));
                 let _ = tx_reply.send(typed);
             }
@@ -414,17 +392,15 @@ impl Editor {
             crate::engine::DgnError::new("VM thread panicked", 0)
         ));
 
-        // 8. Flush captured output to the TUI's output panel
         {
             let lines = output_cap.lock().unwrap();
             for line in lines.iter() {
-                for sub in line.lines() { // Split by \n so multi-line outputs render correctly
+                for sub in line.lines() { 
                     self.output.push(C_WHITE, sub);
                 }
             }
         }
 
-        // 9. Handle Execution Results & Errors
         match result {
             Ok(_) => {
                 self.output.push(C_CYAN, "[Process completed successfully]");
@@ -483,15 +459,18 @@ impl Editor {
     }
 
     fn show_about(&mut self) {
-        self.modal.show("About TurboDragon IDE",
+        let body = format!(
             "  ████████╗██╗   ██╗██████╗ ██████╗  ██████╗ \n\
              ─────────────────────────────────────────────\n\
              TurboDragon IDE v1.0\n\
-             Dragon Programming Language v1.0.6\n\
+             Dragon Programming Language v{}\n\
              ─────────────────────────────────────────────\n\
              Inspired by Turbo C / Turbo Pascal IDEs.\n\
              Built with Rust + crossterm.\n\n\
-             Press any key to close.");
+             Press any key to close.",
+            self.version
+        );
+        self.modal.show("About TurboDragon IDE", &body);
     }
 
     fn find_next(&mut self) {
@@ -517,8 +496,6 @@ impl Editor {
     }
 }
 
-// ── Syntax highlighter ───────────────────────────────────────────
-// REPLACE lines 402–409:
 const KEYWORDS: &[&str] = &[
     "func", "let", "return", "if", "else", "elif",
     "while", "for", "in", "break", "continue",
@@ -586,7 +563,6 @@ fn tokenize(line: &str) -> Vec<Token> {
     tokens
 }
 
-// ── Rendering ────────────────────────────────────────────────────
 const SIDEBAR_W:  u16 = 20;
 const OUTPUT_H:   u16 = 8;
 const MENUBAR_H:  u16 = 1;
@@ -599,7 +575,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
     let editor_top     = MENUBAR_H + TABBAR_H + EDTITLE_H;
     let editor_h       = (output_sep_row - editor_top) as usize;
 
-    // ── Menu bar ─────────────────────────────────────────────────
     queue!(stdout, cursor::MoveTo(0, 0),
         SetBackgroundColor(C_GREY), SetForegroundColor(C_BLACK))?;
     let menu = "  File  Edit  Run  Compile  Options  Help  ";
@@ -608,7 +583,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
     queue!(stdout, Print(menu), Print(" ".repeat(pad)),
         SetForegroundColor(C_DKBLUE), Print(title), ResetColor)?;
 
-    // ── Tab bar ───────────────────────────────────────────────────
     queue!(stdout, cursor::MoveTo(0, MENUBAR_H),
         SetBackgroundColor(C_DKBLUE))?;
     let mut tab_x = 0u16;
@@ -626,7 +600,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
         Print(" ".repeat((cols as usize).saturating_sub(tab_x as usize))),
         ResetColor)?;
 
-    // ── Editor title bar ──────────────────────────────────────────
     let title_row = MENUBAR_H + TABBAR_H;
     queue!(stdout, cursor::MoveTo(0, title_row),
         SetBackgroundColor(C_GREY), SetForegroundColor(C_BLACK))?;
@@ -635,7 +608,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
     let ed_title = format!(" {}{}", fname, mod_flag);
     queue!(stdout, Print(format!("{:<width$}", ed_title, width=cols as usize)), ResetColor)?;
 
-    // ── Sidebar ───────────────────────────────────────────────────
     for row_idx in 0..editor_h {
         let screen_row = editor_top + row_idx as u16;
         queue!(stdout, cursor::MoveTo(0, screen_row))?;
@@ -654,7 +626,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
         queue!(stdout, ResetColor)?;
     }
 
-    // ── Editor body ───────────────────────────────────────────────
     let editor_left  = SIDEBAR_W;
     let editor_width = (cols - SIDEBAR_W) as usize;
 
@@ -671,17 +642,14 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
         if let Some(line_chars) = ed.buf().lines.get(file_row) {
             let line_str: String = line_chars.iter().collect();
 
-            // line number (4 chars)
             queue!(stdout, SetForegroundColor(Color::DarkGrey),
                 Print(format!("{:3} ", file_row + 1)))?;
 
-            // code with syntax highlighting
             if is_cursor_row {
-                // print before cursor, cursor block, after cursor
                 let before: String = line_chars[..ed.cur_col.min(line_chars.len())].iter().collect();
                 let after:  String = line_chars[ed.cur_col.min(line_chars.len())..].iter().collect();
                 print_highlighted(stdout, &before, bg)?;
-                // cursor block
+
                 let cur_ch = line_chars.get(ed.cur_col).copied().unwrap_or(' ');
                 queue!(stdout, SetBackgroundColor(C_WHITE), SetForegroundColor(C_DKBLUE),
                     Print(cur_ch), SetBackgroundColor(bg))?;
@@ -690,7 +658,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
                 print_highlighted(stdout, &line_str, bg)?;
             }
 
-            // fill rest of line
             let used = 4 + line_str.len().min(editor_width - 4);
             let fill = editor_width.saturating_sub(used + if is_cursor_row { 1 } else { 0 });
             queue!(stdout, SetBackgroundColor(bg), Print(" ".repeat(fill)))?;
@@ -701,13 +668,11 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
         queue!(stdout, ResetColor)?;
     }
 
-    // ── Output separator ──────────────────────────────────────────
     queue!(stdout, cursor::MoveTo(0, output_sep_row),
         SetBackgroundColor(C_GREY), SetForegroundColor(C_BLACK))?;
     let sep = format!(" Output   F9=Run  F5=Compile  Ctrl+L=Clear {:─<w$}", "", w=(cols as usize).saturating_sub(44));
     queue!(stdout, Print(format!("{:<width$}", sep, width=cols as usize)), ResetColor)?;
 
-    // ── Output lines ─────────────────────────────────────────────
     let out_lines = ed.output.visible((OUTPUT_H - 1) as usize);
     for (i, (color, msg)) in out_lines.iter().enumerate() {
         let screen_row = output_sep_row + 1 + i as u16;
@@ -715,7 +680,7 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
             SetBackgroundColor(C_BLACK), SetForegroundColor(*color),
             Print(format!("{:<width$}", msg, width=cols as usize)), ResetColor)?;
     }
-    // blank remaining output rows
+
     for i in out_lines.len()..(OUTPUT_H - 1) as usize {
         let screen_row = output_sep_row + 1 + i as u16;
         queue!(stdout, cursor::MoveTo(0, screen_row),
@@ -723,7 +688,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
             Print(format!("{:<width$}", "", width=cols as usize)), ResetColor)?;
     }
 
-    // ── Status bar ────────────────────────────────────────────────
     let status_row = rows - 1;
     let pos = format!("Ln {}  Col {}  ", ed.cur_row + 1, ed.cur_col + 1);
     let left_w = (cols as usize).saturating_sub(pos.len());
@@ -733,7 +697,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
         SetForegroundColor(C_DKBLUE),
         Print(pos), ResetColor)?;
 
-    // ── Modal overlay ─────────────────────────────────────────────
     if ed.modal.visible {
         render_modal(stdout, &ed.modal, cols, rows)?;
     }
@@ -750,7 +713,7 @@ fn print_highlighted(stdout: &mut io::Stdout, text: &str, bg: Color) -> io::Resu
             Token::Number(s)   => { queue!(stdout, SetForegroundColor(C_MGNT),   Print(s))?; }
             Token::Other(s)    => { queue!(stdout, SetForegroundColor(C_WHITE),  Print(s))?; }
         }
-        let _ = bg; // bg already set by caller
+        let _ = bg; 
     }
     Ok(())
 }
@@ -762,19 +725,16 @@ fn render_modal(stdout: &mut io::Stdout, modal: &Modal, cols: u16, rows: u16) ->
     let bx    = ((cols as usize).saturating_sub(box_w) / 2) as u16;
     let by    = ((rows as usize).saturating_sub(box_h) / 2) as u16;
 
-    // title bar
     queue!(stdout, cursor::MoveTo(bx, by),
         SetBackgroundColor(C_BLUE), SetForegroundColor(C_YELLOW),
         Print(format!(" {:<width$} ", modal.title, width=box_w - 2)))?;
 
-    // body lines
     for (i, line) in modal.lines.iter().enumerate() {
         queue!(stdout, cursor::MoveTo(bx, by + 1 + i as u16),
             SetBackgroundColor(C_GREY), SetForegroundColor(C_BLACK),
             Print(format!(" {:<width$} ", line, width=box_w - 2)))?;
     }
 
-    // bottom bar
     let close_hint = "[ Press any key to close ]";
     queue!(stdout, cursor::MoveTo(bx, by + 1 + modal.lines.len() as u16),
         SetBackgroundColor(C_GREY), SetForegroundColor(C_DKBLUE),
@@ -786,7 +746,6 @@ fn render_modal(stdout: &mut io::Stdout, modal: &Modal, cols: u16, rows: u16) ->
     queue!(stdout, ResetColor)
 }
 
-// ── Input: "open file" prompt (reads a path from the user) ───────
 fn prompt_open(stdout: &mut io::Stdout, cols: u16, rows: u16) -> io::Result<Option<String>> {
     let label = " Open file: ";
     let box_w = 50usize;
@@ -817,6 +776,7 @@ fn prompt_open(stdout: &mut io::Stdout, cols: u16, rows: u16) -> io::Result<Opti
         stdout.flush()?;
 
         if let Event::Key(k) = event::read()? {
+            if k.kind != event::KeyEventKind::Press { continue; }
             match k.code {
                 KeyCode::Char('c') if k.modifiers == KeyModifiers::CONTROL => {
                     execute!(stdout, cursor::Hide)?;
@@ -862,6 +822,7 @@ fn prompt_find(stdout: &mut io::Stdout, cols: u16, rows: u16) -> io::Result<Opti
             cursor::MoveTo(icol + input.len() as u16, by+1), ResetColor)?;
         stdout.flush()?;
         if let Event::Key(k) = event::read()? {
+            if k.kind != event::KeyEventKind::Press { continue; }
             match k.code {
                 KeyCode::Esc   => { execute!(stdout, cursor::Hide)?; return Ok(None); }
                 KeyCode::Enter => { execute!(stdout, cursor::Hide)?; return Ok(Some(input)); }
@@ -904,6 +865,7 @@ fn prompt_goto_line(stdout: &mut io::Stdout, cols: u16, rows: u16) -> io::Result
         stdout.flush()?;
 
         if let Event::Key(k) = event::read()? {
+            if k.kind != event::KeyEventKind::Press { continue; }
             match k.code {
                 KeyCode::Esc => { execute!(stdout, cursor::Hide)?; return Ok(None); }
                 KeyCode::Enter => { execute!(stdout, cursor::Hide)?; return Ok(Some(input)); }
@@ -945,6 +907,7 @@ fn prompt_save_as(stdout: &mut io::Stdout, cols: u16, rows: u16) -> io::Result<O
         stdout.flush()?;
 
         if let Event::Key(k) = event::read()? {
+            if k.kind != event::KeyEventKind::Press { continue; }
             match k.code {
                 KeyCode::Esc => { execute!(stdout, cursor::Hide)?; return Ok(None); }
                 KeyCode::Enter => { execute!(stdout, cursor::Hide)?; return Ok(Some(input)); }
@@ -957,17 +920,13 @@ fn prompt_save_as(stdout: &mut io::Stdout, cols: u16, rows: u16) -> io::Result<O
     }
 }
 
-// ── TUI-aware readln prompt ───────────────────────────────────────
-// Called at runtime when a Dragon script invokes readln().
-// Temporarily suspends raw mode so the user can type normally.
 fn tui_readln(
     stdout: &mut io::Stdout,
     prompt: &str,
     cols: u16,
     rows: u16,
 ) -> io::Result<String> {
-    let out_row = rows - 2; // just above the status bar
-    // draw prompt bar
+    let out_row = rows - 2; 
     queue!(
         stdout,
         cursor::MoveTo(0, out_row),
@@ -994,6 +953,7 @@ fn tui_readln(
         stdout.flush()?;
 
         if let Event::Key(k) = event::read()? {
+            if k.kind != event::KeyEventKind::Press { continue; }
             match k.code {
                 KeyCode::Enter => break,
                 KeyCode::Backspace => { input.pop(); }
@@ -1025,11 +985,9 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
         render(stdout, &ed, cols, rows)?;
 
         match event::read()? {
-            // ── Terminal resize ───────────────────────────────────
             Event::Resize(c, r) => { cols = c; rows = r; }
 
             Event::Key(KeyEvent { code, modifiers, kind: event::KeyEventKind::Press, .. }) => {
-                // Close modal on any key
                 if ed.modal.visible {
                     ed.modal.hide();
                     continue;
@@ -1040,10 +998,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                     (KeyCode::Char('q'), KeyModifiers::CONTROL) => break,
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
 
-                    // ── File ops ──────────────────────────────────
-                    // REPLACE the Ctrl+S arm with:
-
-                    // ── Find ──────────────────────────────────────
                     (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
                         if let Some(term) = prompt_find(stdout, cols, rows)? {
                             if !term.is_empty() {
@@ -1053,16 +1007,12 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                             }
                         }
                     }
-                    // F5 in Turbo C was also "Find next" — map it here too
-                    // (existing F5=Compile stays; add Ctrl+F3 as Find Next)
                     (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                        // Ctrl+R = Find next occurrence
                         ed.find_next();
                     }
 
                     (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                         if ed.buf().path.is_none() {
-                            // No path yet — ask for one
                             if let Some(path) = prompt_save_as(stdout, cols, rows)? {
                                 let path = path.trim().to_string();
                                 if !path.is_empty() {
@@ -1107,7 +1057,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         ed.switch_file(idx);
                         ed.status = "New file — Ctrl+S to save".into();
                     }
-                    // ── Go to line ────────────────────────────────
                     (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
                         if let Some(line_str) = prompt_goto_line(stdout, cols, rows)? {
                             if let Ok(n) = line_str.trim().parse::<usize>() {
@@ -1120,7 +1069,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         }
                     }
 
-                    // ── Undo / Redo ───────────────────────────────
                     (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                         if let Some((r, c)) = ed.buf_mut().undo() {
                             ed.cur_row = r; ed.cur_col = c;
@@ -1138,12 +1086,10 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         }
                     }
 
-                    // ── Tab: cycle files ──────────────────────────
                     (KeyCode::Tab, _) => {
                         let next = (ed.active + 1) % ed.buffers.len();
                         ed.switch_file(next);
                     }
-                    // ── Back-tab: cycle files reverse ─────────────
                     (KeyCode::BackTab, _) => {
                         let n = ed.buffers.len();
                         let prev = (ed.active + n - 1) % n;
@@ -1158,11 +1104,9 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         ed.cur_col = new_c;
                     }
 
-                    // ── Run / Compile ─────────────────────────────
                     (KeyCode::F(9),  _) => ed.run(stdout, cols, rows),
                     (KeyCode::F(5),  _) => ed.compile(),
 
-                    // ── Help / About ──────────────────────────────
                     (KeyCode::F(1),  _) => ed.show_help(),
                     (KeyCode::F(10), _) => ed.show_about(),
                     (KeyCode::F(2), _) => {
@@ -1184,7 +1128,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                             }
                         }
                     }
-                    // F3 = Open file (matches Turbo C)
                     (KeyCode::F(3), _) => {
                         if let Some(path) = prompt_open(stdout, cols, rows)? {
                             if !path.trim().is_empty() {
@@ -1192,7 +1135,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                             }
                         }
                     }
-                    // F4 = Goto line
                     (KeyCode::F(4), _) => {
                         if let Some(line_str) = prompt_goto_line(stdout, cols, rows)? {
                             if let Ok(n) = line_str.trim().parse::<usize>() {
@@ -1203,18 +1145,15 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                             }
                         }
                     }
-                    // F6 = Next tab (matches Turbo C window cycling)
                     (KeyCode::F(6), _) => {
                         let next = (ed.active + 1) % ed.buffers.len();
                         ed.switch_file(next);
                     }
-                    // F7 = Toggle line comment  (//)
                     (KeyCode::F(7), _) => {
                         let r = ed.cur_row;
                         let line = &ed.buf().lines[r];
                         let trimmed: String = line.iter().collect::<String>();
                         if trimmed.trim_start().starts_with("//") {
-                            // uncomment: remove first "//"
                             if let Some(pos) = trimmed.find("//") {
                                 let new_line: Vec<char> = format!("{}{}", &trimmed[..pos], &trimmed[pos+2..]).chars().collect();
                                 ed.buf_mut().lines[r] = new_line;
@@ -1226,7 +1165,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         ed.buf_mut().dirty = true;
                         ed.status = "Line comment toggled".into();
                     }
-                    // F8 = Close current file (matches Turbo C close window)
                     (KeyCode::F(8), _) => {
                         if ed.buffers.len() > 1 {
                             let name = ed.buf().name.clone();
@@ -1239,10 +1177,8 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         }
                     }
 
-                    // ── Clear output ──────────────────────────────
                     (KeyCode::Char('l'), KeyModifiers::CONTROL) => ed.output.clear(),
 
-                    // ── Cursor movement ───────────────────────────
                     (KeyCode::Up, _) => {
                         if ed.cur_row > 0 { ed.cur_row -= 1; ed.clamp_col(); }
                     }
@@ -1276,8 +1212,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         ed.cur_row = (ed.cur_row + editor_h).min(max);
                         ed.clamp_col();
                     }
-
-                   // ── Editing ───────────────────────────────────
                     (KeyCode::Backspace, _) => {
                         let r = ed.cur_row;
                         let c = ed.cur_col;

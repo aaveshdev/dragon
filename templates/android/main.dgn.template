@@ -1,0 +1,27 @@
+import ui;
+
+// lib/main.dgn — your app starts here. Edit this file (and anything else
+// under lib/) to build your app;
+
+tap_count = 0;
+
+func on_tap() {
+    tap_count = tap_count + 1;
+    return 0;
+}
+
+func render() {
+    return Column([
+        StyledText("Welcome to __DRAGON_APP_NAME__", "", 22, ""),
+        Text("Made with Dragon."),
+        ElevatedButton("Tap me", "tap"),
+        StyledText("Tapped " + tap_count + " times", "#8E8E93", 0, "")
+    ]);
+}
+
+func on_event(evt: str) {
+    if (evt == "tap") {
+        on_tap();
+    }
+    return 0;
+}

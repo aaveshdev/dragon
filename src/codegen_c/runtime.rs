@@ -100,48 +100,85 @@ typedef int    DgnSocket;
 
 /* ── Garbage Collector ───────────────────────────────────── */
 typedef struct GcHeader GcHeader;
-struct GcHeader { int marked; DgnTag tag; GcHeader* next; };
+struct GcHeader { int marked; DgnTag tag; GcHeader* next; GcHeader* hnext; };
 
 static GcHeader* _dgn_gc_head = NULL;
 static void* _dgn_stack_bottom = NULL;
 
+/* Hash table indexing live objects by their payload pointer (the address
+   returned to callers, i.e. (GcHeader*)+1), so dgn_gc_mark_ptr can check
+   "is this candidate stack word a live payload pointer?" in O(1) average
+   instead of walking the full _dgn_gc_head list per candidate word. That
+   walk is what made automatic collection impractically slow on programs
+   with large live sets and/or big stack frames (e.g. DJVM's own giant
+   bytecode-dispatch function): every collection was
+   O(stack_words_scanned * live_object_count). */
+#define DGN_GC_HTAB_BITS 16
+#define DGN_GC_HTAB_SIZE (1u << DGN_GC_HTAB_BITS)
+static GcHeader* _dgn_gc_htab[DGN_GC_HTAB_SIZE];
+
+static unsigned _dgn_gc_hash(void* p) {
+    uintptr_t x = (uintptr_t)p >> 4; /* malloc'd payloads are at least 8/16-byte aligned */
+    x ^= x >> 15; x *= 0x2545F4914F6CDD1DULL; x ^= x >> 13;
+    return (unsigned)(x & (DGN_GC_HTAB_SIZE - 1));
+}
+
+static void dgn_gc_htab_insert(GcHeader* hdr) {
+    void* payload = (void*)(hdr + 1);
+    unsigned b = _dgn_gc_hash(payload);
+    hdr->hnext = _dgn_gc_htab[b];
+    _dgn_gc_htab[b] = hdr;
+}
+
+static void dgn_gc_htab_remove(GcHeader* hdr) {
+    void* payload = (void*)(hdr + 1);
+    unsigned b = _dgn_gc_hash(payload);
+    GcHeader** slot = &_dgn_gc_htab[b];
+    while(*slot) {
+        if(*slot == hdr) { *slot = hdr->hnext; return; }
+        slot = &(*slot)->hnext;
+    }
+}
+
+static GcHeader* dgn_gc_htab_find(void* payload) {
+    unsigned b = _dgn_gc_hash(payload);
+    GcHeader* c = _dgn_gc_htab[b];
+    while(c) {
+        if((void*)(c + 1) == payload) return c;
+        c = c->hnext;
+    }
+    return NULL;
+}
+
 static void dgn_gc_mark_ptr(void* ptr) {
     if(!ptr) return;
-    GcHeader* curr = _dgn_gc_head;
-    while(curr) {
-        void* payload = (void*)(curr + 1);
-        if(ptr == payload) {
-            if(!curr->marked) {
-                curr->marked = 1;
-                if(curr->tag == DGN_LIST) {
-                    DgnList* l = (DgnList*)payload;
-                    for(int i=0; i<l->len; i++) {
-                        DgnVal v = l->data[i];
-                        if(v.tag==DGN_STR) dgn_gc_mark_ptr(v.s);
-                        else if(v.tag==DGN_LIST) dgn_gc_mark_ptr(v.list);
-                        else if(v.tag==DGN_MAP||v.tag==DGN_CLASS||v.tag==DGN_INSTANCE) dgn_gc_mark_ptr(v.map);
-                        else if(v.tag==DGN_FUNC) dgn_gc_mark_ptr(v.func);
-                    }
-                } else if(curr->tag == DGN_MAP || curr->tag == DGN_CLASS || curr->tag == DGN_INSTANCE) {
-                    DgnMap* m = (DgnMap*)payload;
-                    for(int i=0; i<m->cap; i++) {
-                        if(m->entries[i].used) {
-                            DgnVal v = m->entries[i].val;
-                            if(v.tag==DGN_STR) dgn_gc_mark_ptr(v.s);
-                            else if(v.tag==DGN_LIST) dgn_gc_mark_ptr(v.list);
-                            else if(v.tag==DGN_MAP||v.tag==DGN_CLASS||v.tag==DGN_INSTANCE) dgn_gc_mark_ptr(v.map);
-                            else if(v.tag==DGN_FUNC) dgn_gc_mark_ptr(v.func);
-                        }
-                    }
-                } else if(curr->tag == DGN_FUNC) {
-                    DgnFunc* f = (DgnFunc*)payload;
-                    if(f->env) dgn_gc_mark_ptr(f->env);
-                }
-                    
-            }
-            return;
+    GcHeader* curr = dgn_gc_htab_find(ptr);
+    if(!curr || curr->marked) return;
+    curr->marked = 1;
+    void* payload = ptr;
+    if(curr->tag == DGN_LIST) {
+        DgnList* l = (DgnList*)payload;
+        for(int i=0; i<l->len; i++) {
+            DgnVal v = l->data[i];
+            if(v.tag==DGN_STR) dgn_gc_mark_ptr(v.s);
+            else if(v.tag==DGN_LIST) dgn_gc_mark_ptr(v.list);
+            else if(v.tag==DGN_MAP||v.tag==DGN_CLASS||v.tag==DGN_INSTANCE) dgn_gc_mark_ptr(v.map);
+            else if(v.tag==DGN_FUNC) dgn_gc_mark_ptr(v.func);
         }
-        curr = curr->next;
+    } else if(curr->tag == DGN_MAP || curr->tag == DGN_CLASS || curr->tag == DGN_INSTANCE) {
+        DgnMap* m = (DgnMap*)payload;
+        for(int i=0; i<m->cap; i++) {
+            if(m->entries[i].used) {
+                DgnVal v = m->entries[i].val;
+                if(v.tag==DGN_STR) dgn_gc_mark_ptr(v.s);
+                else if(v.tag==DGN_LIST) dgn_gc_mark_ptr(v.list);
+                else if(v.tag==DGN_MAP||v.tag==DGN_CLASS||v.tag==DGN_INSTANCE) dgn_gc_mark_ptr(v.map);
+                else if(v.tag==DGN_FUNC) dgn_gc_mark_ptr(v.func);
+            }
+        }
+    } else if(curr->tag == DGN_FUNC) {
+        DgnFunc* f = (DgnFunc*)payload;
+        if(f->env) dgn_gc_mark_ptr(f->env);
     }
 }
 
@@ -166,7 +203,12 @@ static void dgn_gc_mark_val(DgnVal v) {
     else if(v.tag==DGN_FUNC) dgn_gc_mark_ptr(v.func);
 }
 
-static void dgn_gc_collect() {
+#ifdef _MSC_VER
+static __declspec(noinline) void dgn_gc_collect(void);
+#else
+static void dgn_gc_collect(void) __attribute__((noinline));
+#endif
+static void dgn_gc_collect(void) {
     if(_dgn_aug_init) {
         dgn_gc_mark_ptr(_dgn_aug_str.map);
         dgn_gc_mark_ptr(_dgn_aug_list.map);
@@ -176,18 +218,42 @@ static void dgn_gc_collect() {
     /* Root all top-level Dragon globals — they live in BSS/data, not the stack */
     for(int _gi = 0; _dgn_global_roots[_gi] != NULL; _gi++)
         dgn_gc_mark_val(*_dgn_global_roots[_gi]);
-    
+
+    /* Force every register the compiler is holding a live pointer in to be
+       spilled to this (non-inlined) function's own stack frame before we
+       scan. setjmp is documented to save the full callee-saved register
+       set into the jmp_buf (itself a stack-resident local, so it falls
+       inside the scanned range below); combined with the noinline
+       attribute above — which guarantees a real call boundary exists, so
+       any callee-saved register the *caller* was using to hold a
+       live-across-calls pointer gets pushed onto this frame by the
+       standard ABI prologue the moment this function's body touches that
+       register — this makes the conservative scan sound even under -O2,
+       where the earlier conservative-but-unsound version of this scan
+       could otherwise miss a register-only pointer. */
+    jmp_buf _dgn_gc_regspill;
+    setjmp(_dgn_gc_regspill);
+
     void* top;
     void** curr = (void**)&top;
     void** bottom = (void**)_dgn_stack_bottom;
     if(curr > bottom) { void** tmp = curr; curr = bottom; bottom = tmp; }
     while(curr < bottom) { dgn_gc_mark_ptr(*curr); curr++; }
+    /* Also scan the jmp_buf's own bytes explicitly: on some ABIs/libc
+       implementations part of it may be padded/aligned in ways that don't
+       line up on pointer-sized boundaries relative to the stack scan
+       above, so treat it as an extra (harmless, since scanning is just a
+       conservative "does this look like a live payload pointer" check)
+       root source in its own right. */
+    { void** jb = (void**)&_dgn_gc_regspill; size_t jn = sizeof(_dgn_gc_regspill)/sizeof(void*);
+      for(size_t _ji=0; _ji<jn; _ji++) dgn_gc_mark_ptr(jb[_ji]); }
 
     GcHeader** node = &_dgn_gc_head;
     while(*node) {
         if(!(*node)->marked) {
             GcHeader* unreached = *node;
             *node = unreached->next;
+            dgn_gc_htab_remove(unreached);
             if(unreached->tag == DGN_LIST) {
                 DgnList* l = (DgnList*)(unreached + 1);
                 if(l->data) free(l->data);
@@ -206,21 +272,28 @@ static void dgn_gc_collect() {
     }
 }
 
+static long _dgn_gc_alloc_count = 0;
+#define DGN_GC_THRESHOLD 50000
+
 static void* dgn_gc_alloc(size_t size, DgnTag tag) {
-    /* The old auto-trigger here ran a conservative stack-scanning collector
-       every 1000 allocations. That technique is unsound once the C source
-       is compiled with optimizations (-O2 is always used by --native): the
-       compiler is free to keep live DgnVal pointers purely in registers,
-       which are invisible to the stack scanner, so live objects could be
-       freed while still in use. For short-lived CLI programs it's much
-       safer to just let allocations accumulate and let the OS reclaim
-       everything at process exit. Call dgn_gc_collect() manually/explicitly
-       if you ever need to reduce peak memory in a long-running program. */
+    /* dgn_gc_collect() is now a noinline function that forces a register
+       spill (via setjmp) before conservatively scanning the C stack, so
+       it's sound to call it automatically at -O2 — see dgn_gc_collect()
+       above for why. Trigger it every DGN_GC_THRESHOLD allocations so
+       long-running programs (e.g. a bytecode interpreter looping millions
+       of times) don't grow memory without bound, while short CLI scripts
+       that never cross the threshold pay nothing extra. */
+    _dgn_gc_alloc_count++;
+    if(_dgn_gc_alloc_count >= DGN_GC_THRESHOLD) {
+        dgn_gc_collect();
+        _dgn_gc_alloc_count = 0;
+    }
     GcHeader* hdr = (GcHeader*)malloc(sizeof(GcHeader) + size);
     hdr->marked = 0;
     hdr->tag = tag;
     hdr->next = _dgn_gc_head;
     _dgn_gc_head = hdr;
+    dgn_gc_htab_insert(hdr);
     return (void*)(hdr + 1);
 }
 
@@ -2859,8 +2932,25 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
             case DGN_MAP: {
                 DgnVal ptr_val = dgn_map_get(val, "ptr");
                 if(ptr_val.tag == DGN_NULL) ptr_val = dgn_map_get(val, "__ptr__");
-                kinds[i]    = DGN_FA_PTR;
-                cargs[i].p  = (void*)(uintptr_t)ptr_val.i;
+                
+                if (ptr_val.tag != DGN_NULL) {
+                    kinds[i]    = DGN_FA_PTR;
+                    cargs[i].p  = (void*)(uintptr_t)ptr_val.i;
+                } else {
+                    /* Check if it's a struct and pack it into a temporary C buffer */
+                    DgnVal bytes_val = dgn_map_get(val, "__bytes__");
+                    if (bytes_val.tag == DGN_LIST) {
+                        DgnList* b = bytes_val.list;
+                        char* sbuf = (char*)malloc(b->len);
+                        for(int _bi=0; _bi<b->len; _bi++) sbuf[_bi] = (char)b->data[_bi].i;
+                        str_copies[i] = sbuf; /* ensures it gets safely free()'d after the call */
+                        kinds[i]    = DGN_FA_PTR;
+                        cargs[i].p  = (void*)sbuf;
+                    } else {
+                        kinds[i]    = DGN_FA_PTR;
+                        cargs[i].p  = NULL;
+                    }
+                }
                 break;
             }
             default:
@@ -3145,6 +3235,49 @@ dgn_map_set(&m, "loadlib_call", dgn_func(dgn_ffi_loadlib_call, 4));  // this + 3
 
 static DgnVal dgn_binop(const char* op, DgnVal a, DgnVal b) { (void)op;(void)a;(void)b; return dgn_null(); }
 static DgnVal dgn_unary(const char* op, DgnVal a)            { (void)op;(void)a; return dgn_null(); }
+
+/* ── Growable string buffer ──────────────────────────────────────────────
+   Purely additive: used only by the compiler's loop-accumulation
+   optimization (a "s = s + x" pattern inside a loop gets rewritten to
+   append into one of these instead of doing a full malloc+strcpy+strcat+
+   free EVERY iteration via dgn_add's string-concat path -- that's the
+   classic O(n^2) string-building antipattern for n concatenations). Not
+   GC-tracked itself (it's a transient loop-local C value, materialized
+   into a real GC-tracked DgnVal string exactly once, at the end). */
+typedef struct { char* data; size_t len; size_t cap; } DgnStrBuf;
+
+static void dgn_strbuf_init(DgnStrBuf* sb, const char* seed) {
+    size_t seed_len = strlen(seed);
+    sb->cap = seed_len < 16 ? 16 : seed_len * 2;
+    sb->data = (char*)malloc(sb->cap);
+    memcpy(sb->data, seed, seed_len);
+    sb->len = seed_len;
+    sb->data[sb->len] = 0;
+}
+static void dgn_strbuf_ensure(DgnStrBuf* sb, size_t extra) {
+    if (sb->len + extra + 1 > sb->cap) {
+        size_t newcap = sb->cap * 2;
+        while (newcap < sb->len + extra + 1) newcap *= 2;
+        sb->data = (char*)realloc(sb->data, newcap);
+        sb->cap = newcap;
+    }
+}
+static void dgn_strbuf_append_val(DgnStrBuf* sb, DgnVal v) {
+    char* s = dgn_val_to_cstr(v);
+    size_t slen = strlen(s);
+    dgn_strbuf_ensure(sb, slen);
+    memcpy(sb->data + sb->len, s, slen);
+    sb->len += slen;
+    sb->data[sb->len] = 0;
+    free(s);
+}
+static DgnVal dgn_strbuf_to_dgnval(DgnStrBuf* sb) {
+    char* r = (char*)dgn_gc_alloc(sb->len + 1, DGN_STR);
+    memcpy(r, sb->data, sb->len + 1);
+    free(sb->data);
+    DgnVal v; v.tag = DGN_STR; v.s = r;
+    return v;
+}
 
 static char** _dgn_argv=NULL; static int _dgn_argc=0;
 static void dgn_runtime_init(int argc, char** argv, void* stack_bottom) { 

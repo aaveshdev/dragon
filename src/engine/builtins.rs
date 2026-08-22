@@ -2131,10 +2131,10 @@ let widths = compute_widths(data, upem);
                 use sha2::Sha256;
                 type HmacSha256 = Hmac<Sha256>;
 
-                let data = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
-                    .ok_or_else(|| DgnError::new("Data required", 0))?;
-                let key = get_bytes(args.get(1).unwrap_or(&DgnValue::Null))
+                let key = get_bytes(args.get(0).unwrap_or(&DgnValue::Null))
                     .ok_or_else(|| DgnError::new("Key required", 0))?;
+                let data = get_bytes(args.get(1).unwrap_or(&DgnValue::Null))
+                    .ok_or_else(|| DgnError::new("Data required", 0))?;
 
                 let mut mac = <HmacSha256 as Mac>::new_from_slice(&key).map_err(|_| DgnError::new("Invalid HMAC key", 0))?;
                 mac.update(&data);

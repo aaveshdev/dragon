@@ -32,6 +32,16 @@ struct Linter {
 
 impl Linter {
     fn new() -> Self {
+        Self::new_with_extra_builtins(&[])
+    }
+
+    /// Same as `new()`, plus additional bare names the caller wants
+    /// accepted as builtins — used for `--native --lib` mode, whose
+    /// bare-name builtin allowlist (see `codegen_c::native::builtin_call`)
+    /// is intentionally different from the interpreter's (e.g. `sqrt(x)`
+    /// instead of `math.sqrt(x)`), so the general linter doesn't know about
+    /// them by default.
+    fn new_with_extra_builtins(extra: &[&str]) -> Self {
         let mut l = Linter {
             scopes: vec![],
             report: LintReport { errors: vec![], warnings: vec![] },
@@ -52,6 +62,9 @@ impl Linter {
             "argv", "PI", "E",
         ];
         for b in builtins {
+            l.define(b, "built-in function", true);
+        }
+        for b in extra {
             l.define(b, "built-in function", true);
         }
         l
@@ -280,6 +293,17 @@ pub fn lint_ast(ast: &Stmt) -> LintReport {
     let mut linter = Linter::new();
     linter.check_stmt(ast);
     linter.exit_scope(); 
+    linter.report
+}
+
+/// Same as `lint_ast`, but additionally accepts the given bare names as
+/// builtins. Used for `--native --lib`, whose builtin allowlist
+/// (see `codegen_c::native::builtin_call`) is a different, native-specific
+/// set of bare-callable names from the interpreter's own builtins.
+pub fn lint_ast_with_extra_builtins(ast: &Stmt, extra: &[&str]) -> LintReport {
+    let mut linter = Linter::new_with_extra_builtins(extra);
+    linter.check_stmt(ast);
+    linter.exit_scope();
     linter.report
 }
 

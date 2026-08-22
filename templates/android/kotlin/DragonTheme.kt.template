@@ -1,0 +1,115 @@
+package __DRAGON_PACKAGE__
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+
+object DragonColors {
+    val ObsidianBg = Color(0xFF14171F)      
+    val ObsidianSurface = Color(0xFF1D2230) 
+    val ObsidianSurfaceRaised = Color(0xFF262C3D)
+    val Ember = Color(0xFFE8935B)         
+    val EmberDeep = Color(0xFFC96B3E)      
+    val Verdigris = Color(0xFF4FB0A5)       
+    val TextPrimary = Color(0xFFF2EDE4)   
+    val TextMuted = Color(0xFF8A8F9E)
+    val Divider = Color(0xFF2C3244)
+}
+
+
+data class DragonFonts(
+    val display: FontFamily = FontFamily.SansSerif,
+    val body: FontFamily = FontFamily.SansSerif,
+)
+
+fun dragonTypography(fonts: DragonFonts): Typography = Typography(
+    headlineMedium = TextStyle(
+        fontFamily = fonts.display, fontWeight = FontWeight.SemiBold, fontSize = 24.sp, letterSpacing = 0.2.sp
+    ),
+    titleMedium = TextStyle(
+        fontFamily = fonts.display, fontWeight = FontWeight.Medium, fontSize = 17.sp, letterSpacing = 0.1.sp
+    ),
+    bodyLarge = TextStyle(
+        fontFamily = fonts.body, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 22.sp
+    ),
+    bodyMedium = TextStyle(
+        fontFamily = fonts.body, fontWeight = FontWeight.Normal, fontSize = 14.sp, lineHeight = 20.sp
+    ),
+    labelLarge = TextStyle(
+        fontFamily = fonts.display, fontWeight = FontWeight.Medium, fontSize = 14.sp, letterSpacing = 0.4.sp
+    ),
+)
+
+class CutCornerDragonShape(private val cut: Dp) : Shape {
+    override fun createOutline(
+        size: Size,
+        layoutDirection: LayoutDirection,
+        density: androidx.compose.ui.unit.Density
+    ): androidx.compose.ui.graphics.Outline {
+        val c = with(density) { cut.toPx() }.coerceAtMost(size.minDimension / 2f)
+        val path = Path().apply {
+            moveTo(0f, 0f)
+            lineTo(size.width - c, 0f)
+            lineTo(size.width, c)
+            lineTo(size.width, size.height)
+            lineTo(0f, size.height)
+            close()
+        }
+        return androidx.compose.ui.graphics.Outline.Generic(path)
+    }
+}
+
+val DragonCardShape = CutCornerDragonShape(14.dp)
+val DragonButtonShape = CutCornerDragonShape(10.dp)
+val DragonFieldShape = CutCornerDragonShape(8.dp)
+
+val EmberGlowBrush: Brush = Brush.linearGradient(listOf(DragonColors.Ember, DragonColors.EmberDeep))
+
+data class DragonTokens(
+    val emberGlow: Brush = EmberGlowBrush,
+    val cardShape: Shape = DragonCardShape,
+    val buttonShape: Shape = DragonButtonShape,
+    val fieldShape: Shape = DragonFieldShape,
+)
+
+val LocalDragonTokens = compositionLocalOf { DragonTokens() }
+
+private val DragonColorScheme = darkColorScheme(
+    background = DragonColors.ObsidianBg,
+    surface = DragonColors.ObsidianSurface,
+    surfaceVariant = DragonColors.ObsidianSurfaceRaised,
+    primary = DragonColors.Ember,
+    secondary = DragonColors.Verdigris,
+    onBackground = DragonColors.TextPrimary,
+    onSurface = DragonColors.TextPrimary,
+    onPrimary = DragonColors.ObsidianBg,
+    onSecondary = DragonColors.ObsidianBg,
+    outline = DragonColors.Divider,
+)
+
+@Composable
+fun DragonTheme(fonts: DragonFonts = DragonFonts(), content: @Composable () -> Unit) {
+    CompositionLocalProvider(LocalDragonTokens provides DragonTokens()) {
+        MaterialTheme(
+            colorScheme = DragonColorScheme,
+            typography = dragonTypography(fonts),
+            content = content
+        )
+    }
+}

@@ -32,6 +32,70 @@ This repository contains the official Rust implementation of Dragon: a lexer, pa
 - **TurboDragon IDE** — a built-in terminal UI editor/runner, launched with `--ide`.
 - **Package-based projects** — run a project directly from a `package.json` manifest with `dragon run`.
 
+## Android app development (experimental)
+
+Dragon can compile to a real Android `.so` via `dragon --native --lib
+--target android-all`, callable directly from Kotlin via generated JNI
+bindings (`--jni-package` / `--jni-class`) — no hand-written JNI bridge
+required. On top of that, `dragon`, `ui.dgn`, and a small generic Jetpack
+Compose renderer together let you build an app's entire UI and logic in
+`.dgn` files: layouts (row, column, stack, grid, list_view), components
+(text, button, textfield, checkbox, switch, slider, icon, image, card,
+app_bar, fab, webview), navigation (`drawer_scaffold`), per-widget
+styling, file storage (documents and assets), and app state — all driven
+from Dragon.
+
+`dragon create <name> [--package <id>]` scaffolds a full project — a
+`package.json` manifest, `lib/main.dgn` + `lib/ui.dgn` (the only files you
+should need to touch day to day), and a complete Android Gradle project.
+`dragon build` and `dragon run` (from inside a generated project)
+compile your `.dgn` app to native `.so`s, build the Android project, and
+— for `run` — install and launch on a connected device or emulator.
+
+This is genuinely experimental and young, not a finished framework:
+
+- **Verified rigorously, with real confidence**: the native compilation
+  pipeline itself — the C transpiler, the JNI wrapper generation, the
+  string/list memory-ownership model, and the file-storage builtins —
+  stress-tested with AddressSanitizer across several real apps (a stateful
+  to-do list, a calculator, a multi-page app with a sidebar drawer and a
+  floating action button) through many rounds of finding and fixing
+  genuine use-after-free and leak bugs. `dragon create`'s project
+  scaffolding is real, tested output too — every generated file was
+  inspected, and the generated `lib/main.dgn` was compiled and run.
+  Example apps ship in `examples/`: `todo_app.dgn`, `calculator.dgn`,
+  `nav_app.dgn`, all built on `ui.dgn`'s widget library.
+- **Not yet verified on real hardware/toolchains by us**: the Android/
+  Kotlin side of the example integration (`examples/android/*.kt`) is
+  hand-written and reviewed, not compiled here — you are the first real
+  test of any given change to it. `dragon build`/`dragon run`'s Gradle and
+  ADB steps are similarly written carefully but never executed end to end
+  (no Gradle/ADB/emulator available in the environment this was built in)
+  — treat your first real run as a genuine first test. `dragon create`
+  does not generate a Gradle wrapper (a binary jar with no way to vendor
+  it here); open the generated project in Android Studio once, or run
+  `gradle wrapper` yourself, before `dragon build`/`dragon run` will work.
+  iOS is not supported at all yet: the `--target ios-*` cross-compilation
+  flags work, but no SwiftUI renderer exists, so there's currently no way
+  to actually display a Dragon UI on iOS.
+- **Language limits that matter for real apps**: `--native --lib` has
+  scalar types plus a single collection type (`strlist`, a list of
+  strings) — no structs/records, no closures, no generics, single-
+  threaded only. State that would naturally be a struct (e.g. a to-do
+  item) has to be encoded as a delimited string and parsed by hand today.
+  Identifiers that collide with C keywords (e.g. a Dragon function named
+  `goto`) currently produce invalid C rather than a clear error — rename
+  around it for now.
+- **No network access**: implementing HTTPS/TLS safely from scratch in
+  plain C is a large, security-sensitive undertaking not worth rushing.
+  The documented pattern instead: the host app performs the request and
+  calls a Dragon function with the result, the same way `on_event()`
+  already works — see `examples/android/UI_BRIDGE_README.md`.
+
+See `examples/android/UI_BRIDGE_README.md` for the full integration guide,
+and `CROSS_COMPILE_TESTING.md` for cross-compilation setup (NDK, and the
+Android-specific 16KB page-size linking requirement).
+
 ## Example
 
 ```dragon

@@ -1,0 +1,625 @@
+package __DRAGON_PACKAGE__
+
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.Divider
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.onFocusEvent
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import coil.compose.AsyncImage
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+
+
+@Composable
+fun DragonApp(bridge: DragonBridge) {
+    var treeJson by remember { mutableStateOf(bridge.render()) }
+
+    val dispatch: (String) -> Unit = { event ->
+        bridge.on_event(event)
+        treeJson = bridge.render()
+    }
+
+    val root = remember(treeJson) { JSONObject(treeJson) }
+
+    if (root.optString("type") == "drawer_scaffold") {
+        DragonDrawerScaffold(root, dispatch)
+        return
+    }
+
+    val fabNode = remember(treeJson) { findFab(root) }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        DragonRootContent(root, dispatch)
+        if (fabNode != null) {
+            Box(modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)) {
+                DragonNode(fabNode, dispatch)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DragonRootContent(root: JSONObject, dispatch: (String) -> Unit) {
+    val rootHasOwnBg = root.optString("type") == "column" && root.optString("bg").isNotEmpty()
+
+    if (rootHasOwnBg) {
+        DragonNode(root, dispatch, Modifier.fillMaxSize())
+    } else {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .verticalScroll(rememberScrollState()) 
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            DragonNode(root, dispatch)
+        }
+    }
+}
+
+private fun findFab(node: JSONObject): JSONObject? {
+    if (node.optString("type") == "fab") return node
+    node.optJSONArray("children")?.let { arr ->
+        for (i in 0 until arr.length()) {
+            val child = arr.optJSONObject(i) ?: continue
+            findFab(child)?.let { return it }
+        }
+    }
+    node.optJSONObject("content")?.let { c -> findFab(c)?.let { return it } }
+    node.optJSONArray("drawer")?.let { arr ->
+        for (i in 0 until arr.length()) {
+            val child = arr.optJSONObject(i) ?: continue
+            findFab(child)?.let { return it }
+        }
+    }
+    return null
+}
+
+@Composable
+private fun DragonDrawerScaffold(root: JSONObject, dispatch: (String) -> Unit) {
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+
+    val localDispatch: (String) -> Unit = { event ->
+        if (event == "__toggle_drawer__") {
+            scope.launch { if (drawerState.isOpen) drawerState.close() else drawerState.open() }
+        } else {
+            dispatch(event)
+        }
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.surface)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val drawerChildren = root.optJSONArray("drawer")
+                    if (drawerChildren != null) {
+                        for (i in 0 until drawerChildren.length()) {
+                            val child = drawerChildren.optJSONObject(i) ?: continue
+                            DragonNode(child, localDispatch)
+                        }
+                    }
+                }
+            }
+        }
+    ) {
+        val content = root.optJSONObject("content")
+        val fabNode = remember(root) { content?.let { findFab(it) } }
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (content != null) {
+                DragonRootContent(content, localDispatch)
+            }
+            if (fabNode != null) {
+                Box(modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)) {
+                    DragonNode(fabNode, localDispatch)
+                }
+            }
+        }
+    }
+}
+
+private fun parseHexColor(hex: String, fallback: Color): Color {
+    if (hex.isEmpty()) return fallback
+    return try {
+        val cleaned = hex.removePrefix("#")
+        val value = cleaned.toLong(16)
+        when (cleaned.length) {
+            6 -> Color(0xFF000000L or value)
+            8 -> Color(value)
+            else -> fallback
+        }
+    } catch (e: NumberFormatException) {
+        fallback
+    }
+}
+
+
+private fun iconFor(name: String): ImageVector = when (name) {
+    "add" -> Icons.Filled.Add
+    "delete" -> Icons.Filled.Delete
+    "settings" -> Icons.Filled.Settings
+    "menu" -> Icons.Filled.Menu
+    "close" -> Icons.Filled.Close
+    "check" -> Icons.Filled.Check
+    "search" -> Icons.Filled.Search
+    "home" -> Icons.Filled.Home
+    "star" -> Icons.Filled.Star
+    "favorite" -> Icons.Filled.Favorite
+    "info" -> Icons.Filled.Info
+    else -> Icons.Filled.MoreVert
+}
+
+
+@Composable
+private fun AutoSizeSingleLineText(
+    text: String,
+    color: Color,
+    style: TextStyle,
+    textAlign: TextAlign,
+    modifier: Modifier = Modifier,
+    minFontSize: Float = 12f
+) {
+    var shrunkStyle by remember(text, style) { mutableStateOf(style) }
+    var readyToDraw by remember(text, style) { mutableStateOf(false) }
+
+    Text(
+        text = text,
+        color = color,
+        style = shrunkStyle,
+        textAlign = textAlign,
+        maxLines = 1,
+        softWrap = false,
+        modifier = modifier.drawWithContent { if (readyToDraw) drawContent() },
+        onTextLayout = { result ->
+            val currentSize = shrunkStyle.fontSize.value
+            if (result.didOverflowWidth && currentSize > minFontSize) {
+                shrunkStyle = shrunkStyle.copy(fontSize = (currentSize * 0.9f).sp)
+            } else {
+                readyToDraw = true
+            }
+        }
+    )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier = Modifier) {
+    val tokens = LocalDragonTokens.current
+    when (node.optString("type")) {
+        "text" -> {
+            val fg = node.optString("fg")
+            val sizeSp = node.optInt("size", 0)
+            val align = node.optString("align")
+            val color = parseHexColor(fg, MaterialTheme.colorScheme.onBackground)
+            val baseStyle = MaterialTheme.typography.bodyLarge
+            val style = if (sizeSp > 0) baseStyle.copy(fontSize = sizeSp.sp) else baseStyle
+            val textAlign = when (align) {
+                "end" -> TextAlign.End
+                "center" -> TextAlign.Center
+                else -> null
+            }
+            if (textAlign != null) {
+                AutoSizeSingleLineText(
+                    text = node.optString("text"),
+                    color = color,
+                    style = style,
+                    textAlign = textAlign,
+                    modifier = modifier.fillMaxWidth()
+                )
+            } else {
+                Text(text = node.optString("text"), style = style, color = color, modifier = modifier)
+            }
+        }
+        "button" -> {
+            DragonButton(
+                label = node.optString("label"),
+                onClick = { dispatch(node.optString("event")) },
+                onLongClick = if (node.has("longEvent") && node.optString("longEvent").isNotEmpty()) {
+                    { dispatch(node.optString("longEvent")) }
+                } else null,
+                bg = node.optString("bg"),
+                fg = node.optString("fg"),
+                weight = node.optInt("weight", 0),
+                tokens = tokens,
+                modifier = modifier
+            )
+        }
+        "textfield" -> {
+            val focusEvt = node.optString("focusEvent")
+            val blurEvt = node.optString("blurEvent")
+            var wasFocused by remember { mutableStateOf(false) }
+            val baseModifier = if (modifier === Modifier) modifier.fillMaxWidth() else modifier
+            val fieldModifier = if (focusEvt.isNotEmpty() || blurEvt.isNotEmpty()) {
+                baseModifier.onFocusEvent { state ->
+                    if (state.isFocused && !wasFocused && focusEvt.isNotEmpty()) dispatch(focusEvt)
+                    if (!state.isFocused && wasFocused && blurEvt.isNotEmpty()) dispatch(blurEvt)
+                    wasFocused = state.isFocused
+                }
+            } else {
+                baseModifier
+            }
+            OutlinedTextField(
+                value = node.optString("value"),
+                onValueChange = { newValue -> dispatch(node.optString("event") + ":" + newValue) },
+                placeholder = { Text(text = node.optString("placeholder"), color = DragonColors.TextMuted) },
+                shape = tokens.fieldShape,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = DragonColors.Ember,
+                    unfocusedBorderColor = DragonColors.Divider,
+                    focusedContainerColor = DragonColors.ObsidianSurface,
+                    unfocusedContainerColor = DragonColors.ObsidianSurface,
+                    focusedTextColor = DragonColors.TextPrimary,
+                    unfocusedTextColor = DragonColors.TextPrimary,
+                    cursorColor = DragonColors.Ember,
+                ),
+                modifier = fieldModifier
+            )
+        }
+        "checkbox" -> {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = (if (modifier === Modifier) modifier.fillMaxWidth() else modifier)
+                    .clip(tokens.fieldShape)
+                    .background(DragonColors.ObsidianSurface)
+                    .clickable { dispatch(node.optString("event")) }
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            ) {
+                Checkbox(
+                    checked = node.optBoolean("checked"),
+                    onCheckedChange = { dispatch(node.optString("event")) },
+                    colors = CheckboxDefaults.colors(
+                        checkedColor = DragonColors.Verdigris,
+                        uncheckedColor = DragonColors.TextMuted,
+                        checkmarkColor = DragonColors.ObsidianBg,
+                    )
+                )
+                Text(
+                    text = node.optString("label"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = DragonColors.TextPrimary,
+                    modifier = Modifier.padding(start = 4.dp)
+                )
+            }
+        }
+        "switch" -> {
+            Switch(
+                checked = node.optBoolean("checked"),
+                onCheckedChange = { dispatch(node.optString("event")) },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = DragonColors.ObsidianBg,
+                    checkedTrackColor = DragonColors.Verdigris,
+                    uncheckedThumbColor = DragonColors.TextMuted,
+                    uncheckedTrackColor = DragonColors.ObsidianSurfaceRaised,
+                ),
+                modifier = modifier
+            )
+        }
+        "slider" -> {
+            val value = node.optDouble("value", 0.0).toFloat()
+            val min = node.optDouble("min", 0.0).toFloat()
+            val max = node.optDouble("max", 1.0).toFloat()
+            Slider(
+                value = value,
+                onValueChange = { newValue -> dispatch(node.optString("event") + ":" + newValue) },
+                valueRange = min..max,
+                colors = SliderDefaults.colors(
+                    thumbColor = DragonColors.Ember,
+                    activeTrackColor = DragonColors.Ember,
+                    inactiveTrackColor = DragonColors.Divider,
+                ),
+                modifier = modifier.fillMaxWidth()
+            )
+        }
+        "icon" -> {
+            Icon(
+                imageVector = iconFor(node.optString("name")),
+                contentDescription = node.optString("name"),
+                tint = parseHexColor(node.optString("fg"), MaterialTheme.colorScheme.onBackground),
+                modifier = modifier
+            )
+        }
+        "image" -> {
+            val heightDp = node.optInt("height", 0)
+            AsyncImage(
+                model = node.optString("url"),
+                contentDescription = null,
+                modifier = modifier
+                    .fillMaxWidth()
+                    .let { if (heightDp > 0) it.height(heightDp.dp) else it }
+            )
+        }
+        "webview" -> {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        webViewClient = WebViewClient()
+                        settings.javaScriptEnabled = true
+                    }
+                },
+                update = { it.loadUrl(node.optString("url")) },
+                modifier = modifier.fillMaxWidth()
+            )
+        }
+        "card" -> {
+            val bg = node.optString("bg")
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = modifier
+                    .fillMaxWidth()
+                    .clip(tokens.cardShape)
+                    .background(parseHexColor(bg, DragonColors.ObsidianSurfaceRaised))
+                    .padding(16.dp)
+            ) {
+                renderChildrenInColumn(node.optJSONArray("children"), dispatch)
+            }
+        }
+        "app_bar" -> {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = modifier
+                    .fillMaxWidth()
+                    .background(parseHexColor(node.optString("bg"), DragonColors.ObsidianSurface))
+                    .padding(16.dp)
+            ) {
+                Text(
+                    text = node.optString("title"),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = parseHexColor(node.optString("fg"), DragonColors.TextPrimary)
+                )
+            }
+        }
+        "fab" -> {
+            FloatingActionButton(
+                onClick = { dispatch(node.optString("event")) },
+                containerColor = DragonColors.Ember,
+                contentColor = DragonColors.ObsidianBg,
+                shape = CircleShape
+            ) {
+                Text(text = node.optString("label"), fontWeight = FontWeight.Bold)
+            }
+        }
+        "row" -> {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = modifier.fillMaxWidth()
+            ) {
+                renderChildrenInRow(node.optJSONArray("children"), dispatch)
+            }
+        }
+        "column" -> {
+            val bg = node.optString("bg")
+            val bgColor = if (bg.isNotEmpty()) parseHexColor(bg, MaterialTheme.colorScheme.background) else null
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = modifier
+                    .fillMaxWidth()
+                    .let { if (bgColor != null) it.background(bgColor) else it }
+                    .let { if (bgColor != null) it.padding(16.dp) else it }
+            ) {
+                renderChildrenInColumn(node.optJSONArray("children"), dispatch)
+            }
+        }
+        "stack" -> {
+            Box(modifier = modifier.fillMaxWidth()) {
+                val children = node.optJSONArray("children")
+                if (children != null) {
+                    for (i in 0 until children.length()) {
+                        val child = children.optJSONObject(i) ?: continue
+                        DragonNode(child, dispatch)
+                    }
+                }
+            }
+        }
+        "list_view" -> {
+            val children = node.optJSONArray("children")
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = modifier.fillMaxWidth()
+            ) {
+                if (children != null) {
+                    items(children.length()) { i ->
+                        val child = children.optJSONObject(i)
+                        if (child != null) DragonNode(child, dispatch)
+                    }
+                }
+            }
+        }
+        "grid" -> {
+            val children = node.optJSONArray("children")
+            val columns = node.optInt("columns", 2).coerceAtLeast(1)
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(columns),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = modifier.fillMaxWidth()
+            ) {
+                if (children != null) {
+                    items(children.length()) { i ->
+                        val child = children.optJSONObject(i)
+                        if (child != null) DragonNode(child, dispatch)
+                    }
+                }
+            }
+        }
+        "divider" -> {
+            Divider(color = DragonColors.Divider, thickness = 1.dp, modifier = modifier)
+        }
+        "spacer" -> {
+            Spacer(modifier = modifier)
+        }
+        else -> {
+            Text(
+                text = "[unknown widget type: ${node.optString("type")}]",
+                color = DragonColors.TextMuted,
+                modifier = modifier
+            )
+        }
+    }
+}
+
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DragonButton(
+    label: String,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)?,
+    bg: String,
+    fg: String,
+    weight: Int,
+    tokens: DragonTokens,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val isStyled = bg.isNotEmpty()
+
+    val shape: Shape = if (isStyled) {
+        if (weight > 1) RoundedCornerShape(50) else CircleShape
+    } else {
+        tokens.buttonShape
+    }
+    val background: Brush = if (isStyled) {
+        val c = parseHexColor(bg, DragonColors.Ember)
+        Brush.linearGradient(listOf(c, c)) 
+    } else {
+        tokens.emberGlow
+    }
+    val textColor = if (isStyled) parseHexColor(fg, DragonColors.TextPrimary) else DragonColors.ObsidianBg
+    val textStyle = if (isStyled) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.labelLarge
+    val sizeModifier = if (isStyled && weight <= 1) Modifier.aspectRatio(1f) else Modifier
+    val contentPadding = if (isStyled) PaddingValues(14.dp) else PaddingValues(horizontal = 20.dp, vertical = 12.dp)
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .then(sizeModifier)
+            .clip(shape)
+            .background(background)
+            .border(
+                width = if (pressed) 1.5.dp else 0.dp,
+                color = (if (isStyled) Color.White else DragonColors.TextPrimary).copy(alpha = if (pressed) 0.35f else 0f),
+                shape = shape
+            )
+            .combinedClickable(
+                interactionSource = interactionSource,
+                indication = null, // no default Material ripple -- the border glow above is the feedback
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
+            .padding(contentPadding)
+    ) {
+        Text(text = label, color = textColor, fontWeight = FontWeight.SemiBold, style = textStyle)
+    }
+}
+
+@Composable
+private fun ColumnScope.renderChildrenInColumn(children: JSONArray?, dispatch: (String) -> Unit) {
+    if (children == null) return
+    for (i in 0 until children.length()) {
+        val child = children.optJSONObject(i) ?: continue
+        val w = child.optInt("weight", 0)
+        val childModifier = if (w > 0) Modifier.weight(w.toFloat()) else Modifier
+        DragonNode(child, dispatch, childModifier)
+    }
+}
+
+@Composable
+private fun RowScope.renderChildrenInRow(children: JSONArray?, dispatch: (String) -> Unit) {
+    if (children == null) return
+    for (i in 0 until children.length()) {
+        val child = children.optJSONObject(i) ?: continue
+        val childModifier = if (child.has("weight")) {
+            val w = child.optInt("weight", 0)
+            if (w > 0) Modifier.weight(w.toFloat()) else Modifier
+        } else {
+            if (child.optString("type") == "button") Modifier else Modifier.weight(1f)
+        }
+        DragonNode(child, dispatch, childModifier)
+    }
+}

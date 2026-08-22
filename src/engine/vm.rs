@@ -317,15 +317,34 @@ impl Vm {
                     }
 
                     if let DgnValue::NativeMethod(ref f) = func {
-                        let r = f(args).map_err(|mut e| { if e.line == 0 { e.line = line; } e })?;
-                        self.stack.push(r);
-                        ip += 1;
-                        continue;
+                        match f(args) {
+                            Ok(r) => { self.stack.push(r); ip += 1; continue; }
+                            Err(mut e) => {
+                                if e.line == 0 { e.line = line; }
+                                if let Some((catch_ip, depth)) = self.try_frames.pop() {
+                                    self.stack.truncate(depth);
+                                    self.stack.push(DgnValue::String(e.msg));
+                                    ip = catch_ip;
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
 
-                    let r = call_dgn_func(func, args).await
-                        .map_err(|mut e| { if e.line == 0 { e.line = line; } e })?;
-                    self.stack.push(r);
+                    match call_dgn_func(func, args).await {
+                        Ok(r) => { self.stack.push(r); }
+                        Err(mut e) => {
+                            if e.line == 0 { e.line = line; }
+                            if let Some((catch_ip, depth)) = self.try_frames.pop() {
+                                self.stack.truncate(depth);
+                                self.stack.push(DgnValue::String(e.msg));
+                                ip = catch_ip;
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
 
                 Instruction::Return => { return Ok(self.pop()); }
@@ -393,8 +412,19 @@ impl Vm {
                         // Call init if it exists
                         if let Ok(init) = get_attr(instance.clone(), "init") {
                             if let DgnValue::Func(_) = init {
-                                call_dgn_func(init, args).await
-                                    .map_err(|mut e| { e.line = line; e })?;
+                                match call_dgn_func(init, args).await {
+                                    Ok(_) => {}
+                                    Err(mut e) => {
+                                        e.line = line;
+                                        if let Some((catch_ip, depth)) = self.try_frames.pop() {
+                                            self.stack.truncate(depth);
+                                            self.stack.push(DgnValue::String(e.msg));
+                                            ip = catch_ip;
+                                            continue;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
                         }
                         self.stack.push(instance);
@@ -425,8 +455,19 @@ impl Vm {
                             .ok_or(DgnError::new(&format!("Method '{}' not in parent", method_name), line))?;
                         
                         if let DgnValue::Func(f) = method {
-                            // Call the method, but bind `this_val` so the instance context is preserved
-                            call_dgn_func_impl(f, args, Some(this_val)).await?
+                            match call_dgn_func_impl(f, args, Some(this_val)).await {
+                                Ok(v) => v,
+                                Err(mut e) => {
+                                    if e.line == 0 { e.line = line; }
+                                    if let Some((catch_ip, depth)) = self.try_frames.pop() {
+                                        self.stack.truncate(depth);
+                                        self.stack.push(DgnValue::String(e.msg));
+                                        ip = catch_ip;
+                                        continue;
+                                    }
+                                    return Err(e);
+                                }
+                            }
                         } else { 
                             DgnValue::Null 
                         }
@@ -881,6 +922,11 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (DgnValue::Number(a), DgnValue::Int(b)) => Ok(DgnValue::Number(a + b as f64)),
             (DgnValue::String(mut a), b) => { a.push_str(&val_to_string(&b)); Ok(DgnValue::String(a)) },
             (a, DgnValue::String(b)) => Ok(DgnValue::String(val_to_string(&a) + &b)),
+            (DgnValue::List(a), DgnValue::List(b)) => {
+                let mut combined = a.lock().unwrap().clone();
+                combined.extend(b.lock().unwrap().iter().cloned());
+                Ok(DgnValue::List(Arc::new(Mutex::new(combined))))
+            },
             _ => Ok(DgnValue::Null),
         },
         BinOp::Sub => match (l, r) {
@@ -914,6 +960,7 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a==b)),
             (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a==b)),
             (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(true)),
+            (DgnValue::ByteArray(a), DgnValue::ByteArray(b)) => Ok(DgnValue::Bool(*a.lock().unwrap() == *b.lock().unwrap())),
             _ => Ok(DgnValue::Bool(false)),
         },
         BinOp::Ne  => match (l,r) {
@@ -924,6 +971,7 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (DgnValue::String(a), DgnValue::String(b)) => Ok(DgnValue::Bool(a != b)),
             (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a != b)),
             (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(false)),
+            (DgnValue::ByteArray(a), DgnValue::ByteArray(b)) => Ok(DgnValue::Bool(*a.lock().unwrap() != *b.lock().unwrap())),
             _ => Ok(DgnValue::Bool(true)),
         },
         BinOp::Lt  => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Bool(a<b)) } else { Ok(DgnValue::Bool(false)) },

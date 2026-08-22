@@ -1,0 +1,59 @@
+package __DRAGON_PACKAGE__
+
+import android.content.Context
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
+import java.io.File
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            DragonTheme {
+                DragonScreen()
+            }
+        }
+    }
+}
+
+@Composable
+fun DragonScreen() {
+    val context = LocalContext.current
+    val bridge = remember {
+        val b = DragonBridge()
+        b.set_storage_dir(context.filesDir.absolutePath)
+        b.set_asset_dir(copyAssetsToInternalStorage(context))
+        b
+    }
+    DragonApp(bridge)
+}
+
+
+private fun copyAssetsToInternalStorage(context: Context): String {
+    val outDir = File(context.filesDir, "dragon_assets")
+    if (!outDir.exists()) {
+        outDir.mkdirs()
+        val assetManager = context.assets
+        val names = assetManager.list("") ?: emptyArray()
+        for (name in names) {
+            try {
+                assetManager.open(name).use { input ->
+                    File(outDir, name).outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            } catch (e: java.io.IOException) {
+                // Most likely `name` is actually a subdirectory (list()
+                // returns those too, and open() on a directory throws) --
+                // skipped 
+            }
+        }
+    }
+    return outDir.absolutePath
+}

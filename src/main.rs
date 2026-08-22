@@ -1,6 +1,7 @@
 mod engine;
 mod codegen_c;
 mod tui;
+mod android_project;
 // mod aot_compiler;
 use engine::*;
 // use engine::{Chunk, Compiler, Instruction, lint_ast, lex, Parser};
@@ -108,6 +109,31 @@ fn main() {
         println!("  dragon -c <in> -o <out> --lib     Compile script to Shared Library");
         println!("  dragon -c <in> -o <out> --native  Compile script to native C binary (via gcc/clang/msvc) experimental");
         println!("  dragon -c <in> -o <out> --native --lib     Native shared library experimental");
+        println!("  dragon -c <in> -o <out> --native --lib --target <t1,t2,...>   Cross-compile the native library.");
+        println!("        Targets: android-arm64, android-armv7, android-x86_64, android-x86, android-all,");
+        println!("                 ios-arm64, ios-arm64-sim, ios-x86_64-sim, ios-all, all");
+        println!("        Android → <out>/jniLibs/<abi>/lib<name>.so  (drop into a Gradle project's jniLibs/)");
+        println!("        iOS     → <out>/ios/<slice>/lib<name>.a, plus <out>.xcframework with --xcframework");
+        println!("        Options: --android-api <level>  (default 24)");
+        println!("                 --ios-min <version>     (default 13.0)");
+        println!("                 --xcframework            package iOS slices into a .xcframework");
+        println!("                 --jni-package <pkg> --jni-class <Class>   emit Java_<pkg>_<Class>_<fn> JNI");
+        println!("                     wrappers directly into the Android .so (both required together) --");
+        println!("                     the .so becomes System.loadLibrary()-able with `external fun` as-is,");
+        println!("                     no separate CMake/JNI bridge library needed.");
+        println!("        Requires ANDROID_NDK_HOME for Android slices; iOS slices require building on macOS with Xcode.");
+        println!("");
+        println!("  dragon create <name> [--package <id>]   Scaffold a new Android app project");
+        println!("        Generates package.json, lib/main.dgn + lib/ui.dgn, and a full Android Gradle project.");
+        println!("        Run `dragon run`/`dragon build` inside the created directory from here on.");
+        println!("  dragon run                              Run the current project");
+        println!("        Inside a project made by `dragon create`: builds (native lib + Gradle), installs on a");
+        println!("        connected device/emulator (via adb), and launches it.");
+        println!("        Elsewhere: reads package.json's \"main\"/\"entry\" field and interprets that script.");
+        println!("  dragon build [--release]                Build an APK (inside a `dragon create` project)");
+        println!("        Debug APK by default; --release for a release build. Does not install/launch --");
+        println!("        use `dragon run` for that.");
+        println!("");
         println!("  dragon --ide                      Launch TurboDragon IDE");
         // println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("  dragon -v, --version              Show version information");
@@ -129,7 +155,6 @@ fn main() {
 
         let input_path = Path::new("lib/main.dgn");
         
-        // FIX: Target 'arm64-v8a' (Standard for Phones) inside the 'android' project folder
         let jni_dir = Path::new("app/src/main/jniLibs/x86_64");
         let output_so = jni_dir.join("libdragon_android.so");
 
@@ -138,7 +163,6 @@ fn main() {
             return;
         }
 
-        // FIX: Look for template in CURRENT DIRECTORY (where user runs command)
         let template_path = Path::new("libdragon_android.so");
         
         if !template_path.exists() {
@@ -154,7 +178,7 @@ fn main() {
 
         println!("Compiling Script: {}", input_path.display());
 
-        // 2. Gather & Encrypt Sources
+
         let mut sources = HashMap::new();
         if let Err(e) = gather_sources(input_path, &mut sources, true) {
             eprintln!("Build Failed: {}", e);
@@ -168,11 +192,10 @@ fn main() {
         let payload_bytes = encrypt_payload(payload.as_bytes());
         let payload_len = payload_bytes.len() as u64;
 
-        // 3. Copy Template -> Destination
+  
         println!("Installing Engine to: {:?}", output_so);
         fs::copy(&template_path, &output_so).expect("Failed to copy library template");
 
-        // 4. Inject Code into the Binary (Append Mode)
         println!("Injecting Encrypted Bytecode...");
         
         let mut file = OpenOptions::new()
@@ -181,11 +204,8 @@ fn main() {
             .open(&output_so)
             .expect("Failed to open .so for writing");
         
-        // Write Data
         file.write_all(&payload_bytes).expect("Write failed");
-        // Write Length (8 bytes)
         file.write_all(&payload_len.to_le_bytes()).expect("Write len failed");
-        // Write Signature (16 bytes)
         file.write_all(BUNDLE_SIGNATURE).expect("Write sig failed");
 
         println!("Success! App compiled and embedded into native library.");
@@ -208,6 +228,43 @@ fn main() {
         let is_window_mode = args.contains(&"--window".to_string());
         let is_native_mode = args.contains(&"--native".to_string());
         let keep_c_mode    = args.contains(&"--keep-c".to_string());
+        let make_xcframework = args.contains(&"--xcframework".to_string());
+
+        let target_spec = args.iter().position(|a| a == "--target").and_then(|i| args.get(i + 1)).cloned();
+        let android_api: u32 = args.iter().position(|a| a == "--android-api")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24); // NDK r27+ default floor; override with --android-api <level>
+        let ios_min_version = args.iter().position(|a| a == "--ios-min")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| "13.0".to_string());
+        let jni_package = args.iter().position(|a| a == "--jni-package").and_then(|i| args.get(i + 1)).cloned();
+        let jni_class = args.iter().position(|a| a == "--jni-class").and_then(|i| args.get(i + 1)).cloned();
+        if jni_package.is_some() != jni_class.is_some() {
+            eprintln!("Error: --jni-package and --jni-class must be given together.");
+            std::process::exit(1);
+        }
+
+        let cross_targets = match target_spec {
+            Some(spec) => match codegen_c::CrossTarget::parse_list(&spec) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            None => Vec::new(),
+        };
+        let cross_opts = codegen_c::CrossBuildOptions {
+            targets: cross_targets,
+            android_api,
+            ios_min_version,
+            make_xcframework,
+            jni_package,
+            jni_class,
+        };
+
         println!("Compiling {}...", input_path.display());
 
         // ── --native path: transpile Dragon AST → C, then invoke gcc/clang/msvc ──
@@ -237,8 +294,38 @@ fn main() {
                 }
             };
 
-            // Lint the AST
-            let report = lint_ast(&ast);
+            // Lint the AST. For --native --lib, imports are resolved and
+            // merged first (native has no runtime import mechanism -- it's
+            // one flat C translation unit), so the linter sees the same
+            // fully-merged function/global set the actual compile step
+            // will use; otherwise every function pulled in from an
+            // imported file would incorrectly look undefined here.
+            let base_dir_for_lint = input_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+            let flattened_for_lint;
+            let ast_for_lint: &Stmt = if is_lib_mode {
+                match codegen_c::flatten_imports_for_lib(&ast, &base_dir_for_lint, &mut std::collections::HashSet::new()) {
+                    Ok(a) => { flattened_for_lint = a; &flattened_for_lint }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                &ast
+            };
+
+            // --native --lib has its own bare-name builtin allowlist (see
+            // codegen_c::native::builtin_call) that's intentionally
+            // different from the interpreter's namespaced builtins (e.g.
+            // `sqrt(x)` here vs. `math.sqrt(x)` in a normal script), so the
+            // linter needs to be told about those too or it flags every
+            // one of them as an undefined function.
+            let native_extra_builtins = [
+                "sqrt", "abs", "floor", "ceil", "pow", "min", "max",
+                "substr", "index_of", "char_at", "parse_int", "parse_float",
+                "file_write", "file_append", "file_read", "file_exists", "file_delete", "json_escape",
+            ];
+            let report = lint_ast_with_extra_builtins(ast_for_lint, &native_extra_builtins);
             if !report.is_clean() {
                 report.print();
                 if !report.errors.is_empty() {
@@ -254,18 +341,29 @@ fn main() {
                 keep_c_mode,
                 is_lib_mode,
                 is_window_mode,
+                &cross_opts,
             ) {
                 Ok(()) => {
                     #[cfg(unix)]
                     {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Ok(metadata) = fs::metadata(output_path) {
-                            let mut perms = metadata.permissions();
-                            perms.set_mode(0o755);
-                            let _ = fs::set_permissions(output_path, perms);
+                        // Cross-compiled artifacts (Android .so / iOS .a) are
+                        // written under out_dir/jniLibs and out_dir/ios, not to
+                        // output_path itself, so there's nothing at output_path
+                        // to chmod in that case.
+                        if cross_opts.targets.is_empty() {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(metadata) = fs::metadata(output_path) {
+                                let mut perms = metadata.permissions();
+                                perms.set_mode(0o755);
+                                let _ = fs::set_permissions(output_path, perms);
+                            }
                         }
                     }
-                    println!("Success! Native output: {}", output_path.display());
+                    if cross_opts.targets.is_empty() {
+                        println!("Success! Native output: {}", output_path.display());
+                    } else {
+                        println!("Success! Cross-compiled target(s) built.");
+                    }
                 }
                 Err(e) => {
                     eprintln!("Native compilation failed: {}", e);
@@ -487,93 +585,6 @@ fn main() {
             fs::copy(&template, output_path).expect("Copy failed");
             println!("Created Shared Library: {:?}", output_path);
         } 
-//       else if is_web_mode {
-//         println!("Compiling for Web Assembly (Protected Mode)...");
-
-//         let template_dir = exe_path.parent().unwrap();
-//         let wasm_file = template_dir.join("dragon_lib_bg.wasm");
-//         let js_file = template_dir.join("dragon_lib.js");
-
-//         if !wasm_file.exists() || !js_file.exists() {
-//              println!("Error: WASM templates not found.");
-//              println!("Please build 'dragon_template' target wasm32-unknown-unknown and place .wasm and .js here.");
-//              return;
-//         }
-
-//         let out_dir = output_path.with_extension(""); 
-//         fs::create_dir_all(&out_dir).expect("Failed to create output dir");
-
-//         fs::copy(&wasm_file, out_dir.join("dragon_lib_bg.wasm")).unwrap();
-//         fs::copy(&js_file, out_dir.join("dragon.js")).unwrap();
-
-//         // 1. Gather Sources
-//         let mut sources = HashMap::new();
-//         if let Err(e) = gather_sources(input_path, &mut sources, true) {
-//              eprintln!("Error gathering sources: {}", e);
-//              return;
-//         }
-
-//         // 2. Serialize to JSON
-//         let payload_json = serde_json::to_string(&sources).expect("Failed to serialize");
-//         // let mut payload_bytes = payload_json.into_bytes();
-
-//         // 3. Encrypt (XOR) - Same logic as Native
-//         let payload_bytes = encrypt_payload(payload_json.as_bytes());
-// let payload_len = payload_bytes.len() as u64;
-
-//         // 4. Encode to Base64 (Safe for embedding in HTML string)
-//         use base64::{Engine as _, engine::general_purpose};
-//         let protected_payload = general_purpose::STANDARD.encode(&payload_bytes);
-
-//         // 5. Generate HTML with Protected Payload
-//         // Note: We now import `dragon_run_encrypted` instead of `dragon_run_wasm`
-//         let html_content = format!(r#"
-// <!DOCTYPE html>
-// <html>
-// <head>
-//     <meta charset="utf-8">
-//     <title>Dragon App</title>
-//     <style>
-//         body {{ font-family: monospace; background: #222; color: #eee; padding: 20px; }}
-//         #console {{ white-space: pre-wrap; }}
-//     </style>
-// </head>
-// <body>
-//     <h1>Dragon Output</h1>
-//     <div id="console">Initializing System...</div>
-//     <script type="module">
-//         import init, {{ dragon_run_wasm }} from './dragon.js';
-
-//         async function run() {{
-//             await init();
-//             const outputDiv = document.getElementById("console");
-            
-//             const oldLog = console.log;
-//             console.log = (msg) => {{
-//                 outputDiv.innerText += msg + "\n";
-//                 oldLog(msg);
-//             }};
-
-//             const payload = "{}";
-
-//             outputDiv.innerText = "> System Ready. Executing...\n";
-//             try {{
-//                 const result = dragon_run_wasm(payload);
-//                 outputDiv.innerText += "\n[" + result + "]";
-//             }} catch(e) {{
-//                 outputDiv.innerText += "\n[WASM Error: " + e + "]";
-//             }}
-//         }}
-//         run();
-//     </script>
-// </body>
-// </html>
-// "#, protected_payload);
-
-//         fs::write(out_dir.join("index.html"), html_content).unwrap();
-//         println!("Success! Protected Web bundle created at: {:?}", out_dir);
-//         return;
-//     }
         else {
             fs::copy(&exe_path, output_path).expect("Copy failed");
             println!("Created Executable: {:?}", output_path);
@@ -661,8 +672,49 @@ fn main() {
 
     let mut filename = command.to_string();
 
+    if command == "create" {
+        if args.len() < 3 {
+            eprintln!("Usage: dragon create <name> [--package <reverse.dns.name>]");
+            std::process::exit(1);
+        }
+        let name = &args[2];
+        let package = args.iter().position(|a| a == "--package")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| format!("com.example.{}", name.replace(['-', ' '], "_")));
+        if let Err(e) = android_project::create_project(name, &package) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if command == "build" {
+        let release = args.iter().any(|a| a == "--release");
+        let dragon_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("dragon"));
+        match android_project::build_android(&dragon_exe, release) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if command == "run" {
         let pkg_path = Path::new("package.json");
+        if pkg_path.exists() && android_project::is_android_project(pkg_path) {
+            let dragon_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("dragon"));
+            match android_project::run_android(&dragon_exe) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         if !pkg_path.exists() {
             eprintln!("Error: 'package.json' not found. Are you inside a Dragon project?");
             std::process::exit(1);
@@ -738,26 +790,7 @@ fn main() {
     }
 }
 
-// fn get_key() -> Vec<u8> {
 
-//     let mut key = Vec::new();
-
-//     key.push(68);  
-//     key.push(82);  
-//     key.push(65);  
-//     key.push(71); 
-//     key.push(79); 
-//     key.push(78); 
-//     key.push(95); 
-//     key.push(50);  
-//     key.push(48);  
-//     key.push(50);  
-//     key.push(54); 
-    
-//     key.push(10+20);
-
-//     key
-// }
 
 fn hide_windows_console(path: &Path) -> std::io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;

@@ -16,6 +16,10 @@ use std::process::Command;
 use std::path::PathBuf;
 use crate::engine::{Expr, ExprNode, Stmt, StmtNode, lex, Parser};
 
+mod target;
+pub use target::CrossTarget;
+use target::{ndk_clang_path, ios_clang_and_sysroot};
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,6 +32,21 @@ fn is_builtin_module(name: &str) -> bool {
     )
 }
 
+/// Cross-compilation options for `--native --lib --target ...`. Empty
+/// `targets` means "compile for the host" (the original behavior).
+#[derive(Default, Clone)]
+pub struct CrossBuildOptions {
+    pub targets: Vec<CrossTarget>,
+    pub android_api: u32,       // default 24 — see main.rs
+    pub ios_min_version: String, // e.g. "13.0"
+    pub make_xcframework: bool,
+    /// When both are set, Android slices additionally get
+    /// `Java_<package>_<class>_<fn>` JNI wrappers spliced in, so the .so is
+    /// directly `System.loadLibrary()`-able — no separate JNI bridge needed.
+    pub jni_package: Option<String>,
+    pub jni_class: Option<String>,
+}
+
 pub fn compile_to_native_c(
     ast: &Stmt,
     src_path: &Path,          // ← new: path to the .dgn entry file
@@ -35,10 +54,35 @@ pub fn compile_to_native_c(
     keep_c: bool,
     is_lib: bool,
     is_window: bool,
+    cross: &CrossBuildOptions,
 ) -> Result<(), String> {
+    if !cross.targets.is_empty() && !is_lib {
+        return Err(
+            "--target is only supported together with --lib. Cross-compiling a \
+             standalone executable via --native isn't wired up yet; build a \
+             shared/static library and drive it from a native Android/iOS host app instead."
+                .into(),
+        );
+    }
+
     let base_dir = src_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // --native --lib has no runtime import mechanism (it's one flat C
+    // translation unit), so `import "file.dgn";` is resolved here, once,
+    // at compile time: recursively load and merge every imported file's
+    // top-level declarations into a single combined AST before anything
+    // downstream (transpilation, header generation, JNI wrapper
+    // generation) ever looks at it -- all three need to see the same
+    // fully-merged function/global set, not just the entry file's own.
+    let flattened_lib_ast;
+    let ast: &Stmt = if is_lib {
+        flattened_lib_ast = flatten_imports_for_lib(ast, &base_dir, &mut std::collections::HashSet::new())?;
+        &flattened_lib_ast
+    } else {
+        ast
+    };
+
     let c_src = if is_lib {
-        transpile_native_lib(ast)
+        transpile_native_lib(ast).map_err(|e| e)?
     } else {
         transpile(ast, false, &base_dir)   // ← pass base_dir
     };
@@ -54,17 +98,83 @@ pub fn compile_to_native_c(
     fs::write(&c_path, &c_src).map_err(|e| format!("Failed to write C source: {}", e))?;
     println!("  [native] C source → {}", c_path.display());
 
-    let status = invoke_compiler(&c_path, out_path, is_lib, is_window)?;
-    if !status {
-        // if !keep_c {
-            let _ = fs::remove_file(&c_path);
-        // }
-        return Err("C compiler exited with non-zero status".into());
+    if cross.targets.is_empty() {
+        let status = invoke_compiler(&c_path, out_path, is_lib, is_window)?;
+        if !status {
+            if !keep_c {
+                let _ = fs::remove_file(&c_path);
+            }
+            return Err("C compiler exited with non-zero status".into());
+        }
+    } else {
+        // Cross-compiling: the generated header is needed up front so it can
+        // be bundled alongside each iOS static-library slice for xcframework
+        // packaging (the host path only needs it after the build succeeds).
+        let stem = out_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let header_text = generate_native_lib_header(ast, &stem).ok();
+
+        // If JNI wrappers were requested, build a second, Android-only
+        // source file with `#include <jni.h>` + the Java_-prefixed wrappers
+        // appended — this must stay separate from `c_path` because iOS
+        // slices compile from the same base source and have no `<jni.h>`.
+        let mut android_jni_path: Option<PathBuf> = None;
+        if is_lib {
+            if let (Some(pkg), Some(cls)) = (&cross.jni_package, &cross.jni_class) {
+                let jni_wrappers = generate_jni_wrappers(ast, pkg, cls).map_err(|e| {
+                    if !keep_c { let _ = fs::remove_file(&c_path); }
+                    e
+                })?;
+                let augmented = format!(
+                    "{}\n\n/* ---- JNI wrappers (Android) ---- */\n#include <jni.h>\n\n{}",
+                    c_src, jni_wrappers
+                );
+                let jni_path = std::env::temp_dir().join(format!("dragon_{}_jni.c", stem));
+                fs::write(&jni_path, &augmented)
+                    .map_err(|e| format!("Failed to write JNI-augmented C source: {}", e))?;
+                println!("  [native] Android C source (+JNI) → {}", jni_path.display());
+                android_jni_path = Some(jni_path);
+            }
+        }
+
+        if let Err(e) = invoke_cross_compiler(&c_path, android_jni_path.as_deref(), out_path, &stem, cross, header_text.as_deref()) {
+            if !keep_c {
+                let _ = fs::remove_file(&c_path);
+                if let Some(p) = &android_jni_path { let _ = fs::remove_file(p); }
+            }
+            return Err(e);
+        }
+        if !keep_c {
+            if let Some(p) = &android_jni_path { let _ = fs::remove_file(p); }
+        }
     }
 
-    // if !keep_c {
+    if !keep_c {
         let _ = fs::remove_file(&c_path);
-    // }
+    }
+
+    if is_lib {
+        let stem = out_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        match generate_native_lib_header(ast, &stem) {
+            Ok(header) => {
+                let h_dir = out_path.parent().unwrap_or(Path::new("."));
+                let h_path = h_dir.join(format!("{}.h", stem));
+                if let Err(e) = fs::write(&h_path, &header) {
+                    println!("  [native] warning: failed to write header {}: {}", h_path.display(), e);
+                } else {
+                    println!("  [native] header    → {}", h_path.display());
+                }
+            }
+            Err(e) => {
+                // The library itself already compiled successfully (this
+                // function only re-derives signatures for the header, using
+                // the exact same rules) — a failure here would only happen
+                // if transpile_native_lib itself had already errored out
+                // above, so this is unreachable in practice, but fail soft
+                // rather than losing an otherwise-successful build.
+                println!("  [native] warning: could not generate header: {}", e);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -162,7 +272,26 @@ fn run_gcc(
     is_lib: bool,
     is_window: bool,
 ) -> Result<bool, String> {
-    let mut args = vec![c_path, "-O2", "-o", out_path, "-lm"];
+    // Optimization level.
+    //
+    // The GC-safety restriction below (plain -O3's more aggressive inlining
+    // can hide a live pointer from our conservative stack-scanning GC —
+    // see the long comment in the else-branch) simply doesn't apply here
+    // when compiling a --lib build: transpile_native_lib emits plain C with
+    // no DgnVal boxing, no dgn_gc_alloc, no GC at all, so there's nothing
+    // for aggressive inlining to hide from a collector that was never
+    // going to run. Full -O3 is safe and strictly better for a compiled
+    // shared library other languages will call into a lot.
+    let opt_flags: &[&str] = if is_lib {
+        &["-O3"]
+    } else if cc == "gcc" {
+        &["-O3", "-fno-inline-functions", "-fomit-frame-pointer"]
+    } else {
+        &["-O2"]
+    };
+    let mut args = vec![c_path];
+    args.extend_from_slice(opt_flags);
+    args.extend_from_slice(&["-o", out_path, "-lm"]);
     if is_lib {
         args.push("-shared");
         args.push("-fPIC");
@@ -193,6 +322,197 @@ fn which_exists(name: &str) -> bool {
     .unwrap_or(false)
 }
 
+
+fn invoke_cross_compiler(
+    c_path: &Path,
+    android_c_path: Option<&Path>,
+    out_path: &Path,
+    stem: &str,
+    cross: &CrossBuildOptions,
+    header_text: Option<&str>,
+) -> Result<(), String> {
+    let out_dir = out_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let c_str = c_path.to_str().ok_or("Non-UTF8 temp C path")?;
+
+    let android_c_str = android_c_path.and_then(|p| p.to_str()).unwrap_or(c_str);
+
+    let mut errors: Vec<String> = Vec::new();
+
+    let android_targets: Vec<CrossTarget> =
+        cross.targets.iter().copied().filter(|t| t.is_android()).collect();
+    if !android_targets.is_empty() {
+        let jni_libs_dir = out_dir.join("jniLibs");
+        for t in android_targets {
+            match ndk_clang_path(t, cross.android_api) {
+                Ok(clang) => {
+                    let abi_dir = jni_libs_dir.join(t.android_abi_dir());
+                    if let Err(e) = fs::create_dir_all(&abi_dir) {
+                        errors.push(format!("[{}] could not create {}: {}", t.label(), abi_dir.display(), e));
+                        continue;
+                    }
+                    let so_name = format!("lib{}.so", stem);
+                    let so_path = abi_dir.join(&so_name);
+ 
+                    let soname_flag = format!("-Wl,-soname,{}", so_name);
+                    let args = [
+                        android_c_str, "-shared", "-fPIC", "-O3",
+                        "-o", so_path.to_str().unwrap(),
+                        "-lm",
+                        soname_flag.as_str(),
+                        "-Wl,-z,max-page-size=16384",
+                    ];
+                    println!("  [native] [{}] compiling with {}", t.label(), clang.display());
+                    match Command::new(&clang).args(args).status() {
+                        Ok(s) if s.success() => println!("  [native] [{}] → {}", t.label(), so_path.display()),
+                        Ok(s) => errors.push(format!("[{}] clang exited with {}", t.label(), s)),
+                        Err(e) => errors.push(format!("[{}] failed to launch {}: {}", t.label(), clang.display(), e)),
+                    }
+                }
+                Err(e) => errors.push(format!("[{}] {}", t.label(), e)),
+            }
+        }
+    }
+
+
+    let ios_targets: Vec<CrossTarget> =
+        cross.targets.iter().copied().filter(|t| t.is_ios()).collect();
+    let mut built_slices: Vec<(CrossTarget, PathBuf)> = Vec::new();
+    if !ios_targets.is_empty() {
+        let ios_dir = out_dir.join("ios");
+        for t in ios_targets {
+            match build_ios_slice(c_str, &ios_dir, stem, t, &cross.ios_min_version) {
+                Ok(a_path) => built_slices.push((t, a_path)),
+                Err(e) => errors.push(format!("[{}] {}", t.label(), e)),
+            }
+        }
+
+        if cross.make_xcframework && !built_slices.is_empty() {
+            match package_xcframework(&out_dir, stem, &built_slices, header_text) {
+                Ok(xc_path) => println!("  [native] xcframework → {}", xc_path.display()),
+                Err(e) => errors.push(format!("[xcframework] {}", e)),
+            }
+        } else if !cross.make_xcframework && !built_slices.is_empty() {
+            println!(
+                "  [native] iOS static libs built under {} — pass --xcframework to package them.",
+                ios_dir.display()
+            );
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} of {} target(s) failed:\n  - {}",
+            errors.len(), cross.targets.len(), errors.join("\n  - ")))
+    }
+}
+
+fn build_ios_slice(
+    c_str: &str,
+    ios_dir: &Path,
+    stem: &str,
+    target: CrossTarget,
+    min_version: &str,
+) -> Result<PathBuf, String> {
+    let (clang, sysroot) = ios_clang_and_sysroot(target)?;
+    let slice_dir = ios_dir.join(target.label());
+    fs::create_dir_all(&slice_dir).map_err(|e| format!("could not create {}: {}", slice_dir.display(), e))?;
+
+    let obj_path = slice_dir.join(format!("{}.o", stem));
+    let triple = target.ios_clang_target(min_version);
+    let compile_args = [
+        "-c", c_str,
+        "-arch", target.ios_arch(),
+        "-target", &triple,
+        "-isysroot", sysroot.to_str().unwrap(),
+        "-O3", "-fPIC",
+        "-o", obj_path.to_str().unwrap(),
+    ];
+    println!("  [native] [{}] compiling with {} (-target {})", target.label(), clang.display(), triple);
+    let status = Command::new(&clang).args(compile_args).status()
+        .map_err(|e| format!("failed to launch {}: {}", clang.display(), e))?;
+    if !status.success() {
+        return Err(format!("clang exited with {}", status));
+    }
+
+    let a_path = slice_dir.join(format!("lib{}.a", stem));
+    let ar_status = Command::new("xcrun")
+        .args(["ar", "-rcs", a_path.to_str().unwrap(), obj_path.to_str().unwrap()])
+        .status()
+        .map_err(|e| format!("failed to launch xcrun ar: {}", e))?;
+    if !ar_status.success() {
+        return Err(format!("ar exited with {}", ar_status));
+    }
+    println!("  [native] [{}] → {}", target.label(), a_path.display());
+    Ok(a_path)
+}
+
+/// Merges the built slices per platform-variant (lipo-ing the two simulator
+/// archs into one fat `.a` if both were built) and calls
+/// `xcodebuild -create-xcframework` to produce `<stem>.xcframework`.
+fn package_xcframework(
+    out_dir: &Path,
+    stem: &str,
+    slices: &[(CrossTarget, PathBuf)],
+    header_text: Option<&str>,
+) -> Result<PathBuf, String> {
+    let headers_dir = out_dir.join("ios").join("include");
+    fs::create_dir_all(&headers_dir).map_err(|e| format!("could not create {}: {}", headers_dir.display(), e))?;
+    if let Some(h) = header_text {
+        fs::write(headers_dir.join(format!("{}.h", stem)), h)
+            .map_err(|e| format!("could not write header: {}", e))?;
+    }
+
+    let device_lib = slices.iter().find(|(t, _)| *t == CrossTarget::IosArm64).map(|(_, p)| p.clone());
+    let sim_libs: Vec<PathBuf> = slices.iter().filter(|(t, _)| t.is_ios_simulator()).map(|(_, p)| p.clone()).collect();
+
+    let sim_fat_lib = if sim_libs.len() > 1 {
+        let fat_path = out_dir.join("ios").join(format!("lib{}-simulator-fat.a", stem));
+        let mut args = vec!["lipo", "-create"];
+        let sim_strs: Vec<&str> = sim_libs.iter().map(|p| p.to_str().unwrap()).collect();
+        args.extend(sim_strs.iter().copied());
+        args.push("-output");
+        let fat_str = fat_path.to_str().unwrap();
+        args.push(fat_str);
+        let status = Command::new("xcrun").args(&args).status()
+            .map_err(|e| format!("failed to launch xcrun lipo: {}", e))?;
+        if !status.success() {
+            return Err(format!("lipo exited with {}", status));
+        }
+        Some(fat_path)
+    } else {
+        sim_libs.into_iter().next()
+    };
+
+    if device_lib.is_none() && sim_fat_lib.is_none() {
+        return Err("no iOS slices available to package".into());
+    }
+
+    let xc_path = out_dir.join(format!("{}.xcframework", stem));
+    let _ = fs::remove_dir_all(&xc_path); // xcodebuild refuses to overwrite an existing bundle
+    let mut args = vec!["xcodebuild".to_string(), "-create-xcframework".to_string()];
+    if let Some(ref d) = device_lib {
+        args.push("-library".into());
+        args.push(d.to_str().unwrap().to_string());
+        args.push("-headers".into());
+        args.push(headers_dir.to_str().unwrap().to_string());
+    }
+    if let Some(ref s) = sim_fat_lib {
+        args.push("-library".into());
+        args.push(s.to_str().unwrap().to_string());
+        args.push("-headers".into());
+        args.push(headers_dir.to_str().unwrap().to_string());
+    }
+    args.push("-output".into());
+    args.push(xc_path.to_str().unwrap().to_string());
+
+    let status = Command::new("xcrun").args(&args).status()
+        .map_err(|e| format!("failed to launch xcrun xcodebuild: {}", e))?;
+    if !status.success() {
+        return Err(format!("xcodebuild -create-xcframework exited with {}", status));
+    }
+    Ok(xc_path)
+}
 
 mod mangle;
 mod native;
