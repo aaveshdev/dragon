@@ -63,8 +63,6 @@ This is genuinely experimental and young, not a finished framework:
   genuine use-after-free and leak bugs. `dragon create`'s project
   scaffolding is real, tested output too — every generated file was
   inspected, and the generated `lib/main.dgn` was compiled and run.
-  Example apps ship in `examples/`: `todo_app.dgn`, `calculator.dgn`,
-  `nav_app.dgn`, all built on `ui.dgn`'s widget library.
 - **Not yet verified on real hardware/toolchains by us**: the Android/
   Kotlin side of the example integration (`examples/android/*.kt`) is
   hand-written and reviewed, not compiled here — you are the first real
@@ -90,7 +88,7 @@ This is genuinely experimental and young, not a finished framework:
   plain C is a large, security-sensitive undertaking not worth rushing.
   The documented pattern instead: the host app performs the request and
   calls a Dragon function with the result, the same way `on_event()`
-  already works — see `examples/android/UI_BRIDGE_README.md`.
+  already works.
 
 See `examples/android/UI_BRIDGE_README.md` for the full integration guide,
 and `CROSS_COMPILE_TESTING.md` for cross-compilation setup (NDK, and the
