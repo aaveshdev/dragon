@@ -1,0 +1,105 @@
+import "dragon/ui" as *
+
+class Todo {
+    func init(title, done = False) {
+        this.title = title
+        this.done = done
+    }
+}
+
+class HomePage extends LiveView {
+    func createState() { return HomeState() }
+}
+
+class HomeState extends Live {
+    func onInit() {
+        this.todos = [Todo("Learn Dragon"), Todo("Build an app", done: True)]
+        this.input = TextController()
+        this.tab = 0
+        this.dark = False
+        this.slider = 0.3
+        this.choice = "a"
+        this.formKey = GlobalKey()
+        this.anim = Animator(duration: Duration(milliseconds: 500), vsync: this)
+        this.big = False
+    }
+
+    func add() {
+        me = this
+        t = this.input.text
+        if (t == "") { return }
+        this.update(func() {
+            me.todos.push(Todo(t))
+            me.input.clear()
+        })
+    }
+
+    func build(context) {
+        me = this
+        theme = Theme.of(context)
+        items = []
+        i = 0
+        for todo in this.todos {
+            idx = i
+            items.push(Swipe(key: ValueKey("t" + str(idx)),
+                onDismissed: func() { me.update(func() { me.todos.remove_at(idx) }) },
+                child: CheckItem(value: todo.done, title: Text(todo.title),
+                    onChange: func(v) { me.update(func() { todo.done = v }) })))
+            i = i + 1
+        }
+        pages = [
+            Feed(children: [
+                Pad(padding: Insets.all(12), child: Input(controller: this.input,
+                    decoration: FieldLook(labelText: "New todo", suffixIcon: IconButton(onTap: func() { me.add() }, icon: Icon(Icons.add))),
+                    onSubmit: func(v) { me.add() })),
+                Col(children: items)
+            ]),
+            Center(child: Col(main: Main.center, children: [
+                Toggle(value: this.dark, onChange: func(v) { me.update(func() { me.dark = v }) }),
+                Slider(value: this.slider, onChange: func(v) { me.update(func() { me.slider = v }) }),
+                Dropdown(value: this.choice, items: [
+                    Option(value: "a", child: Text("Alpha")),
+                    Option(value: "b", child: Text("Beta"))],
+                    onChange: func(v) { me.update(func() { me.choice = v }) }),
+                AnimBox(duration: Duration(milliseconds: 300), width: this.big ? 200 : 100, height: 50,
+                    decoration: Look(color: Colors.orange, borderRadius: Corners.circular(8))),
+                SolidButton(onTap: func() { me.update(func() { me.big = not me.big }) }, child: Text("Grow")),
+                Flow(gap: 8, children: [Tag(label: Text("one")), FilterTag(label: Text("two"), selected: True, onSelected: func(v) { })]),
+                ProgressBar(value: this.slider),
+                Row(main: Main.center, children: [
+                    FlatButton(onTap: func() {
+                        showDialog(context: context, builder: func(c) {
+                            return Alert(title: Text("Hello"), content: Text("A dialog"),
+                                actions: [FlatButton(onTap: func() { Nav.pop(c) }, child: Text("Close"))])
+                        })
+                    }, child: Text("Dialog")),
+                    FlatButton(onTap: func() {
+                        Notices.of(context).notify(Notice(content: Text("Saved!")))
+                    }, child: Text("Snack")),
+                    FlatButton(onTap: func() {
+                        Nav.push(context, Route(builder: func(c) { return DetailPage() }))
+                    }, child: Text("Push"))
+                ])
+            ]))
+        ]
+        return Screen(
+            topBar: TopBar(title: Text("Showcase"), actions: [IconButton(onTap: func() { }, icon: Icon(Icons.search))]),
+            sideMenu: SideMenu(child: Feed(children: [SideMenuHeader(child: Text("Menu")), Item(leading: Icon(Icons.home), title: Text("Home"))])),
+            body: pages[this.tab],
+            bottomBar: NavBar(selectedIndex: this.tab,
+                onDestinationSelected: func(i) { me.update(func() { me.tab = i }) },
+                destinations: [NavItem(icon: Icons.list, label: "Todos"), NavItem(icon: Icons.settings, label: "Controls")]),
+            actionButton: ActionButton(onTap: func() { me.add() }, child: Icon(Icons.add)))
+    }
+}
+
+class DetailPage extends View {
+    func build(context) {
+        return Screen(topBar: TopBar(title: Text("Detail")),
+            body: Center(child: Button(onTap: func() { Nav.pop(context) }, child: Text("Back"))))
+    }
+}
+
+func main() {
+    runApp(App(title: "Showcase", home: HomePage()))
+}

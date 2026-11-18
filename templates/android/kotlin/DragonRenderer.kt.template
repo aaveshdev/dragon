@@ -1,25 +1,46 @@
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
+
 package __DRAGON_PACKAGE__
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -28,36 +49,56 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Snackbar
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -65,13 +106,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -89,43 +134,141 @@ import org.json.JSONObject
 @Composable
 fun DragonApp(bridge: DragonBridge) {
     var treeJson by remember { mutableStateOf(bridge.render()) }
+    var themeJson by remember { mutableStateOf(bridge.theme()) }
 
     val dispatch: (String) -> Unit = { event ->
         bridge.on_event(event)
         treeJson = bridge.render()
+        themeJson = bridge.theme()
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(1000)
+            dispatch("__tick__")
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        var lastSeq = bridge.http_request_seq()
+        while (true) {
+            val seq = bridge.http_request_seq()
+            if (seq != lastSeq) {
+                lastSeq = seq
+                val url = bridge.http_request_url()
+                val event = bridge.http_request_event()
+                val method = bridge.http_request_method()
+                val body = bridge.http_request_body()
+                if (url.isNotEmpty() && event.isNotEmpty()) {
+                    val (status, responseBody) = performDragonHttpRequest(url, method, body)
+                    val statusStr = status.toString().padStart(3, '0')
+                    dispatch(event + ":" + statusStr + ":" + responseBody)
+                }
+            }
+            kotlinx.coroutines.delay(200)
+        }
     }
 
     val root = remember(treeJson) { JSONObject(treeJson) }
-
-    if (root.optString("type") == "drawer_scaffold") {
-        DragonDrawerScaffold(root, dispatch)
-        return
+    val hasNavigation = remember(treeJson) { findFirst(root) { it.optString("type") == "page" } != null }
+    if (hasNavigation) {
+        BackHandler(enabled = true) { dispatch("__nav_back__") }
     }
 
-    val fabNode = remember(treeJson) { findFab(root) }
+    val fabNode = remember(treeJson) { findFirst(root) { it.optString("type") == "fab" } }
+    val snackbarNode = remember(treeJson) {
+        findFirst(root) { it.optString("type") == "snackbar" && it.optBoolean("visible") }
+    }
+    val dialogNode = remember(treeJson) {
+        findFirst(root) { it.optString("type") == "alert_dialog" && it.optBoolean("visible") }
+    }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        DragonRootContent(root, dispatch)
-        if (fabNode != null) {
-            Box(modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)) {
-                DragonNode(fabNode, dispatch)
+    DragonTheme(themeJson = themeJson) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            DragonScreenRoot(root, dispatch)
+            if (fabNode != null) {
+                Box(modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)) {
+                    DragonFab(fabNode, dispatch)
+                }
             }
+            if (snackbarNode != null) {
+                DragonSnackbarOverlay(snackbarNode, dispatch, Modifier.align(Alignment.BottomCenter))
+            }
+        }
+        if (dialogNode != null) {
+            DragonAlertDialogOverlay(dialogNode, dispatch)
+        }
+    }
+}
+
+private suspend fun performDragonHttpRequest(url: String, method: String, body: String): Pair<Int, String> {
+    return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        try {
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.requestMethod = method.ifEmpty { "GET" }
+            connection.connectTimeout = 15000
+            connection.readTimeout = 15000
+            if (connection.requestMethod == "POST" || connection.requestMethod == "PUT") {
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            }
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            status to text
+        } catch (e: Exception) {
+            0 to (e.message ?: "request failed")
         }
     }
 }
 
 @Composable
-private fun DragonRootContent(root: JSONObject, dispatch: (String) -> Unit) {
-    val rootHasOwnBg = root.optString("type") == "column" && root.optString("bg").isNotEmpty()
+private fun DragonScreenRoot(node: JSONObject, dispatch: (String) -> Unit) {
+    when (node.optString("type")) {
+        "drawer_scaffold" -> DragonDrawerScaffold(node, dispatch)
+        "page" -> DragonPageHost(node, dispatch)
+        else -> DragonPlainScreen(node, dispatch)
+    }
+}
 
-    if (rootHasOwnBg) {
-        DragonNode(root, dispatch, Modifier.fillMaxSize())
+@Composable
+private fun DragonPageHost(node: JSONObject, dispatch: (String) -> Unit) {
+    val key = node.optString("key")
+    val content = node.optJSONObject("content") ?: JSONObject()
+    AnimatedContent(
+        targetState = key,
+        transitionSpec = {
+            (slideInHorizontally(animationSpec = tween(220)) { it / 4 } + fadeIn(tween(220))) togetherWith
+                (slideOutHorizontally(animationSpec = tween(180)) { -it / 6 } + fadeOut(tween(180)))
+        },
+        label = "dragon_page_transition"
+    ) {
+        DragonScreenRoot(content, dispatch)
+    }
+}
+
+@Composable
+private fun DragonPlainScreen(root: JSONObject, dispatch: (String) -> Unit) {
+    val rootType = root.optString("type")
+    val hasFullBleedBg = rootType == "container" &&
+        root.optInt("width", 0) < 0 && root.optInt("height", 0) < 0 &&
+        (root.optString("bg").isNotEmpty() || root.optString("gradientFrom").isNotEmpty())
+    val hasScreenChrome = (rootType == "column" || rootType == "row") && containsScreenChrome(root)
+    val selfManaging = rootType == "tab_view" || rootType == "refreshable_list" || rootType == "stack"
+
+    if (hasFullBleedBg) {
+        DragonNode(root, dispatch, Modifier.fillMaxSize().imePadding())
+    } else if (hasScreenChrome || selfManaging) {
+        DragonNode(root, dispatch, Modifier.fillMaxSize().imePadding().background(MaterialTheme.colorScheme.background))
     } else {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
-                .verticalScroll(rememberScrollState()) 
+                .statusBarsPadding()
+                .imePadding()
+                .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
@@ -134,19 +277,28 @@ private fun DragonRootContent(root: JSONObject, dispatch: (String) -> Unit) {
     }
 }
 
-private fun findFab(node: JSONObject): JSONObject? {
-    if (node.optString("type") == "fab") return node
+private fun containsScreenChrome(node: JSONObject): Boolean {
+    val children = node.optJSONArray("children") ?: return false
+    for (i in 0 until children.length()) {
+        val child = children.optJSONObject(i) ?: continue
+        val t = child.optString("type")
+        if (t == "app_bar" || t == "bottom_nav" || t == "flexible") return true
+    }
+    return false
+}
+
+private fun findFirst(node: JSONObject, predicate: (JSONObject) -> Boolean): JSONObject? {
+    if (predicate(node)) return node
     node.optJSONArray("children")?.let { arr ->
         for (i in 0 until arr.length()) {
-            val child = arr.optJSONObject(i) ?: continue
-            findFab(child)?.let { return it }
+            arr.optJSONObject(i)?.let { c -> findFirst(c, predicate)?.let { return it } }
         }
     }
-    node.optJSONObject("content")?.let { c -> findFab(c)?.let { return it } }
+    node.optJSONObject("child")?.let { c -> findFirst(c, predicate)?.let { return it } }
+    node.optJSONObject("content")?.let { c -> findFirst(c, predicate)?.let { return it } }
     node.optJSONArray("drawer")?.let { arr ->
         for (i in 0 until arr.length()) {
-            val child = arr.optJSONObject(i) ?: continue
-            findFab(child)?.let { return it }
+            arr.optJSONObject(i)?.let { c -> findFirst(c, predicate)?.let { return it } }
         }
     }
     return null
@@ -173,6 +325,7 @@ private fun DragonDrawerScaffold(root: JSONObject, dispatch: (String) -> Unit) {
                     modifier = Modifier
                         .fillMaxSize()
                         .background(MaterialTheme.colorScheme.surface)
+                        .statusBarsPadding()
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -188,16 +341,8 @@ private fun DragonDrawerScaffold(root: JSONObject, dispatch: (String) -> Unit) {
         }
     ) {
         val content = root.optJSONObject("content")
-        val fabNode = remember(root) { content?.let { findFab(it) } }
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (content != null) {
-                DragonRootContent(content, localDispatch)
-            }
-            if (fabNode != null) {
-                Box(modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)) {
-                    DragonNode(fabNode, localDispatch)
-                }
-            }
+        if (content != null) {
+            DragonScreenRoot(content, localDispatch)
         }
     }
 }
@@ -217,22 +362,26 @@ private fun parseHexColor(hex: String, fallback: Color): Color {
     }
 }
 
-
-private fun iconFor(name: String): ImageVector = when (name) {
-    "add" -> Icons.Filled.Add
-    "delete" -> Icons.Filled.Delete
+private fun iconFor(name: String): ImageVector = when (name.lowercase()) {
+    "add", "new" -> Icons.Filled.Add
+    "delete", "trash" -> Icons.Filled.Delete
     "settings" -> Icons.Filled.Settings
     "menu" -> Icons.Filled.Menu
-    "close" -> Icons.Filled.Close
-    "check" -> Icons.Filled.Check
+    "close", "cancel" -> Icons.Filled.Close
+    "check", "done" -> Icons.Filled.Check
     "search" -> Icons.Filled.Search
     "home" -> Icons.Filled.Home
-    "star" -> Icons.Filled.Star
-    "favorite" -> Icons.Filled.Favorite
+    "star", "favorites" -> Icons.Filled.Star
+    "favorite", "like" -> Icons.Filled.Favorite
     "info" -> Icons.Filled.Info
+    "back", "arrow_back" -> Icons.Filled.ArrowBack
+    "forward", "arrow_forward" -> Icons.AutoMirrored.Filled.ArrowForward
+    "edit" -> Icons.Filled.Edit
+    "person", "profile", "account" -> Icons.Filled.Person
+    "notifications", "alerts" -> Icons.Filled.Notifications
+    "list" -> Icons.Filled.Menu
     else -> Icons.Filled.MoreVert
 }
-
 
 @Composable
 private fun AutoSizeSingleLineText(
@@ -265,17 +414,17 @@ private fun AutoSizeSingleLineText(
     )
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier = Modifier) {
     val tokens = LocalDragonTokens.current
     when (node.optString("type")) {
+        "empty" -> Box(modifier = modifier)
         "text" -> {
-            val fg = node.optString("fg")
+            val fg = node.optString("color")
             val sizeSp = node.optInt("size", 0)
             val align = node.optString("align")
             val color = parseHexColor(fg, MaterialTheme.colorScheme.onBackground)
-            val baseStyle = MaterialTheme.typography.bodyLarge
+            val baseStyle = if (sizeSp >= 22) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.bodyLarge
             val style = if (sizeSp > 0) baseStyle.copy(fontSize = sizeSp.sp) else baseStyle
             val textAlign = when (align) {
                 "end" -> TextAlign.End
@@ -295,22 +444,23 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
             }
         }
         "button" -> {
-            DragonButton(
-                label = node.optString("label"),
-                onClick = { dispatch(node.optString("event")) },
-                onLongClick = if (node.has("longEvent") && node.optString("longEvent").isNotEmpty()) {
-                    { dispatch(node.optString("longEvent")) }
-                } else null,
-                bg = node.optString("bg"),
-                fg = node.optString("fg"),
-                weight = node.optInt("weight", 0),
-                tokens = tokens,
-                modifier = modifier
-            )
+            DragonButton(node = node, dispatch = dispatch, tokens = tokens, modifier = modifier)
         }
         "textfield" -> {
             val focusEvt = node.optString("focusEvent")
             val blurEvt = node.optString("blurEvent")
+            val obscured = node.optBoolean("obscured", false)
+            val lines = node.optInt("lines", 1).coerceAtLeast(1)
+            val prefixIconName = node.optString("prefixIcon")
+            val suffixIconName = node.optString("suffixIcon")
+            val clearable = node.optBoolean("clearable", false)
+            val keyboardTypeName = node.optString("keyboardType")
+            val submitEvt = node.optString("submitEvent")
+            val maxLength = node.optInt("maxLength", 0)
+            val errorText = node.optString("errorText")
+            val enabled = node.optBoolean("enabled", true)
+            val value = node.optString("value")
+            val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
             var wasFocused by remember { mutableStateOf(false) }
             val baseModifier = if (modifier === Modifier) modifier.fillMaxWidth() else modifier
             val fieldModifier = if (focusEvt.isNotEmpty() || blurEvt.isNotEmpty()) {
@@ -322,29 +472,76 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
             } else {
                 baseModifier
             }
-            OutlinedTextField(
-                value = node.optString("value"),
-                onValueChange = { newValue -> dispatch(node.optString("event") + ":" + newValue) },
-                placeholder = { Text(text = node.optString("placeholder"), color = DragonColors.TextMuted) },
-                shape = tokens.fieldShape,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = DragonColors.Ember,
-                    unfocusedBorderColor = DragonColors.Divider,
-                    focusedContainerColor = DragonColors.ObsidianSurface,
-                    unfocusedContainerColor = DragonColors.ObsidianSurface,
-                    focusedTextColor = DragonColors.TextPrimary,
-                    unfocusedTextColor = DragonColors.TextPrimary,
-                    cursorColor = DragonColors.Ember,
-                ),
-                modifier = fieldModifier
-            )
+            val keyboardType = when (keyboardTypeName) {
+                "number" -> androidx.compose.ui.text.input.KeyboardType.Number
+                "decimal" -> androidx.compose.ui.text.input.KeyboardType.Decimal
+                "email" -> androidx.compose.ui.text.input.KeyboardType.Email
+                "phone" -> androidx.compose.ui.text.input.KeyboardType.Phone
+                else -> androidx.compose.ui.text.input.KeyboardType.Text
+            }
+            val imeAction = if (submitEvt.isNotEmpty()) androidx.compose.ui.text.input.ImeAction.Done else androidx.compose.ui.text.input.ImeAction.Default
+            Column(modifier = fieldModifier) {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { newValue ->
+                        val limited = if (maxLength > 0 && newValue.length > maxLength) newValue.take(maxLength) else newValue
+                        dispatch(node.optString("event") + ":" + limited)
+                    },
+                    placeholder = { Text(text = node.optString("placeholder"), color = tokens.textMuted) },
+                    shape = tokens.fieldShape,
+                    singleLine = lines <= 1,
+                    minLines = lines,
+                    enabled = enabled,
+                    isError = errorText.isNotEmpty(),
+                    visualTransformation = if (obscured) androidx.compose.ui.text.input.PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+                    leadingIcon = if (prefixIconName.isNotEmpty()) {
+                        { Icon(imageVector = iconFor(prefixIconName), contentDescription = null, tint = tokens.textMuted) }
+                    } else null,
+                    trailingIcon = if (clearable && value.isNotEmpty()) {
+                        {
+                            IconButton(onClick = { dispatch(node.optString("event") + ":") }) {
+                                Icon(imageVector = Icons.Filled.Close, contentDescription = "clear", tint = tokens.textMuted)
+                            }
+                        }
+                    } else if (suffixIconName.isNotEmpty()) {
+                        { Icon(imageVector = iconFor(suffixIconName), contentDescription = null, tint = tokens.textMuted) }
+                    } else null,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = keyboardType, imeAction = imeAction),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
+                        if (submitEvt.isNotEmpty()) dispatch(submitEvt)
+                        focusManager.clearFocus()
+                    }),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = tokens.primary,
+                        unfocusedBorderColor = tokens.divider,
+                        focusedContainerColor = tokens.surface,
+                        unfocusedContainerColor = tokens.surface,
+                        focusedTextColor = tokens.textPrimary,
+                        unfocusedTextColor = tokens.textPrimary,
+                        cursorColor = tokens.primary,
+                        errorBorderColor = MaterialTheme.colorScheme.error,
+                        disabledBorderColor = tokens.divider,
+                        disabledContainerColor = tokens.surface,
+                        disabledTextColor = tokens.textMuted,
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (errorText.isNotEmpty()) {
+                    Text(
+                        text = errorText,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
+                        modifier = Modifier.padding(start = 4.dp, top = 2.dp)
+                    )
+                }
+            }
         }
         "checkbox" -> {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = (if (modifier === Modifier) modifier.fillMaxWidth() else modifier)
                     .clip(tokens.fieldShape)
-                    .background(DragonColors.ObsidianSurface)
+                    .background(tokens.surface)
                     .clickable { dispatch(node.optString("event")) }
                     .padding(horizontal = 12.dp, vertical = 10.dp)
             ) {
@@ -352,28 +549,32 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
                     checked = node.optBoolean("checked"),
                     onCheckedChange = { dispatch(node.optString("event")) },
                     colors = CheckboxDefaults.colors(
-                        checkedColor = DragonColors.Verdigris,
-                        uncheckedColor = DragonColors.TextMuted,
-                        checkmarkColor = DragonColors.ObsidianBg,
+                        checkedColor = tokens.secondary,
+                        uncheckedColor = tokens.textMuted,
+                        checkmarkColor = tokens.background,
                     )
                 )
                 Text(
                     text = node.optString("label"),
                     style = MaterialTheme.typography.bodyMedium,
-                    color = DragonColors.TextPrimary,
+                    color = tokens.textPrimary,
                     modifier = Modifier.padding(start = 4.dp)
                 )
             }
         }
         "switch" -> {
+            val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
             Switch(
                 checked = node.optBoolean("checked"),
-                onCheckedChange = { dispatch(node.optString("event")) },
+                onCheckedChange = {
+                    haptics.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                    dispatch(node.optString("event"))
+                },
                 colors = SwitchDefaults.colors(
-                    checkedThumbColor = DragonColors.ObsidianBg,
-                    checkedTrackColor = DragonColors.Verdigris,
-                    uncheckedThumbColor = DragonColors.TextMuted,
-                    uncheckedTrackColor = DragonColors.ObsidianSurfaceRaised,
+                    checkedThumbColor = tokens.background,
+                    checkedTrackColor = tokens.secondary,
+                    uncheckedThumbColor = tokens.textMuted,
+                    uncheckedTrackColor = tokens.surfaceRaised,
                 ),
                 modifier = modifier
             )
@@ -387,84 +588,170 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
                 onValueChange = { newValue -> dispatch(node.optString("event") + ":" + newValue) },
                 valueRange = min..max,
                 colors = SliderDefaults.colors(
-                    thumbColor = DragonColors.Ember,
-                    activeTrackColor = DragonColors.Ember,
-                    inactiveTrackColor = DragonColors.Divider,
+                    thumbColor = tokens.primary,
+                    activeTrackColor = tokens.primary,
+                    inactiveTrackColor = tokens.divider,
                 ),
                 modifier = modifier.fillMaxWidth()
             )
         }
         "icon" -> {
+            val size = node.optInt("size", 0)
             Icon(
                 imageVector = iconFor(node.optString("name")),
                 contentDescription = node.optString("name"),
-                tint = parseHexColor(node.optString("fg"), MaterialTheme.colorScheme.onBackground),
-                modifier = modifier
+                tint = parseHexColor(node.optString("color"), MaterialTheme.colorScheme.onBackground),
+                modifier = if (size > 0) modifier.size(size.dp) else modifier
             )
+        }
+        "avatar" -> {
+            val size = node.optInt("size", 44)
+            val url = node.optString("url")
+            val label = node.optString("label")
+            val bg = node.optString("bg")
+            Box(
+                modifier = modifier
+                    .size(size.dp)
+                    .clip(CircleShape)
+                    .background(parseHexColor(bg, tokens.surfaceRaised)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (url.isNotEmpty()) {
+                    AsyncImage(model = url, contentDescription = null, modifier = Modifier.fillMaxSize())
+                } else {
+                    Text(
+                        text = label.take(2).uppercase(),
+                        color = tokens.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            }
         }
         "image" -> {
             val heightDp = node.optInt("height", 0)
-            AsyncImage(
-                model = node.optString("url"),
-                contentDescription = null,
+            val radius = node.optInt("radius", 0)
+            val shape = if (radius > 0) RoundedCornerShape(radius.dp) else RectangleShape
+            Box(
                 modifier = modifier
                     .fillMaxWidth()
                     .let { if (heightDp > 0) it.height(heightDp.dp) else it }
-            )
+                    .clip(shape)
+                    .background(tokens.surface),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    color = tokens.primary,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(20.dp)
+                )
+                AsyncImage(
+                    model = node.optString("url"),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
         }
         "webview" -> {
+            val targetUrl = node.optString("url")
+            val hasLoadSeq = node.has("loadSeq")
+            val loadSeq = node.optInt("loadSeq", 0)
+            val navCommand = node.optString("navCommand")
+            val navSeq = node.optInt("navSeq", 0)
+            val stateEvent = node.optString("stateEvent")
+            var lastLoadSeq by remember { mutableStateOf(-1) }
+            var lastNavSeq by remember { mutableStateOf(-1) }
+            var lastLoadedUrl by remember { mutableStateOf("") }
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {
-                        webViewClient = WebViewClient()
                         settings.javaScriptEnabled = true
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView, url: String?) {
+                                lastLoadedUrl = url ?: ""
+                                if (stateEvent.isNotEmpty()) {
+                                    val backFlag = if (view.canGoBack()) 1 else 0
+                                    val fwdFlag = if (view.canGoForward()) 1 else 0
+                                    dispatch(stateEvent + ":" + backFlag + ":" + fwdFlag + ":" + (url ?: ""))
+                                }
+                            }
+                        }
+                        loadUrl(targetUrl)
+                        lastLoadSeq = loadSeq
+                        lastNavSeq = navSeq
+                        lastLoadedUrl = targetUrl
                     }
                 },
-                update = { it.loadUrl(node.optString("url")) },
+                update = { wv ->
+                    val seqChanged = loadSeq != lastLoadSeq
+                    val urlDiffers = !hasLoadSeq && targetUrl.isNotEmpty() && targetUrl != lastLoadedUrl
+                    if (seqChanged || urlDiffers) {
+                        lastLoadSeq = loadSeq
+                        lastLoadedUrl = targetUrl
+                        wv.loadUrl(targetUrl)
+                    }
+                    if (navSeq != lastNavSeq) {
+                        lastNavSeq = navSeq
+                        when (navCommand) {
+                            "back" -> if (wv.canGoBack()) wv.goBack()
+                            "forward" -> if (wv.canGoForward()) wv.goForward()
+                            "reload" -> wv.reload()
+                        }
+                    }
+                },
                 modifier = modifier.fillMaxWidth()
             )
         }
         "card" -> {
             val bg = node.optString("bg")
+            val elevation = if (node.has("elevation")) node.optInt("elevation") else 3
+            var m = modifier.fillMaxWidth()
+            if (elevation > 0) m = m.shadow(elevation.dp, tokens.cardShape, clip = false)
             Column(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = modifier
-                    .fillMaxWidth()
+                modifier = m
                     .clip(tokens.cardShape)
-                    .background(parseHexColor(bg, DragonColors.ObsidianSurfaceRaised))
+                    .background(parseHexColor(bg, tokens.surfaceRaised))
                     .padding(16.dp)
             ) {
                 renderChildrenInColumn(node.optJSONArray("children"), dispatch)
             }
         }
         "app_bar" -> {
+            val backEvt = node.optString("backEvent")
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = modifier
                     .fillMaxWidth()
-                    .background(parseHexColor(node.optString("bg"), DragonColors.ObsidianSurface))
-                    .padding(16.dp)
+                    .background(parseHexColor(node.optString("bg"), tokens.surface))
+                    .statusBarsPadding()
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
             ) {
+                if (backEvt.isNotEmpty()) {
+                    IconButton(onClick = { dispatch(backEvt) }) {
+                        Icon(
+                            imageVector = Icons.Filled.ArrowBack,
+                            contentDescription = "back",
+                            tint = parseHexColor(node.optString("fg"), tokens.textPrimary)
+                        )
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
                 Text(
                     text = node.optString("title"),
                     style = MaterialTheme.typography.titleMedium,
-                    color = parseHexColor(node.optString("fg"), DragonColors.TextPrimary)
+                    color = parseHexColor(node.optString("fg"), tokens.textPrimary),
+                    modifier = Modifier.padding(start = 4.dp)
                 )
             }
         }
-        "fab" -> {
-            FloatingActionButton(
-                onClick = { dispatch(node.optString("event")) },
-                containerColor = DragonColors.Ember,
-                contentColor = DragonColors.ObsidianBg,
-                shape = CircleShape
-            ) {
-                Text(text = node.optString("label"), fontWeight = FontWeight.Bold)
-            }
-        }
+        "fab" -> DragonFab(node, dispatch)
         "row" -> {
+            val justify = node.optString("justify")
+            val arrangement = if (justify == "space_between") Arrangement.SpaceBetween else Arrangement.spacedBy(10.dp)
             Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = arrangement,
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = modifier.fillMaxWidth()
             ) {
@@ -474,8 +761,10 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
         "column" -> {
             val bg = node.optString("bg")
             val bgColor = if (bg.isNotEmpty()) parseHexColor(bg, MaterialTheme.colorScheme.background) else null
+            val align = if (node.optString("align") == "center") Alignment.CenterHorizontally else Alignment.Start
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalAlignment = align,
                 modifier = modifier
                     .fillMaxWidth()
                     .let { if (bgColor != null) it.background(bgColor) else it }
@@ -486,11 +775,19 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
         }
         "stack" -> {
             Box(modifier = modifier.fillMaxWidth()) {
+                renderChildrenInStack(node.optJSONArray("children"), dispatch)
+            }
+        }
+        "wrap" -> {
+            FlowRow(
+                modifier = modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 val children = node.optJSONArray("children")
                 if (children != null) {
                     for (i in 0 until children.length()) {
-                        val child = children.optJSONObject(i) ?: continue
-                        DragonNode(child, dispatch)
+                        children.optJSONObject(i)?.let { DragonNode(it, dispatch) }
                     }
                 }
             }
@@ -526,32 +823,576 @@ fun DragonNode(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier 
                 }
             }
         }
+        "refreshable_list" -> {
+            val children = node.optJSONArray("children")
+            val refreshing = node.optBoolean("refreshing", false)
+            val event = node.optString("event")
+            var pullPx by remember { mutableStateOf(0f) }
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            val thresholdPx = with(density) { 64.dp.toPx() }
+            Box(
+                modifier = modifier
+                    .fillMaxWidth()
+                    .pointerInput(event) {
+                        detectVerticalDragGestures(
+                            onDragEnd = {
+                                if (pullPx >= thresholdPx && !refreshing && event.isNotEmpty()) {
+                                    dispatch(event)
+                                }
+                                pullPx = 0f
+                            },
+                            onVerticalDrag = { change: androidx.compose.ui.input.pointer.PointerInputChange, dragAmount: Float ->
+                                if (dragAmount > 0f || pullPx > 0f) {
+                                    pullPx = (pullPx + dragAmount).coerceIn(0f, thresholdPx * 1.6f)
+                                    change.consume()
+                                }
+                            }
+                        )
+                    }
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(with(density) { (if (refreshing) thresholdPx * 0.7f else pullPx).toDp() }),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (pullPx > 0f || refreshing) {
+                            CircularProgressIndicator(
+                                color = tokens.primary,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                    }
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.fillMaxWidth().weight(1f)
+                    ) {
+                        if (children != null) {
+                            items(children.length()) { i ->
+                                val child = children.optJSONObject(i)
+                                if (child != null) DragonNode(child, dispatch)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "tab_view" -> {
+            val labels = node.optJSONArray("labels")
+            val selected = node.optInt("selected", 0)
+            val pages = node.optJSONArray("pages")
+            val pageCount = (pages?.length() ?: 0).coerceAtLeast(1)
+            val safeSelected = selected.coerceIn(0, pageCount - 1)
+            val pagerState = androidx.compose.foundation.pager.rememberPagerState(initialPage = safeSelected) { pageCount }
+            LaunchedEffect(safeSelected) {
+                if (pagerState.currentPage != safeSelected) {
+                    pagerState.animateScrollToPage(safeSelected)
+                }
+            }
+            LaunchedEffect(pagerState.currentPage) {
+                if (pagerState.currentPage != safeSelected) {
+                    dispatch(node.optString("event") + ":" + pagerState.currentPage)
+                }
+            }
+            Column(modifier = modifier.fillMaxSize()) {
+                if (labels != null && labels.length() > 0) {
+                    androidx.compose.material3.TabRow(
+                        selectedTabIndex = safeSelected.coerceIn(0, labels.length() - 1),
+                        containerColor = tokens.surface,
+                        contentColor = tokens.primary
+                    ) {
+                        for (i in 0 until labels.length()) {
+                            androidx.compose.material3.Tab(
+                                selected = i == safeSelected,
+                                onClick = { dispatch(node.optString("event") + ":" + i) },
+                                text = { Text(text = labels.optString(i)) }
+                            )
+                        }
+                    }
+                }
+                androidx.compose.foundation.pager.HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxWidth().weight(1f)
+                ) { pageIndex ->
+                    val pageContent = pages?.optJSONObject(pageIndex)
+                    if (pageContent != null) {
+                        DragonNode(pageContent, dispatch, Modifier.fillMaxSize())
+                    }
+                }
+            }
+        }
         "divider" -> {
-            Divider(color = DragonColors.Divider, thickness = 1.dp, modifier = modifier)
+            val color = parseHexColor(node.optString("color"), tokens.divider)
+            val thickness = node.optInt("thickness", 1).coerceAtLeast(1)
+            Divider(color = color, thickness = thickness.dp, modifier = modifier)
         }
-        "spacer" -> {
-            Spacer(modifier = modifier)
+        "spacer" -> Spacer(modifier = modifier)
+        "align" -> {
+            val alignment = when (node.optString("alignment")) {
+                "center" -> Alignment.Center
+                "topLeft" -> Alignment.TopStart
+                "topCenter" -> Alignment.TopCenter
+                "topRight" -> Alignment.TopEnd
+                "centerLeft" -> Alignment.CenterStart
+                "centerRight" -> Alignment.CenterEnd
+                "bottomLeft" -> Alignment.BottomStart
+                "bottomCenter" -> Alignment.BottomCenter
+                "bottomRight" -> Alignment.BottomEnd
+                else -> Alignment.Center
+            }
+            Box(modifier = modifier.fillMaxWidth(), contentAlignment = alignment) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
         }
+        "container" -> {
+            val w = node.optInt("width", 0)
+            val h = node.optInt("height", 0)
+            val bg = node.optString("bg")
+            val gradFrom = node.optString("gradientFrom")
+            val gradTo = node.optString("gradientTo")
+            val radius = node.optInt("radius", 0).coerceAtLeast(0)
+            val borderColor = node.optString("borderColor")
+            val borderWidth = node.optInt("borderWidth", 0)
+            val elevation = node.optInt("elevation", 0)
+            val shape: Shape = if (radius > 0) RoundedCornerShape(radius.dp) else RectangleShape
+
+            var m = modifier
+            m = when {
+                w < 0 -> m.fillMaxWidth()
+                w > 0 -> m.width(w.dp)
+                else -> m
+            }
+            m = when {
+                h < 0 -> m.fillMaxHeight()
+                h > 0 -> m.height(h.dp)
+                else -> m
+            }
+            if (elevation > 0) m = m.shadow(elevation.dp, shape, clip = false)
+            m = m.clip(shape)
+            m = when {
+                gradFrom.isNotEmpty() && gradTo.isNotEmpty() -> m.background(
+                    Brush.linearGradient(
+                        listOf(parseHexColor(gradFrom, Color.Transparent), parseHexColor(gradTo, Color.Transparent))
+                    )
+                )
+                bg.isNotEmpty() -> m.background(parseHexColor(bg, Color.Transparent))
+                else -> m
+            }
+            if (borderWidth > 0) {
+                m = m.border(borderWidth.dp, parseHexColor(borderColor, tokens.divider), shape)
+            }
+            Box(modifier = m) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
+        }
+        "padding" -> {
+            val all = node.optInt("all", 0)
+            val left = node.optInt("left", all)
+            val top = node.optInt("top", all)
+            val right = node.optInt("right", all)
+            val bottom = node.optInt("bottom", all)
+            Box(modifier = modifier.padding(start = left.dp, top = top.dp, end = right.dp, bottom = bottom.dp)) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
+        }
+        "sized_box" -> {
+            val w = node.optInt("width", 0)
+            val h = node.optInt("height", 0)
+            var m = modifier
+            if (w > 0) m = m.width(w.dp)
+            if (h > 0) m = m.height(h.dp)
+            Box(modifier = m) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
+        }
+        "aspect_ratio" -> {
+            val wr = node.optInt("widthRatio", 1).coerceAtLeast(1)
+            val hr = node.optInt("heightRatio", 1).coerceAtLeast(1)
+            Box(modifier = modifier.fillMaxWidth().aspectRatio(wr.toFloat() / hr.toFloat())) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch, Modifier.fillMaxSize()) }
+            }
+        }
+        "opacity" -> {
+            val percent = node.optInt("percent", 100).coerceIn(0, 100)
+            Box(modifier = modifier.alpha(percent / 100f)) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
+        }
+        "visibility" -> {
+            val visible = node.optBoolean("visible", true)
+            AnimatedVisibility(visible = visible, modifier = modifier) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
+        }
+        "chip" -> {
+            val selected = node.optBoolean("selected", false)
+            val bg = if (selected) tokens.primary else tokens.surfaceRaised
+            val fg = if (selected) tokens.background else tokens.textPrimary
+            Box(
+                modifier = modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(bg)
+                    .clickable { dispatch(node.optString("event")) }
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Text(text = node.optString("label"), color = fg, style = MaterialTheme.typography.labelLarge)
+            }
+        }
+        "badge" -> {
+            val count = node.optInt("count", 0)
+            Box(modifier = modifier) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+                if (count > 0) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .offset(x = 6.dp, y = (-6).dp)
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(tokens.primary),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = if (count > 99) "99+" else count.toString(),
+                            color = tokens.background,
+                            style = MaterialTheme.typography.labelLarge.copy(fontSize = 10.sp)
+                        )
+                    }
+                }
+            }
+        }
+        "radio_group" -> {
+            val options = node.optJSONArray("options")
+            val selected = node.optString("selected")
+            Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (options != null) {
+                    for (i in 0 until options.length()) {
+                        val label = options.optString(i)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { dispatch(node.optString("event") + ":" + label) }
+                                .padding(vertical = 4.dp)
+                        ) {
+                            RadioButton(
+                                selected = label == selected,
+                                onClick = { dispatch(node.optString("event") + ":" + label) },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = tokens.primary,
+                                    unselectedColor = tokens.textMuted
+                                )
+                            )
+                            Text(text = label, color = tokens.textPrimary, modifier = Modifier.padding(start = 4.dp))
+                        }
+                    }
+                }
+            }
+        }
+        "icon_menu" -> {
+            var expanded by remember { mutableStateOf(false) }
+            val options = node.optJSONArray("options")
+            val iconName = node.optString("icon")
+            Box(modifier = modifier) {
+                IconButton(onClick = { expanded = true }) {
+                    Icon(imageVector = iconFor(iconName), contentDescription = null, tint = tokens.textPrimary)
+                }
+                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                    if (options != null) {
+                        for (i in 0 until options.length()) {
+                            val label = options.optString(i)
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = {
+                                    expanded = false
+                                    dispatch(node.optString("event") + ":" + label)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        "dropdown" -> {
+            var expanded by remember { mutableStateOf(false) }
+            val options = node.optJSONArray("options")
+            val selected = node.optString("selected")
+            Box(modifier = modifier.fillMaxWidth()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(tokens.fieldShape)
+                        .border(1.dp, tokens.divider, tokens.fieldShape)
+                        .clickable { expanded = true }
+                        .padding(horizontal = 16.dp, vertical = 14.dp)
+                ) {
+                    Text(
+                        text = if (selected.isNotEmpty()) selected else "Select",
+                        color = tokens.textPrimary
+                    )
+                    Icon(imageVector = Icons.Filled.MoreVert, contentDescription = null, tint = tokens.textMuted)
+                }
+                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                    if (options != null) {
+                        for (i in 0 until options.length()) {
+                            val label = options.optString(i)
+                            DropdownMenuItem(
+                                text = { Text(label) },
+                                onClick = {
+                                    expanded = false
+                                    dispatch(node.optString("event") + ":" + label)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        "circular_progress" -> {
+            CircularProgressIndicator(color = tokens.primary, modifier = modifier)
+        }
+        "linear_progress" -> {
+            val value = node.optDouble("value", 0.0).toFloat().coerceIn(0f, 1f)
+            LinearProgressIndicator(
+                progress = { value },
+                color = tokens.primary,
+                trackColor = tokens.divider,
+                modifier = modifier.fillMaxWidth().clip(RoundedCornerShape(50))
+            )
+        }
+        "bottom_nav" -> {
+            val labels = node.optJSONArray("labels")
+            val selected = node.optInt("selected", 0)
+            NavigationBar(containerColor = tokens.surface, modifier = modifier.fillMaxWidth()) {
+                if (labels != null) {
+                    for (i in 0 until labels.length()) {
+                        val label = labels.optString(i)
+                        NavigationBarItem(
+                            selected = i == selected,
+                            onClick = { dispatch(node.optString("event") + ":" + i) },
+                            icon = { Icon(imageVector = iconFor(label), contentDescription = label) },
+                            label = { Text(text = label) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = tokens.primary,
+                                selectedTextColor = tokens.primary,
+                                unselectedIconColor = tokens.textMuted,
+                                unselectedTextColor = tokens.textMuted,
+                                indicatorColor = tokens.surfaceRaised
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        "gesture_detector" -> {
+            val longEvt = node.optString("longEvent")
+            val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+            Box(
+                modifier = modifier.combinedClickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = { dispatch(node.optString("event")) },
+                    onLongClick = if (longEvt.isNotEmpty()) {
+                        {
+                            haptics.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                            dispatch(longEvt)
+                        }
+                    } else null
+                )
+            ) {
+                node.optJSONObject("child")?.let { DragonNode(it, dispatch) }
+            }
+        }
+        "alert_dialog", "snackbar", "page", "positioned", "flexible" -> {
+            node.optJSONObject("content")?.let { DragonNode(it, dispatch, modifier) }
+                ?: node.optJSONObject("child")?.let { DragonNode(it, dispatch, modifier) }
+        }
+        "spacer_content" -> Box(modifier = modifier)
         else -> {
             Text(
                 text = "[unknown widget type: ${node.optString("type")}]",
-                color = DragonColors.TextMuted,
+                color = tokens.textMuted,
                 modifier = modifier
             )
         }
     }
 }
 
+@Composable
+private fun DragonFab(node: JSONObject, dispatch: (String) -> Unit) {
+    val tokens = LocalDragonTokens.current
+    val label = node.optString("label")
+    val icon = node.optString("icon")
+    FloatingActionButton(
+        onClick = { dispatch(node.optString("event")) },
+        containerColor = tokens.primary,
+        contentColor = tokens.background,
+        shape = CircleShape
+    ) {
+        if (label.isNotEmpty()) {
+            Text(text = label, fontWeight = FontWeight.Bold)
+        } else {
+            Icon(imageVector = iconFor(if (icon.isNotEmpty()) icon else "add"), contentDescription = null)
+        }
+    }
+}
 
-@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DragonAlertDialogOverlay(node: JSONObject, dispatch: (String) -> Unit) {
+    val tokens = LocalDragonTokens.current
+    val dismissLabel = node.optString("dismissLabel")
+    AlertDialog(
+        onDismissRequest = { dispatch(node.optString("dismissEvent")) },
+        title = { Text(text = node.optString("title")) },
+        text = { Text(text = node.optString("message")) },
+        confirmButton = {
+            TextButton(onClick = { dispatch(node.optString("confirmEvent")) }) {
+                Text(text = node.optString("confirmLabel"), color = tokens.primary)
+            }
+        },
+        dismissButton = if (dismissLabel.isNotEmpty()) {
+            {
+                TextButton(onClick = { dispatch(node.optString("dismissEvent")) }) {
+                    Text(text = dismissLabel, color = tokens.textMuted)
+                }
+            }
+        } else null,
+        containerColor = tokens.surfaceRaised,
+        titleContentColor = tokens.textPrimary,
+        textContentColor = tokens.textMuted
+    )
+}
+
+@Composable
+private fun DragonSnackbarOverlay(node: JSONObject, dispatch: (String) -> Unit, modifier: Modifier = Modifier) {
+    val tokens = LocalDragonTokens.current
+    val label = node.optString("actionLabel")
+    Snackbar(
+        modifier = modifier.padding(16.dp),
+        containerColor = tokens.surfaceRaised,
+        contentColor = tokens.textPrimary,
+        action = if (label.isNotEmpty()) {
+            {
+                TextButton(onClick = { dispatch(node.optString("actionEvent")) }) {
+                    Text(text = label, color = tokens.primary)
+                }
+            }
+        } else null
+    ) {
+        Text(text = node.optString("message"))
+    }
+}
+
 @Composable
 private fun DragonButton(
+    node: JSONObject,
+    dispatch: (String) -> Unit,
+    tokens: DragonTokens,
+    modifier: Modifier = Modifier
+) {
+    val label = node.optString("label")
+    val enabled = node.optBoolean("enabled", true)
+    val loading = node.optBoolean("loading", false)
+    if (!enabled) {
+        DragonDisabledButton(label = label, loading = loading, tokens = tokens, modifier = modifier)
+        return
+    }
+    val bg = node.optString("bg")
+    val fg = node.optString("fg")
+    val weight = node.optInt("weight", 0)
+    val variant = node.optString("variant")
+    val fullWidth = node.optBoolean("fullWidth", false)
+    val longEvt = node.optString("longEvent")
+    val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val onClick = { dispatch(node.optString("event")) }
+    val onLongClick: (() -> Unit)? = if (longEvt.isNotEmpty()) {
+        {
+            haptics.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+            dispatch(longEvt)
+        }
+    } else null
+
+    when (variant) {
+        "text" -> {
+            TextButton(onClick = onClick, modifier = modifier) {
+                Text(text = label, color = tokens.primary, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        "outlined" -> {
+            Box(
+                modifier = modifier
+                    .clip(tokens.buttonShape)
+                    .border(1.dp, tokens.primary, tokens.buttonShape)
+                    .clickable(onClick = onClick)
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Text(text = label, color = tokens.primary, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        "icon" -> {
+            val iconName = node.optString("icon")
+            Box(
+                modifier = modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(tokens.surfaceRaised)
+                    .clickable(onClick = onClick),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(imageVector = iconFor(iconName), contentDescription = iconName, tint = tokens.textPrimary)
+            }
+        }
+        else -> {
+            DragonRaisedButton(
+                label = label,
+                onClick = onClick,
+                onLongClick = onLongClick,
+                bg = bg,
+                fg = fg,
+                weight = weight,
+                fullWidth = fullWidth,
+                tokens = tokens,
+                modifier = modifier
+            )
+        }
+    }
+}
+
+@Composable
+private fun DragonDisabledButton(label: String, loading: Boolean, tokens: DragonTokens, modifier: Modifier = Modifier) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .clip(tokens.buttonShape)
+            .background(tokens.surfaceRaised)
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+    ) {
+        if (loading) {
+            CircularProgressIndicator(
+                color = tokens.textMuted,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(20.dp)
+            )
+        } else {
+            Text(text = label, color = tokens.textMuted, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun DragonRaisedButton(
     label: String,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)?,
     bg: String,
     fg: String,
     weight: Int,
+    fullWidth: Boolean,
     tokens: DragonTokens,
     modifier: Modifier = Modifier
 ) {
@@ -565,30 +1406,33 @@ private fun DragonButton(
         tokens.buttonShape
     }
     val background: Brush = if (isStyled) {
-        val c = parseHexColor(bg, DragonColors.Ember)
-        Brush.linearGradient(listOf(c, c)) 
+        val c = parseHexColor(bg, tokens.primary)
+        Brush.linearGradient(listOf(c, c))
     } else {
         tokens.emberGlow
     }
-    val textColor = if (isStyled) parseHexColor(fg, DragonColors.TextPrimary) else DragonColors.ObsidianBg
+    val textColor = if (isStyled) parseHexColor(fg, tokens.textPrimary) else tokens.background
     val textStyle = if (isStyled) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.labelLarge
-    val sizeModifier = if (isStyled && weight <= 1) Modifier.aspectRatio(1f) else Modifier
+    val sizeModifier = if (isStyled && weight <= 1 && !fullWidth) Modifier.aspectRatio(1f) else Modifier
+    val widthModifier = if (fullWidth) Modifier.fillMaxWidth() else Modifier
     val contentPadding = if (isStyled) PaddingValues(14.dp) else PaddingValues(horizontal = 20.dp, vertical = 12.dp)
 
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
+            .then(widthModifier)
             .then(sizeModifier)
+            .shadow(if (pressed) 1.dp else 3.dp, shape, clip = false)
             .clip(shape)
             .background(background)
             .border(
                 width = if (pressed) 1.5.dp else 0.dp,
-                color = (if (isStyled) Color.White else DragonColors.TextPrimary).copy(alpha = if (pressed) 0.35f else 0f),
+                color = (if (isStyled) Color.White else tokens.textPrimary).copy(alpha = if (pressed) 0.35f else 0f),
                 shape = shape
             )
             .combinedClickable(
                 interactionSource = interactionSource,
-                indication = null, // no default Material ripple -- the border glow above is the feedback
+                indication = null,
                 onClick = onClick,
                 onLongClick = onLongClick
             )
@@ -603,10 +1447,28 @@ private fun ColumnScope.renderChildrenInColumn(children: JSONArray?, dispatch: (
     if (children == null) return
     for (i in 0 until children.length()) {
         val child = children.optJSONObject(i) ?: continue
-        val w = child.optInt("weight", 0)
-        val childModifier = if (w > 0) Modifier.weight(w.toFloat()) else Modifier
-        DragonNode(child, dispatch, childModifier)
+        renderFlexAwareChildInColumn(child, dispatch)
     }
+}
+
+@Composable
+private fun ColumnScope.renderFlexAwareChildInColumn(child: JSONObject, dispatch: (String) -> Unit) {
+    if (child.optString("type") == "flexible") {
+        val flex = child.optInt("flex", 1).coerceAtLeast(1)
+        val inner = child.optJSONObject("child")
+        if (inner != null && inner.optString("type") == "spacer_content") {
+            Spacer(modifier = Modifier.weight(flex.toFloat()))
+        } else if (inner != null) {
+            if (inner.optString("type") == "button" && !inner.has("weight")) {
+                inner.put("weight", flex)
+            }
+            DragonNode(inner, dispatch, Modifier.weight(flex.toFloat()))
+        }
+        return
+    }
+    val w = child.optInt("weight", 0)
+    val childModifier = if (w > 0) Modifier.weight(w.toFloat()) else Modifier
+    DragonNode(child, dispatch, childModifier)
 }
 
 @Composable
@@ -614,12 +1476,58 @@ private fun RowScope.renderChildrenInRow(children: JSONArray?, dispatch: (String
     if (children == null) return
     for (i in 0 until children.length()) {
         val child = children.optJSONObject(i) ?: continue
-        val childModifier = if (child.has("weight")) {
-            val w = child.optInt("weight", 0)
-            if (w > 0) Modifier.weight(w.toFloat()) else Modifier
-        } else {
-            if (child.optString("type") == "button") Modifier else Modifier.weight(1f)
+        renderFlexAwareChildInRow(child, dispatch)
+    }
+}
+
+@Composable
+private fun RowScope.renderFlexAwareChildInRow(child: JSONObject, dispatch: (String) -> Unit) {
+    if (child.optString("type") == "flexible") {
+        val flex = child.optInt("flex", 1).coerceAtLeast(1)
+        val inner = child.optJSONObject("child")
+        if (inner != null && inner.optString("type") == "spacer_content") {
+            Spacer(modifier = Modifier.weight(flex.toFloat()))
+        } else if (inner != null) {
+            if (inner.optString("type") == "button" && !inner.has("weight")) {
+                inner.put("weight", flex)
+            }
+            DragonNode(inner, dispatch, Modifier.weight(flex.toFloat()))
         }
-        DragonNode(child, dispatch, childModifier)
+        return
+    }
+    val childModifier = if (child.has("weight")) {
+        val w = child.optInt("weight", 0)
+        if (w > 0) Modifier.weight(w.toFloat()) else Modifier
+    } else {
+        Modifier
+    }
+    DragonNode(child, dispatch, childModifier)
+}
+
+@Composable
+private fun BoxScope.renderChildrenInStack(children: JSONArray?, dispatch: (String) -> Unit) {
+    if (children == null) return
+    for (i in 0 until children.length()) {
+        val child = children.optJSONObject(i) ?: continue
+        if (child.optString("type") == "positioned") {
+            val top = child.optInt("top", 0)
+            val left = child.optInt("left", 0)
+            val right = child.optInt("right", 0)
+            val bottom = child.optInt("bottom", 0)
+            val positionedModifier: Modifier = when {
+                top > 0 && left > 0 -> Modifier.align(Alignment.TopStart).offset(x = left.dp, y = top.dp)
+                top > 0 && right > 0 -> Modifier.align(Alignment.TopEnd).offset(x = (-right).dp, y = top.dp)
+                bottom > 0 && left > 0 -> Modifier.align(Alignment.BottomStart).offset(x = left.dp, y = (-bottom).dp)
+                bottom > 0 && right > 0 -> Modifier.align(Alignment.BottomEnd).offset(x = (-right).dp, y = (-bottom).dp)
+                top > 0 -> Modifier.align(Alignment.TopCenter).offset(y = top.dp)
+                bottom > 0 -> Modifier.align(Alignment.BottomCenter).offset(y = (-bottom).dp)
+                left > 0 -> Modifier.align(Alignment.CenterStart).offset(x = left.dp)
+                right > 0 -> Modifier.align(Alignment.CenterEnd).offset(x = (-right).dp)
+                else -> Modifier.align(Alignment.Center)
+            }
+            child.optJSONObject("child")?.let { DragonNode(it, dispatch, positionedModifier) }
+        } else {
+            DragonNode(child, dispatch, Modifier.fillMaxSize())
+        }
     }
 }

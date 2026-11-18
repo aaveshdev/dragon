@@ -1,0 +1,8 @@
+{
+  "name": "music_player",
+  "package": "com.example.music_player",
+  "platforms": ["android", "ios", "windows"],
+  "runtime": "app",
+  "main": "lib/main.dgn",
+  "androidDir": "android"
+}

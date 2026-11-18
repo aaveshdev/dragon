@@ -1,0 +1,821 @@
+import "dragon/core" as *
+import "json"
+
+class Wrappers {
+    func init() { this.makers = {} }
+    func add(name, fn) { this.makers[name] = fn }
+    func make(name, w, a, b, c) {
+        fn = this.makers[name]
+        if (fn == null) { return w }
+        return fn(w, a, b, c)
+    }
+}
+WRAP = Wrappers()
+
+class Widget {
+    func init(key = null) {
+        this.key = key
+    }
+
+    func pad(v = 16) { return WRAP.make("pad", this, v, null, null) }
+    func inset(v = 16) { return WRAP.make("inset", this, v, null, null) }
+    func bg(color) { return WRAP.make("bg", this, color, null, null) }
+    func sized(w = null, h = null) { return WRAP.make("sized", this, w, h, null) }
+    func round(r = 12) { return WRAP.make("round", this, r, null, null) }
+    func outline(color = null, width = 1, radius = 0) { return WRAP.make("outline", this, color, width, radius) }
+    func centered() { return WRAP.make("centered", this, null, null, null) }
+    func aligned(where) { return WRAP.make("aligned", this, where, null, null) }
+    func grow(share = 1) { return WRAP.make("grow", this, share, null, null) }
+    func tap(fn) { return WRAP.make("tap", this, fn, null, null) }
+    func longPress(fn) { return WRAP.make("longPress", this, fn, null, null) }
+    func faded(opacity) { return WRAP.make("faded", this, opacity, null, null) }
+    func when(condition) { return WRAP.make("when", this, condition, null, null) }
+    func scrolls() { return WRAP.make("scrolls", this, null, null, null) }
+    func safe() { return WRAP.make("safe", this, null, null, null) }
+    func tip(text) { return WRAP.make("tip", this, text, null, null) }
+}
+
+class View extends Widget {
+    func init(key = null) {
+        super.init(key: key)
+    }
+    func build(context) { return null }
+}
+
+class LiveView extends Widget {
+    func init(key = null) {
+        super.init(key: key)
+    }
+    func createState() { return null }
+}
+
+class Live {
+    func onInit() { }
+    func onWidgetChange(oldWidget) { }
+    func onDependenciesChange() { }
+    func onExit() { }
+    func build(context) { return null }
+    func update(fn = null) {
+        if (fn != null) { fn() }
+        RT.dirty = True
+    }
+}
+
+class Component extends LiveView {
+    func init(key = null) {
+        super.init(key: key)
+    }
+    func state() { return {} }
+    func build(ctx, s) { return null }
+    func onInit(ctx, s) { }
+    func onExit(s) { }
+    func createState() { return ComponentLive() }
+}
+
+class ComponentLive extends Live {
+    func onInit() {
+        this.values = this.widget.state()
+        this.started = False
+    }
+    func onWidgetChange(oldWidget) { }
+    func onExit() { this.widget.onExit(this.values) }
+    func build(context) {
+        if (not this.started) {
+            this.started = True
+            this.widget.onInit(context, this.values)
+        }
+        return this.widget.build(context, this.values)
+    }
+}
+
+class Provider extends Widget {
+    func init(child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func updateShouldNotify(oldWidget) { return True }
+}
+
+class RenderWidget extends Widget {
+    func init(key = null) {
+        super.init(key: key)
+    }
+    func toNode(context) { return null }
+}
+
+class Ctx {
+    func init(parent, path, widget) {
+        this.parent = parent
+        this.path = path
+        this.widget = widget
+        this.inh = null
+        this.state = null
+        this.route = parent == null ? null : parent.route
+        this.mounted = True
+    }
+
+    func set(changes) {
+        cur = this
+        while (cur != null) {
+            if (cur.state != null and class_name(cur.state) == "ComponentLive") {
+                for k in changes.keys() { cur.state.values[k] = changes[k] }
+                RT.dirty = True
+                return
+            }
+            cur = cur.parent
+        }
+    }
+
+    func build(child, slot) {
+        return Engine.build(child, this, slot)
+    }
+
+    func buildAll(children) {
+        out = []
+        if (children == null) { return out }
+        idx = 0
+        for ch in children {
+            node = Engine.build(ch, this, idx)
+            if (node != null) { out.push(node) }
+            idx = idx + 1
+        }
+        return out
+    }
+
+    func on(fn, kind = "void") {
+        if (fn == null) { return null }
+        return RT.register(fn, kind)
+    }
+
+    func findInherited(clsName) {
+        cur = this
+        while (cur != null) {
+            if (cur.inh != null and class_name(cur.inh) == clsName) { return cur.inh }
+            cur = cur.parent
+        }
+        return null
+    }
+
+    func findAncestorState(clsName) {
+        cur = this.parent
+        while (cur != null) {
+            if (cur.state != null and class_name(cur.state) == clsName) { return cur.state }
+            cur = cur.parent
+        }
+        return null
+    }
+}
+
+class Engine {
+    func slot_of(w, slot) {
+        if (w.key != null) {
+            if (typeof(w.key) == "string") { return "k:" + w.key }
+            return w.key.keyString()
+        }
+        return slot
+    }
+
+    func error_node(message) {
+        return {type: "errorBox", message: message}
+    }
+
+    func build(w, pctx, slot) {
+        if (w == null) { return null }
+        if (typeof(w) != "instance") {
+            return Engine.error_node("Expected a widget but got " + typeof(w) + " (" + str(w) + "). Did you forget Text(...)?")
+        }
+        sl = Engine.slot_of(w, slot)
+        path = pctx.path + "/" + str(sl) + ":" + class_name(w)
+        ctx = Ctx(pctx, path, w)
+        try {
+            node = Engine.expand(w, ctx)
+            if (node != null and w.key != null and typeof(node) == "map" and node.wkey == null) {
+                node.wkey = str(sl)
+            }
+            return node
+        } catch (err) {
+            RT.log("error in " + class_name(w) + ": " + str(err))
+            return Engine.error_node(class_name(w) + ": " + str(err))
+        }
+    }
+
+    func expand(w, ctx) {
+        if (is_a(w, View)) {
+            child = w.build(ctx)
+            return Engine.build(child, ctx, 0)
+        }
+        if (is_a(w, LiveView)) {
+            st = Engine.state_for(w, ctx)
+            ctx.state = st
+            child = st.build(ctx)
+            return Engine.build(child, ctx, 0)
+        }
+        if (is_a(w, Provider)) {
+            ctx.inh = w
+            return Engine.build(w.child, ctx, 0)
+        }
+        if (is_a(w, RenderWidget)) {
+            return w.toNode(ctx)
+        }
+        return Engine.error_node("Unknown widget type " + class_name(w))
+    }
+
+    func state_for(w, ctx) {
+        path = ctx.path
+        entry = RT.states[path]
+        cls = class_name(w)
+        if (entry != null and entry.cls != cls) {
+            Engine.dispose_state(path, entry)
+            entry = null
+        }
+        if (entry == null) {
+            st = w.createState()
+            st.widget = w
+            st.context = ctx
+            st.mounted = True
+            st.onInit()
+            st.onDependenciesChange()
+            RT.states[path] = {state: st, cls: cls}
+            RT.seen[path] = True
+            return st
+        }
+        st = entry.state
+        old = st.widget
+        st.widget = w
+        st.context = ctx
+        RT.seen[path] = True
+        if (not same(old, w)) { st.onWidgetChange(old) }
+        return st
+    }
+
+    func dispose_state(path, entry) {
+        st = entry.state
+        st.mounted = False
+        try {
+            st.onExit()
+        } catch (err) {
+            RT.log("error in dispose of " + entry.cls + ": " + str(err))
+        }
+        RT.states.remove(path)
+    }
+}
+
+class RouteSettings {
+    func init(name = null, arguments = null) {
+        this.name = name
+        this.arguments = arguments
+    }
+}
+
+class Route {
+    func init(builder, settings = null, fullscreenDialog = False, maintainState = True) {
+        this.builder = builder
+        this.settings = settings == null ? RouteSettings(name: null, arguments: null) : settings
+        this.fullscreenDialog = fullscreenDialog
+        this.id = 0
+        this.onResult = null
+    }
+}
+class CustomRoute extends Route {
+    func init(pageBuilder, settings = null) {
+        super.init(builder: pageBuilder, settings: settings)
+    }
+}
+class NavState {
+    func push(route, onResult = null) {
+        RT.route_seq = RT.route_seq + 1
+        route.id = RT.route_seq
+        route.onResult = onResult
+        RT.routes.push(route)
+        RT.dirty = True
+        return null
+    }
+    func pushNamed(name, arguments = null, onResult = null) {
+        route = RT.route_for(name, arguments)
+        if (route == null) { raise "No route named '" + str(name) + "'" }
+        return this.push(route, onResult)
+    }
+    func canPop() { return len(RT.routes) > 1 or len(RT.overlays) > 0 }
+    func pop(result = null) {
+        if (len(RT.overlays) > 0) { return RT.close_top_overlay(result) }
+        if (len(RT.routes) <= 1) { return False }
+        route = RT.routes.pop()
+        RT.dirty = True
+        if (route.onResult != null) { route.onResult(result) }
+        return True
+    }
+    func maybePop(result = null) { return this.pop(result) }
+    func popUntil(target) {
+        guard = 0
+        while (len(RT.routes) > 1 and guard < 1000) {
+            top = RT.routes[len(RT.routes) - 1]
+            if (RT.route_matches(top, target)) { break }
+            RT.routes.pop()
+            guard = guard + 1
+        }
+        RT.dirty = True
+    }
+    func pushReplacement(route, onResult = null) {
+        if (len(RT.routes) > 0) { RT.routes.pop() }
+        return this.push(route, onResult)
+    }
+    func pushReplacementNamed(name, arguments = null) {
+        route = RT.route_for(name, arguments)
+        if (route == null) { raise "No route named '" + str(name) + "'" }
+        return this.pushReplacement(route)
+    }
+    func pushAndRemoveUntil(route, target) {
+        guard = 0
+        while (len(RT.routes) > 0 and guard < 1000) {
+            top = RT.routes[len(RT.routes) - 1]
+            if (RT.route_matches(top, target)) { break }
+            RT.routes.pop()
+            guard = guard + 1
+        }
+        return this.push(route)
+    }
+    func pushNamedAndRemoveUntil(name, target, arguments = null) {
+        route = RT.route_for(name, arguments)
+        if (route == null) { raise "No route named '" + str(name) + "'" }
+        return this.pushAndRemoveUntil(route, target)
+    }
+    func popAndPushNamed(name, arguments = null) {
+        this.pop()
+        return this.pushNamed(name, arguments)
+    }
+}
+
+class Nav {
+    func of(context) { return RT.nav }
+    func push(context, route, onResult = null) { return RT.nav.push(route, onResult) }
+    func pushNamed(context, name, arguments = null, onResult = null) { return RT.nav.pushNamed(name, arguments, onResult) }
+    func pop(context, result = null) { return RT.nav.pop(result) }
+    func maybePop(context, result = null) { return RT.nav.pop(result) }
+    func canPop(context) { return RT.nav.canPop() }
+    func popUntil(context, target) { return RT.nav.popUntil(target) }
+    func pushReplacement(context, route, onResult = null) { return RT.nav.pushReplacement(route, onResult) }
+    func pushReplacementNamed(context, name, arguments = null) { return RT.nav.pushReplacementNamed(name, arguments) }
+    func pushAndRemoveUntil(context, route, target) { return RT.nav.pushAndRemoveUntil(route, target) }
+    func pushNamedAndRemoveUntil(context, name, target, arguments = null) { return RT.nav.pushNamedAndRemoveUntil(name, target, arguments) }
+}
+
+class RouteInfo {
+    func of(context) { return context.route }
+}
+
+class NavHost extends RenderWidget {
+    func init(app, key = null) {
+        super.init(key: key)
+        this.app = app
+    }
+    func toNode(context) {
+        RT.appCtx = context
+        if (len(RT.routes) == 0) { RT.init_routes(this.app) }
+        route = RT.routes[len(RT.routes) - 1]
+        context.route = route
+        content = context.build(RouteWrapper(route: route), "r" + str(route.id))
+        return {type: "page", key: "r" + str(route.id), depth: len(RT.routes), content: content}
+    }
+}
+
+class RouteWrapper extends View {
+    func init(route, key = null) {
+        super.init(key: key)
+        this.route = route
+    }
+    func build(context) {
+        context.route = this.route
+        return this.route.builder(context)
+    }
+}
+
+class OverlayHost extends View {
+    func init(overlay, key = null) {
+        super.init(key: key)
+        this.overlay = overlay
+    }
+    func build(context) { return this.overlay.builder(context) }
+}
+
+class Timer {
+    func init(duration, callback, periodic = False) {
+        RT.timer_seq = RT.timer_seq + 1
+        this.id = RT.timer_seq
+        this.period = u_ms(duration)
+        this.callback = callback
+        this.periodic = periodic
+        this.due = now_ms() + this.period
+        this.active = True
+        RT.timers.push(this)
+    }
+    func periodic(duration, callback) {
+        return Timer(duration, callback, True)
+    }
+    func cancel() {
+        this.active = False
+        RT.timers = RT.timers.filter(func(t) { return t.active })
+    }
+    func isActive() { return this.active }
+}
+
+class Future {
+    func delayed(duration, callback = null) {
+        return Timer(duration, callback == null ? func() { } : callback)
+    }
+}
+
+class Platform {
+    func invoke(method, args = null, callback = null) {
+        RT.call_seq = RT.call_seq + 1
+        id = "p" + str(RT.call_seq)
+        RT.pending.push({id: id, method: method, args: args == null ? {} : args})
+        if (callback != null) { RT.callbacks[id] = callback }
+        return id
+    }
+    func isAndroid() { return RT.platform == "android" }
+    func isDesktop() { return RT.platform != "android" }
+    func name() { return RT.platform }
+}
+
+class Runtime {
+    func init() {
+        this.states = {}
+        this.seen = {}
+        this.handlers = {}
+        this.next_id = 1
+        this.dirty = True
+        this.root = null
+        this.routes = []
+        this.route_seq = 0
+        this.route_table = {}
+        this.route_generator = null
+        this.route_unknown = null
+        this.overlays = []
+        this.overlay_seq = 0
+        this.timers = []
+        this.timer_seq = 0
+        this.tickers = []
+        this.pending = []
+        this.callbacks = {}
+        this.call_seq = 0
+        this.commands = []
+        this.media = {width: 411, height: 891, pixelRatio: 2.625, top: 24, bottom: 0, left: 0, right: 0,
+                      keyboard: 0, brightness: "light", textScale: 1.0, locale: "en_US"}
+        this.error = null
+        this.theme_json = null
+        this.title = "Dragon App"
+        this.app_ctx = null
+        this.platform = "desktop"
+        this.docs_dir = "."
+        this.lifecycle_listeners = []
+        this.back_handlers = []
+        this.logs = []
+        this.nav = NavState()
+        this.frame_count = 0
+        this.init_hooks = []
+        this.status_bar = null
+    }
+
+    func log(msg) {
+        showln("[dragon] " + msg)
+    }
+
+    func register(fn, kind) {
+        id = "h" + str(this.next_id)
+        this.next_id = this.next_id + 1
+        this.handlers[id] = {fn: fn, kind: kind}
+        return id
+    }
+
+    func command(c) {
+        this.commands.push(c)
+        this.dirty = True
+    }
+
+    func init_routes(app) {
+        this.route_table = app.routes == null ? {} : app.routes
+        this.route_generator = app.onGenerateRoute
+        this.route_unknown = app.onUnknownRoute
+        first = null
+        start = app.initialRoute == null ? "/" : app.initialRoute
+        if (app.home != null and start == "/") {
+            hm = app.home
+            first = Route(builder: func(ctx) { return hm }, settings: RouteSettings(name: "/", arguments: null))
+        } else {
+            first = this.route_for(start, null)
+        }
+        if (first == null) { raise "MaterialApp needs a `home`, or a route for '" + start + "'" }
+        this.route_seq = this.route_seq + 1
+        first.id = this.route_seq
+        this.routes = [first]
+    }
+
+    func route_for(name, arguments) {
+        builder = this.route_table[name]
+        if (builder != null) {
+            return Route(builder: builder, settings: RouteSettings(name: name, arguments: arguments))
+        }
+        if (this.route_generator != null) {
+            r = this.route_generator(RouteSettings(name: name, arguments: arguments))
+            if (r != null) {
+                r.settings = RouteSettings(name: name, arguments: arguments)
+                return r
+            }
+        }
+        if (this.route_unknown != null) {
+            return this.route_unknown(RouteSettings(name: name, arguments: arguments))
+        }
+        return null
+    }
+
+    func route_matches(route, target) {
+        if (target == null) { return False }
+        if (typeof(target) == "string") { return route.settings.name == target }
+        return target(route)
+    }
+
+    func open_overlay(kind, builder, opts) {
+        this.overlay_seq = this.overlay_seq + 1
+        o = {id: this.overlay_seq, kind: kind, builder: builder, opts: opts, onResult: opts.onResult}
+        if (kind == "snackbar") {
+            this.overlays = this.overlays.filter(func(x) { return x.kind != "snackbar" })
+            dur = opts.duration == null ? 4000 : u_ms(opts.duration)
+            if (dur > 0) {
+                oid = o.id
+                o.timer = Timer(Duration(milliseconds: dur), func() { RT.remove_overlay_id(oid, null) })
+            }
+        }
+        this.overlays.push(o)
+        this.dirty = True
+        return o
+    }
+
+    func remove_overlay_id(oid, result) {
+        keep = []
+        found = null
+        for o in this.overlays {
+            if (o.id == oid) { found = o } else { keep.push(o) }
+        }
+        this.overlays = keep
+        this.dirty = True
+        if (found != null and found.onResult != null) { found.onResult(result) }
+    }
+
+    func close_overlays_of_kind(kind) {
+        this.overlays = this.overlays.filter(func(x) { return x.kind != kind })
+        this.dirty = True
+    }
+
+    func close_top_overlay(result) {
+        n = len(this.overlays)
+        if (n == 0) { return False }
+        i = n - 1
+        while (i >= 0) {
+            o = this.overlays[i]
+            if (o.kind != "snackbar") {
+                this.remove_overlay_id(o.id, result)
+                return True
+            }
+            i = i - 1
+        }
+        return False
+    }
+
+    func begin_frame() {
+        this.handlers = {}
+        this.next_id = 1
+        this.seen = {}
+        this.frame_count = this.frame_count + 1
+    }
+
+    func sweep() {
+        live = []
+        for r in this.routes { live.push("/r" + str(r.id) + ":") }
+        dead = []
+        for path in this.states.keys() {
+            if (this.seen[path] == null) {
+                keep = False
+                for prefix in live {
+                    if (path.index_of(prefix) >= 0) { keep = True }
+                }
+                if (not keep) { dead.push(path) }
+            }
+        }
+        for path in dead {
+            entry = this.states[path]
+            if (entry != null) { Engine.dispose_state(path, entry) }
+        }
+    }
+
+    func build_overlay_nodes() {
+        out = []
+        base = this.app_ctx == null ? Ctx(null, "", null) : this.app_ctx
+        for o in this.overlays {
+            content = Engine.build(OverlayHost(overlay: o), base, "o" + str(o.id))
+            if (content != null) {
+                node = {kind: o.kind, id: o.id, content: content}
+                opts = o.opts
+                node.dismissible = opts.dismissible == null ? True : opts.dismissible
+                node.onDismiss = RT.register(func() { RT.remove_overlay_id(o.id, null) }, "void")
+                if (opts.barrierColor != null) { node.barrierColor = u_color(opts.barrierColor) }
+                if (o.kind == "bottomSheet") {
+                    node.fullscreen = opts.isScrollControlled == True
+                    node.bg = u_color(opts.backgroundColor)
+                    node.dragHandle = opts.showDragHandle == True
+                }
+                if (o.kind == "snackbar") {
+                    node.duration = opts.duration == null ? 4000 : u_ms(opts.duration)
+                    node.bg = u_color(opts.backgroundColor)
+                }
+                out.push(node)
+            }
+        }
+        return out
+    }
+
+    func build_frame() {
+        this.begin_frame()
+        this.dirty = False
+        rootctx = Ctx(null, "", null)
+        this.app_ctx = rootctx
+        out = {v: 1}
+        try {
+            tree = Engine.build(this.root, rootctx, "root")
+            out.root = tree
+            out.overlays = this.build_overlay_nodes()
+            this.sweep()
+            this.error = null
+        } catch (err) {
+            this.error = str(err)
+            this.log("frame error: " + this.error)
+        }
+        if (this.error != null) { out.error = this.error }
+        out.theme = this.theme_json
+        out.title = this.title
+        out.canPop = len(this.routes) > 1
+        out.hasBack = len(this.back_handlers) > 0
+        out.commands = this.commands
+        this.commands = []
+        if (this.status_bar != null) { out.statusBar = this.status_bar }
+        return out
+    }
+}
+
+RT = Runtime()
+
+func runApp(app) {
+    RT.root = app
+    RT.dirty = True
+}
+
+func dragon_host_init(docs_dir, platform, media_json) {
+    RT.docs_dir = docs_dir
+    RT.platform = platform
+    if (media_json != null and media_json != "") { dragon_host_set_media(media_json) }
+    return True
+}
+
+func dragon_host_render() {
+    frame = RT.build_frame()
+    return json_compact(frame)
+}
+
+func dragon_host_is_dirty() {
+    return RT.dirty
+}
+
+func dragon_host_event(evt) {
+    idx = evt.index_of(":")
+    id = evt
+    payload = ""
+    if (idx >= 0) {
+        id = evt.substring(0, idx)
+        payload = evt.substring(idx + 1)
+    }
+    h = RT.handlers[id]
+    if (h == null) { return RT.dirty }
+    kind = h.kind
+    try {
+        if (kind == "void") {
+            h.fn()
+        } elif (kind == "str") {
+            h.fn(payload)
+        } elif (kind == "bool") {
+            h.fn(payload == "true")
+        } elif (kind == "num") {
+            h.fn(parse_float(payload))
+        } elif (kind == "int") {
+            h.fn(floor_int(parse_float(payload)))
+        } elif (kind == "pos") {
+            pr = payload.split(",")
+            h.fn(Offset(dx: parse_float(pr[0]), dy: pr.length > 1 ? parse_float(pr[1]) : 0))
+        } else {
+            h.fn(payload)
+        }
+    } catch (err) {
+        RT.error = str(err)
+        RT.log("error in event handler: " + RT.error)
+        showln(RT.error)
+    }
+    RT.dirty = True
+    return True
+}
+
+func dragon_host_tick(now) {
+    ran = False
+    due = []
+    for t in RT.timers {
+        if (t.active and t.due <= now) { due.push(t) }
+    }
+    for t in due {
+        if (t.periodic) {
+            t.due = now + (t.period < 1 ? 1 : t.period)
+        } else {
+            t.active = False
+        }
+        try {
+            t.callback()
+        } catch (err) {
+            RT.log("error in timer callback: " + str(err))
+        }
+        ran = True
+    }
+    RT.timers = RT.timers.filter(func(t) { return t.active })
+    for tk in RT.tickers {
+        tk.tick(now)
+        ran = True
+    }
+    if (ran) { RT.dirty = True }
+    next = -1
+    for t in RT.timers {
+        gap = t.due - now
+        if (gap < 0) { gap = 0 }
+        if (next < 0 or gap < next) { next = gap }
+    }
+    if (len(RT.tickers) > 0) {
+        if (next < 0 or next > 16) { next = 16 }
+    }
+    return next
+}
+
+func dragon_host_platform_calls() {
+    out = json_compact(RT.pending)
+    RT.pending = []
+    return out
+}
+
+func dragon_host_platform_result(id, result_json) {
+    cb = RT.callbacks[id]
+    RT.callbacks.remove(id)
+    if (cb == null) { return False }
+    val = null
+    if (result_json != null and result_json != "") { val = json.decode(result_json) }
+    try {
+        cb(val)
+    } catch (err) {
+        RT.log("error in platform callback: " + str(err))
+        showln(str(err))
+    }
+    RT.dirty = True
+    return True
+}
+
+func dragon_host_back() {
+    if (len(RT.overlays) > 0) {
+        if (RT.close_top_overlay(null)) { return True }
+    }
+    i = len(RT.back_handlers) - 1
+    while (i >= 0) {
+        if (RT.back_handlers[i]() == True) { return True }
+        i = i - 1
+    }
+    if (len(RT.routes) > 1) {
+        RT.nav.pop(null)
+        return True
+    }
+    return False
+}
+
+func dragon_host_set_media(media_json) {
+    m = json.decode(media_json)
+    if (m == null) { return False }
+    for k in m.keys() { RT.media[k] = m[k] }
+    RT.dirty = True
+    return True
+}
+
+func dragon_host_lifecycle(state) {
+    for fn in RT.lifecycle_listeners {
+        try {
+            fn(state)
+        } catch (err) {
+            RT.log("error in lifecycle listener: " + str(err))
+        }
+    }
+    RT.dirty = True
+    return True
+}
+
+func dragon_host_last_error() {
+    return RT.error == null ? "" : RT.error
+}

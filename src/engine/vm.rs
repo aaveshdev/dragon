@@ -5,6 +5,7 @@ pub struct Vm {
     try_frames: Vec<(usize, usize)>,
     for_iter_stack: Vec<(usize, Vec<(DgnValue, DgnValue)>, usize)>,
     pub extensions: HashMap<String, HashMap<String, DgnValue>>,
+    pending_snapshot: Option<Arc<Mutex<Env>>>,
 }
 
 thread_local! {
@@ -17,6 +18,7 @@ pub fn acquire_vm() -> Vm {
         try_frames: Vec::with_capacity(8),
         for_iter_stack: Vec::with_capacity(8),
         extensions: HashMap::new(),
+        pending_snapshot: None,
     })
 }
 
@@ -24,13 +26,11 @@ pub fn release_vm(mut vm: Vm) {
     vm.stack.clear();
     vm.try_frames.clear();
     vm.for_iter_stack.clear();
+    vm.pending_snapshot = None;
     VM_POOL.with(|p| p.borrow_mut().push(vm));
 }
 
 impl Vm {
-    // pub fn new() -> Self {
-    //     Vm { stack: vec![], try_frames: vec![], for_iters: HashMap::new(), extensions: HashMap::new() }
-    // }
 
         pub fn new() -> Self {
         Vm {
@@ -38,6 +38,7 @@ impl Vm {
             try_frames: Vec::with_capacity(8),
             for_iter_stack: Vec::with_capacity(8),
             extensions: HashMap::new(),
+            pending_snapshot: None,
         }
     }
 
@@ -53,28 +54,23 @@ impl Vm {
 
         while ip < chunk.instructions.len() {
             let line = chunk.source_lines[ip];
-            match &chunk.instructions[ip] { 
+            match &chunk.instructions[ip] {
                 Instruction::Halt => break,
                 Instruction::Nop  => {}
 
-                // ── stack basics ──────────────────────────────────────────────
                 Instruction::LoadConst(v) => self.stack.push(v.clone()),
                 Instruction::LoadVar(ref n) => {
                     let v = env.lock().unwrap().get(n)
                         .ok_or_else(|| DgnError::new(&format!("Var '{}' not defined", n), line))?;
                     self.stack.push(v);
                 }
-                // Instruction::StoreVar(ref n) => {
-                //     let v = self.pop();
-                //     env.lock().unwrap().set(n.clone(), v)
-                //         .map_err(|e| DgnError::new(&e, line))?;
-                // }
 
                 Instruction::StoreVar(ref n) => {
                     let v = self.pop();
                     let mut env_guard = env.lock().unwrap();
-                    // Fast path: variable already exists in THIS frame — skip chain walk
-                    if env_guard.store.contains_key(n.as_str()) {
+                    if env_guard.store.contains_key("__class_name__") {
+                        env_guard.store.insert(n.clone(), v);
+                    } else if env_guard.store.contains_key(n.as_str()) {
                         if !env_guard.constants.contains(n.as_str()) {
                             env_guard.store.insert(n.clone(), v);
                         } else {
@@ -103,20 +99,18 @@ impl Vm {
                     self.stack.push(v);
                 }
 
-                // ── jumps ─────────────────────────────────────────────────────
                 Instruction::Jump(t)           => { ip = *t; continue; }
                 Instruction::JumpIfFalse(t)    => { let v = self.pop(); if !is_truthy(&v) { ip = *t; continue; } }
                 Instruction::JumpIfTrue(t)     => { let v = self.pop(); if  is_truthy(&v) { ip = *t; continue; } }
                 Instruction::JumpIfNotNull(t)  => { let v = self.pop(); if !matches!(v, DgnValue::Null) { ip = *t; continue; } }
 
-                // ── operators ─────────────────────────────────────────────────
                 Instruction::UnaryOp(ref op) => {
                     let v = self.pop();
                     let r = match (op.as_str(), v) {
                         ("-",   DgnValue::Int(n))    => DgnValue::Int(-n),
                         ("+",   DgnValue::Int(n))    => DgnValue::Int(n),
                         ("~",   DgnValue::Int(n))    => DgnValue::Int(!n),
-                        
+
                         ("-",   DgnValue::Number(n)) => DgnValue::Number(-n),
                         ("+",   DgnValue::Number(n)) => DgnValue::Number(n),
                         ("not", x)                   => DgnValue::Bool(!is_truthy(&x)),
@@ -131,7 +125,6 @@ impl Vm {
                     self.stack.push(vm_binary_op(op, l, r, line)?);
                 }
 
-                // ── collections ───────────────────────────────────────────────
                 Instruction::MakeList(n) => {
                     let start = self.stack.len().saturating_sub(*n);
                     let items: Vec<DgnValue> = self.stack.drain(start..).collect();
@@ -159,22 +152,17 @@ impl Vm {
                             self.stack.push(DgnValue::Null);
                         }
 
-                // ── attribute / index access ──────────────────────────────────
-                // ── attribute / index access ──────────────────────────────────
                 Instruction::GetAttr(ref name) | Instruction::GetOptionalAttr(ref name) => {
                     let obj = self.pop();
-                    
-                    // 1. Handle Optional Chaining short-circuit
+
                     if matches!(chunk.instructions[ip], Instruction::GetOptionalAttr(_)) && matches!(obj, DgnValue::Null) {
                         self.stack.push(DgnValue::Null);
                         ip += 1;
                         continue;
                     }
 
-                    // 2. Try standard GetAttr
                     let mut val = get_attr(obj.clone(), name).map_err(|mut e| { e.line = line; e })?;
 
-                    // 3. Fallback to Extensions if Null
                     if let DgnValue::Null = val {
                         let type_name = match obj {
                             DgnValue::String(_) => "string",
@@ -188,7 +176,6 @@ impl Vm {
 
                         if let Some(exts) = self.extensions.get(type_name) {
                             if let Some(DgnValue::Func(f)) = exts.get(name) {
-                                // Bind the primitive to `this` context, exactly like Instance methods!
                                 let f_clone = f.clone();
                                 let obj_capture = obj.clone();
                                 val = DgnValue::Func(Arc::new(DgnFunc {
@@ -209,7 +196,7 @@ impl Vm {
                     }
                     self.stack.push(val);
                 }
-                
+
                 Instruction::AddExtension(ref target_type) => {
                     let func_val = self.pop();
                     if let DgnValue::Func(f) = &func_val {
@@ -221,12 +208,16 @@ impl Vm {
                     }
                 }
                 Instruction::SetAttr(ref name) => {
-                    // compiler emits: [Dup val] -> [compile obj] -> SetAttr
-                    // stack top = obj, below = val (Dup'd), val stays on stack as result
                     let obj = self.pop();
                     let val = self.stack.last().cloned().unwrap_or(DgnValue::Null);
-                    if let DgnValue::Map(m) | DgnValue::Instance(m) = obj {
-                        m.lock().unwrap().insert(name.clone(), val);
+                    match obj {
+                        DgnValue::Map(m) | DgnValue::Instance(m) => {
+                            m.lock().unwrap().insert(name.clone(), val);
+                        }
+                        DgnValue::Class(c) => {
+                            c.lock().unwrap().store.insert(name.clone(), val);
+                        }
+                        _ => {}
                     }
                 }
                 Instruction::GetIndex => {
@@ -244,14 +235,17 @@ impl Vm {
                             } else { DgnValue::Null }
                         },
                         DgnValue::Map(m) | DgnValue::Instance(m) => {
-                            if let DgnValue::String(k) = idx {
-                                m.lock().unwrap().get(&k).cloned().unwrap_or(DgnValue::Null)
-                            } else { DgnValue::Null }
+                            match idx {
+                                DgnValue::String(k) => m.lock().unwrap().get(&k).cloned().unwrap_or(DgnValue::Null),
+                                DgnValue::Int(_) | DgnValue::Number(_) => {
+                                    m.lock().unwrap().get(&val_to_string(&idx)).cloned().unwrap_or(DgnValue::Null)
+                                }
+                                _ => DgnValue::Null,
+                            }
                         },
                         DgnValue::String(s) => {
                             if let Some(i) = idx.as_number() {
                                 let i = i as usize;
-                                // Fast path: ASCII-only string — O(1) byte index
                                 let result = if s.is_ascii() {
                                     s.as_bytes().get(i).map(|&b| DgnValue::String((b as char).to_string()))
                                 } else {
@@ -277,8 +271,12 @@ impl Vm {
                             }
                         }
                         DgnValue::Map(m) | DgnValue::Instance(m) => {
-                            if let DgnValue::String(k) = idx {
-                                m.lock().unwrap().insert(k, val);
+                            match idx {
+                                DgnValue::String(k) => { m.lock().unwrap().insert(k, val); }
+                                DgnValue::Int(_) | DgnValue::Number(_) => {
+                                    m.lock().unwrap().insert(val_to_string(&idx), val);
+                                }
+                                _ => {}
                             }
                         }
                         DgnValue::ByteArray(b) => {
@@ -294,13 +292,27 @@ impl Vm {
                     }
                 }
 
-                // ── function call ─────────────────────────────────────────────
                 Instruction::Call(argc) => {
                     let start = self.stack.len().saturating_sub(*argc);
                     let args: Vec<DgnValue> = self.stack.drain(start..).collect();
                     let func = self.pop();
 
-                    // Async function → spawn task, return Promise
+                    if let DgnValue::Class(cls_env) = func {
+                        match instantiate_class(cls_env, args).await {
+                            Ok(inst) => { self.stack.push(inst); ip += 1; continue; }
+                            Err(mut e) => {
+                                if e.line == 0 { e.line = line; }
+                                if let Some((catch_ip, depth)) = self.try_frames.pop() {
+                                    self.stack.truncate(depth);
+                                    self.stack.push(DgnValue::String(e.msg));
+                                    ip = catch_ip;
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
                     if let DgnValue::Func(ref f) = func {
                         if f.is_async && !f.is_native {
                             let f_clone = f.clone();
@@ -349,15 +361,27 @@ impl Vm {
 
                 Instruction::Return => { return Ok(self.pop()); }
 
-                // ── closures ──────────────────────────────────────────────────
+                Instruction::SnapshotNext(ref names) => {
+                    let snap = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
+                    {
+                        let cur = env.lock().unwrap();
+                        let mut sg = snap.lock().unwrap();
+                        for n in names {
+                            if let Some(v) = cur.get(n) { sg.store.insert(n.clone(), v); }
+                        }
+                    }
+                    self.pending_snapshot = Some(snap);
+                }
+
                 Instruction::MakeClosure(ref opt_name, ref params, req_params, is_async, ref chunk_arc) => {
                     let chunk_arc = chunk_arc.clone();
+                    let captured_env = self.pending_snapshot.take().unwrap_or_else(|| env.clone());
                     let func = DgnFunc {
                         name: opt_name.clone(),
                         params: params.clone(),
                         req_params: *req_params,
                         body: None,
-                        closure: env.clone(),   // capture env = true lexical closure
+                        closure: captured_env,
                         is_native: false,
                         is_async: *is_async,
                         native_fn: None,
@@ -366,7 +390,6 @@ impl Vm {
                     self.stack.push(DgnValue::Func(Arc::new(func)));
                 }
 
-                // ── classes ───────────────────────────────────────────────────
                 Instruction::MakeClass(ref name, ref parent_name, ref body_instrs, ref body_lines) => {
                     let mut parent_env: Option<Arc<Mutex<Env>>> = None;
                     if let Some(ref pname) = parent_name {
@@ -377,13 +400,15 @@ impl Vm {
                     }
 
                     let class_env = Arc::new(Mutex::new(Env::new(Some(env.clone()), None)));
+                    class_env.lock().unwrap().store.insert(
+                        "__class_name__".into(), DgnValue::String(name.clone())
+                    );
                     if let Some(pe) = parent_env {
                         class_env.lock().unwrap().store.insert(
                             "__parent_class__".into(), DgnValue::Class(pe)
                         );
                     }
 
-                    // Execute class body to register methods into class_env
                     let body_chunk = Chunk {
                         instructions: *body_instrs.clone(),
                         source_lines:  *body_lines.clone(),
@@ -392,7 +417,6 @@ impl Vm {
                     class_vm.run(&body_chunk, class_env.clone()).await?;
 
                     let class_val = DgnValue::Class(class_env);
-                    // StoreVar follows in the chunk (emitted by compiler), so just push
                     self.stack.push(class_val);
                 }
 
@@ -409,7 +433,6 @@ impl Vm {
                         let instance = DgnValue::Instance(inst_map);
                         gc_register(&instance);
 
-                        // Call init if it exists
                         if let Ok(init) = get_attr(instance.clone(), "init") {
                             if let DgnValue::Func(_) = init {
                                 match call_dgn_func(init, args).await {
@@ -440,20 +463,17 @@ impl Vm {
                     let this_val = env.lock().unwrap().get("this")
                         .ok_or(DgnError::new("super used outside class method", line))?;
 
-                    // Ensure we are operating on an instance
                     if !matches!(this_val, DgnValue::Instance(_)) {
                         return Err(DgnError::new("super requires instance context", line));
                     }
 
-                    // LEXICAL LOOKUP: Get the parent of the class that DEFINED this method
-                    // By querying `env`, it climbs the scope chain to the enclosing class_env.
                     let parent_cls = env.lock().unwrap().get("__parent_class__")
                         .ok_or(DgnError::new("No parent class for super", line))?;
 
                     let result = if let DgnValue::Class(penv) = parent_cls {
                         let method = penv.lock().unwrap().get(method_name)
                             .ok_or(DgnError::new(&format!("Method '{}' not in parent", method_name), line))?;
-                        
+
                         if let DgnValue::Func(f) = method {
                             match call_dgn_func_impl(f, args, Some(this_val)).await {
                                 Ok(v) => v,
@@ -468,23 +488,19 @@ impl Vm {
                                     return Err(e);
                                 }
                             }
-                        } else { 
-                            DgnValue::Null 
+                        } else {
+                            DgnValue::Null
                         }
-                    } else { 
-                        return Err(DgnError::new("Parent is not a class", line)); 
+                    } else {
+                        return Err(DgnError::new("Parent is not a class", line));
                     };
 
                     self.stack.push(result);
                 }
 
-                // ── for-in iterator ───────────────────────────────────────────
                 Instruction::ForIter(ref var_name, ref value_var, exit_ip) => {
-                    // Check if the top of the stack is already our iterator for this ip
                     let is_active = self.for_iter_stack.last().map(|(k,_,_)| *k == ip).unwrap_or(false);
                     if !is_active {
-                        // First visit: pop iterable, push a new iterator frame.
-                        // Each entry is (key, value): for sequences key=index, for maps key=string key.
                         let iterable = self.pop();
                         let items: Vec<(DgnValue, DgnValue)> = match iterable {
                             DgnValue::List(l) => l.lock().unwrap().iter().enumerate()
@@ -506,7 +522,6 @@ impl Vm {
 
                     let (_, items, idx) = self.for_iter_stack.last_mut().unwrap();
                     if *idx >= items.len() {
-                        // Exhausted — pop frame and jump past loop
                         self.for_iter_stack.pop();
                         ip = *exit_ip;
                         continue;
@@ -515,19 +530,15 @@ impl Vm {
                     *idx += 1;
                     let mut env_guard = env.lock().unwrap();
                     if let Some(vname) = value_var {
-                        // for k, v in iter — bind both
                         env_guard.store.insert(var_name.clone(), k);
                         env_guard.store.insert(vname.clone(), v);
                     } else {
-                        // for x in iter — preserve old behavior: single var gets the value
                         env_guard.store.insert(var_name.clone(), v);
                     }
                 }
 
-                // These are patched to Jump by the compiler; should not appear at runtime
                 Instruction::Break | Instruction::Continue | Instruction::DoWhileStart => {}
 
-                // ── exceptions ────────────────────────────────────────────────
                 Instruction::PushTry(catch_ip) => {
                     self.try_frames.push((*catch_ip, self.stack.len()));
                 }
@@ -548,7 +559,6 @@ impl Vm {
                         .map_err(|e| DgnError::new(&e, line))?;
                 }
 
-                // ── async / await ─────────────────────────────────────────────
                 Instruction::Await => {
                     let val = self.pop();
                     if let DgnValue::Promise(ref sa) = val {
@@ -571,32 +581,13 @@ impl Vm {
                             return Err(DgnError::new("Promise already consumed", line));
                         }
                     } else {
-                        self.stack.push(val); // await non-promise is a passthrough
+                        self.stack.push(val);
                     }
                 }
 
-                // ── import ────────────────────────────────────────────────────
                 Instruction::Import(ref path, ref alias) => {
                     vm_do_import(path, alias, env.clone(), line).await?;
                 }
-
-                // ── inc / dec ─────────────────────────────────────────────────
-                // ── inc / dec ─────────────────────────────────────────────────
-                // Instruction::IncVar(ref n) => {
-                //     let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
-                //     match cur {
-                //         DgnValue::Int(v) => {
-                //             env.lock().unwrap().set(n.clone(), DgnValue::Int(v + 1)).map_err(|e| DgnError::new(&e, line))?;
-                //             self.stack.push(DgnValue::Int(v + 1));
-                //         }
-                //         DgnValue::Number(v) => {
-                //             env.lock().unwrap().set(n.clone(), DgnValue::Number(v + 1.0)).map_err(|e| DgnError::new(&e, line))?;
-                //             self.stack.push(DgnValue::Number(v + 1.0));
-                //         }
-                //         _ => return Err(DgnError::new("Cannot ++ non-number", line)),
-                //     }
-                // }
-
 
                 Instruction::IncVar(ref n) => {
                     let mut env_guard = env.lock().unwrap();
@@ -617,20 +608,6 @@ impl Vm {
                     _ => return Err(DgnError::new("Cannot ++ non-number", line)),
                     }
                 }
-                // Instruction::DecVar(ref n) => {
-                //     let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
-                //     match cur {
-                //         DgnValue::Int(v) => {
-                //             env.lock().unwrap().set(n.clone(), DgnValue::Int(v - 1)).map_err(|e| DgnError::new(&e, line))?;
-                //             self.stack.push(DgnValue::Int(v - 1));
-                //         }
-                //         DgnValue::Number(v) => {
-                //             env.lock().unwrap().set(n.clone(), DgnValue::Number(v - 1.0)).map_err(|e| DgnError::new(&e, line))?;
-                //             self.stack.push(DgnValue::Number(v - 1.0));
-                //         }
-                //         _ => return Err(DgnError::new("Cannot -- non-number", line)),
-                //     }
-                // }
 
                 Instruction::DecVar(ref n) => {
                     let mut env_guard = env.lock().unwrap();
@@ -670,22 +647,6 @@ impl Vm {
                     }
                 }
 
-                
-                // Instruction::PostDecVar(ref n) => {
-                //     let cur = env.lock().unwrap().get(n).unwrap_or(DgnValue::Int(0));
-                //     match cur {
-                //         DgnValue::Int(v) => {
-                //             env.lock().unwrap().set(n.clone(), DgnValue::Int(v - 1)).map_err(|e| DgnError::new(&e, line))?;
-                //             self.stack.push(DgnValue::Int(v)); // push old value
-                //         }
-                //         DgnValue::Number(v) => {
-                //             env.lock().unwrap().set(n.clone(), DgnValue::Number(v - 1.0)).map_err(|e| DgnError::new(&e, line))?;
-                //             self.stack.push(DgnValue::Number(v)); // push old value
-                //         }
-                //         _ => return Err(DgnError::new("Cannot -- non-number", line)),
-                //     }
-                // }
-
                 Instruction::PostDecVar(ref n) => {
                     let mut env_guard = env.lock().unwrap();
                     let cur = env_guard.get(n).unwrap_or(DgnValue::Int(0));
@@ -705,7 +666,6 @@ impl Vm {
                 }
 
                 Instruction::ReadModWriteAttr(ref attr, is_pre, is_dec) => {
-                    // Stack: [..., obj] — compiler emitted obj expression before this op
                     let obj = self.pop();
                     let cur = get_attr(obj.clone(), attr).unwrap_or(DgnValue::Null);
                     match cur {
@@ -726,11 +686,10 @@ impl Vm {
                         _ => return Err(DgnError::new("Cannot ++/-- non-number attr", line)),
                     }
                 }
-                // NEW
                 Instruction::ReadModWriteIndex(is_pre, is_dec) => {
                     let idx = self.pop();
                     let obj = self.pop();
-                    
+
                     let cur = match &obj {
                         DgnValue::List(l) => {
                             if let Some(i) = idx.as_number() {
@@ -744,7 +703,7 @@ impl Vm {
                         },
                         _ => DgnValue::Null,
                     };
-                    
+
                     if let Some(n) = cur.as_number() {
                         let is_int = matches!(cur, DgnValue::Int(_));
                         let nv = if *is_dec { n - 1.0 } else { n + 1.0 };
@@ -776,19 +735,21 @@ impl Vm {
     }
 }
 
-/// Extracted from eval_expr's Binary arm — reusable by both VM and tree-walk
-/// Fully bytecode-native import — no eval_stmt, no tree-walk.
 pub async fn vm_do_import(
     path: &str,
     alias: &Option<String>,
     env: Arc<Mutex<Env>>,
     line: usize,
 ) -> Result<(), DgnError> {
-    let bind = alias.clone().unwrap_or_else(|| {
-        std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string()
-    });
+    let default_name = |p: &str| -> String {
+        let q = p.strip_prefix("package:").unwrap_or(p);
+        std::path::Path::new(q).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| q.to_string())
+    };
+    let bind = match alias.as_deref() {
+        Some("*") | None => default_name(path),
+        Some(a) => a.to_string(),
+    };
 
-    // 1. Built-in modules
     if let Some(module_val) = get_builtin_module(path) {
         env.lock().unwrap().set(bind, module_val).map_err(|e| DgnError::new(&e, line))?;
         return Ok(());
@@ -796,7 +757,6 @@ pub async fn vm_do_import(
 
     let root = Env::get_root(env.clone());
 
-    // 2. Bundled sources
     let bundled_src = {
         let r = root.lock().unwrap();
         if let Some(DgnValue::Map(map)) = r.store.get("__bundled_sources__") {
@@ -811,7 +771,6 @@ pub async fn vm_do_import(
     let (code, new_env_path) = if let Some(src) = bundled_src {
         (src, PathBuf::from(format!("bundle:///{}", path)))
     } else {
-        // 3. File system search
         let current_dir = env.lock().unwrap().current_path
             .parent().unwrap_or(Path::new(".")).to_path_buf();
         let mut search_dirs = vec![current_dir.clone(), current_dir.join("dgn_modules")];
@@ -833,7 +792,19 @@ pub async fn vm_do_import(
         }
 
         let mut found_path = None;
-        'outer: for dir in &search_dirs {
+        if path.starts_with("package:") {
+            let app_dir = {
+                let r = root.lock().unwrap();
+                match r.store.get("__app_dir__") {
+                    Some(DgnValue::String(d)) => PathBuf::from(d),
+                    _ => crate::packages::app_root_of(&r.current_path),
+                }
+            };
+            let roots = crate::packages::package_roots(&app_dir);
+            let f = crate::packages::resolve_package_import(path, &roots).map_err(|e| DgnError::new(&e, line))?;
+            found_path = Some(f.canonicalize().unwrap_or(f));
+        }
+        'outer: for dir in search_dirs.iter().filter(|_| found_path.is_none()) {
             for target in &target_files {
                 let candidate = dir.join(target);
                 if candidate.exists() && candidate.is_file() {
@@ -852,7 +823,6 @@ pub async fn vm_do_import(
 
     let cache_key = new_env_path.to_string_lossy().to_string();
 
-    // 4. Module cache check
     let cached_mod = {
         let r = root.lock().unwrap();
         if let Some(DgnValue::Map(modules)) = r.store.get("__modules__") {
@@ -870,7 +840,6 @@ pub async fn vm_do_import(
         }
         m
     } else {
-        // 5. Parse and compile module source
         let tokens = lex(&code)?;
         let mut parser = Parser::new(tokens);
         let module_body = parser.parse().map_err(|e| DgnError::new(&e, line))?;
@@ -878,6 +847,13 @@ pub async fn vm_do_import(
         let mod_env = Arc::new(Mutex::new(Env::new(None, Some(new_env_path))));
         populate_builtins(mod_env.clone());
         mod_env.lock().unwrap().store.insert("__loading__".to_string(), DgnValue::Bool(true));
+        {
+            let r = root.lock().unwrap();
+            let mut me = mod_env.lock().unwrap();
+            for k in ["__modules__", "__bundled_sources__", "__app_dir__"] {
+                if let Some(v) = r.store.get(k) { me.store.insert(k.to_string(), v.clone()); }
+            }
+        }
 
         let placeholder = DgnValue::Class(mod_env.clone());
         {
@@ -887,7 +863,6 @@ pub async fn vm_do_import(
             }
         }
 
-        // 6. Execute module via VM (pure bytecode — no eval_stmt)
         let mut mod_chunk = Chunk::new();
         Compiler::compile_stmt(&mut mod_chunk, &module_body);
         mod_chunk.emit(Instruction::Halt, 0);
@@ -899,18 +874,27 @@ pub async fn vm_do_import(
         placeholder
     };
 
-    // 7. Bind module into caller's env
-    let final_bind = alias.clone().unwrap_or_else(|| {
-        std::path::Path::new(path).file_stem().unwrap().to_str().unwrap().to_string()
-    });
+    if alias.as_deref() == Some("*") {
+        if let DgnValue::Class(mod_env) = &mod_val {
+            let skip = builtin_name_set();
+            let exports: Vec<(String, DgnValue)> = mod_env.lock().unwrap().store.iter()
+                .filter(|(k, _)| !k.starts_with('_') && !skip.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let mut target = env.lock().unwrap();
+            for (k, v) in exports {
+                target.store.insert(k, v);
+            }
+        }
+        return Ok(());
+    }
+    let final_bind = alias.clone().unwrap_or_else(|| default_name(path));
     env.lock().unwrap().set(final_bind, mod_val).map_err(|e| DgnError::new(&e, line))?;
     Ok(())
 }
 
 pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result<DgnValue, DgnError> {
-    // Helper: coerce to f64
     fn to_f(v: &DgnValue) -> Option<f64> { match v { DgnValue::Number(n) => Some(*n), DgnValue::Int(n) => Some(*n as f64), _ => None } }
-    // Helper: both are Int
     fn both_int(l: &DgnValue, r: &DgnValue) -> Option<(i64, i64)> {
         match (l, r) { (DgnValue::Int(a), DgnValue::Int(b)) => Some((*a, *b)), _ => None }
     }
@@ -938,7 +922,6 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(a*b)) } else { Ok(DgnValue::Null) }
         },
         BinOp::Div => match (l, r) {
-            // int/int: integer division when evenly divisible, else float
             (DgnValue::Int(a), DgnValue::Int(b)) => {
                 if b == 0 { return Err(DgnError::new("Division by zero", line)); }
                 if a % b == 0 { Ok(DgnValue::Int(a / b)) } else { Ok(DgnValue::Number(a as f64 / b as f64)) }
@@ -961,6 +944,8 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a==b)),
             (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(true)),
             (DgnValue::ByteArray(a), DgnValue::ByteArray(b)) => Ok(DgnValue::Bool(*a.lock().unwrap() == *b.lock().unwrap())),
+            (DgnValue::Map(a), DgnValue::Map(b)) => Ok(DgnValue::Bool(std::sync::Arc::ptr_eq(&a, &b))),
+            (DgnValue::List(a), DgnValue::List(b)) => Ok(DgnValue::Bool(std::sync::Arc::ptr_eq(&a, &b))),
             _ => Ok(DgnValue::Bool(false)),
         },
         BinOp::Ne  => match (l,r) {
@@ -972,6 +957,8 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (DgnValue::Bool(a),   DgnValue::Bool(b))   => Ok(DgnValue::Bool(a != b)),
             (DgnValue::Null,      DgnValue::Null)       => Ok(DgnValue::Bool(false)),
             (DgnValue::ByteArray(a), DgnValue::ByteArray(b)) => Ok(DgnValue::Bool(*a.lock().unwrap() != *b.lock().unwrap())),
+            (DgnValue::Map(a), DgnValue::Map(b)) => Ok(DgnValue::Bool(!std::sync::Arc::ptr_eq(&a, &b))),
+            (DgnValue::List(a), DgnValue::List(b)) => Ok(DgnValue::Bool(!std::sync::Arc::ptr_eq(&a, &b))),
             _ => Ok(DgnValue::Bool(true)),
         },
         BinOp::Lt  => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Bool(a<b)) } else { Ok(DgnValue::Bool(false)) },
@@ -999,7 +986,30 @@ pub fn vm_binary_op(op: &BinOp, l: DgnValue, r: DgnValue, line: usize) -> Result
             (l, r) => if let (Some(a), Some(b)) = (to_f(&l), to_f(&r)) { Ok(DgnValue::Number(((a as i64) >> (b as i64)) as f64)) } else { Ok(DgnValue::Null) }
         },
         BinOp::NullCoalesce => if let DgnValue::Null = l { Ok(r) } else { Ok(l) },
-        BinOp::And | BinOp::Or => Ok(DgnValue::Null), // handled by JumpIfFalse/True
+        BinOp::And | BinOp::Or => Ok(DgnValue::Null),
     }
 }
 
+pub async fn instantiate_class(cls_env: Arc<Mutex<Env>>, args: Vec<DgnValue>) -> Result<DgnValue, DgnError> {
+    let inst_map = Arc::new(Mutex::new(HashMap::new()));
+    inst_map.lock().unwrap().insert("__class__".into(), DgnValue::Class(cls_env));
+    let instance = DgnValue::Instance(inst_map);
+    gc_register(&instance);
+    if let Ok(init) = get_attr(instance.clone(), "init") {
+        if let DgnValue::Func(_) = init {
+            call_dgn_func(init, args).await?;
+        }
+    }
+    Ok(instance)
+}
+
+pub fn builtin_name_set() -> &'static HashSet<String> {
+    use std::sync::OnceLock;
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let e = Arc::new(Mutex::new(Env::new(None, None)));
+        populate_builtins(e.clone());
+        let keys: HashSet<String> = e.lock().unwrap().store.keys().cloned().collect();
+        keys
+    })
+}

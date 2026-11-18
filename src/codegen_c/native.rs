@@ -27,10 +27,6 @@ impl NativeType {
             "float" | "double" | "f64" | "f32" | "number" => Some(NativeType::Float),
             "str" | "string" => Some(NativeType::Str),
             "bool" => Some(NativeType::Bool),
-            // Single NAME token only -- the parser reads exactly one NAME
-            // for a param type annotation (func f(x: TYPE)), so a
-            // multi-token form like "list<str>" can never actually be
-            // written and would be dead code to match on here.
             "strlist" => Some(NativeType::StrList),
             _ => None,
         }
@@ -43,12 +39,10 @@ fn mangle_plain(name: &str) -> String {
         .collect()
 }
 
-
 fn parse_param(raw_name: &str, raw_type: &Option<String>) -> (String, Option<NativeType>) {
     let ty = raw_type.as_deref().and_then(NativeType::from_annotation);
     (raw_name.trim().to_string(), ty)
 }
-
 
 #[derive(Clone)]
 pub(crate) struct LibFnSig {
@@ -122,7 +116,6 @@ fn expr_to_native_literal(e: &Expr) -> Option<(NativeType, String)> {
     }
 }
 
-
 fn builtin_call(name: &str, arg_types: &[NativeType]) -> Option<(NativeType, &'static str)> {
     match (name, arg_types) {
         ("sqrt", [NativeType::Int]) | ("sqrt", [NativeType::Float]) => Some((NativeType::Float, "sqrt")),
@@ -159,9 +152,6 @@ static int64_t __dgn_lib_min_i(int64_t a, int64_t b) { return a < b ? a : b; }\n
 static int64_t __dgn_lib_max_i(int64_t a, int64_t b) { return a > b ? a : b; }\n\
 static double __dgn_lib_min_f(double a, double b) { return a < b ? a : b; }\n\
 static double __dgn_lib_max_f(double a, double b) { return a > b ? a : b; }\n\
-/* Bounds-checked substring: clamps start/len into range rather than\n\
-   reading out of bounds on a bad index, since this is an ABI boundary\n\
-   where an out-of-range caller value shouldn't be undefined behavior. */\n\
 static char* __dgn_lib_substr(const char* s, int64_t start, int64_t len) {\n\
     int64_t slen = (int64_t)strlen(s);\n\
     if (start < 0) start = 0;\n\
@@ -173,14 +163,11 @@ static char* __dgn_lib_substr(const char* s, int64_t start, int64_t len) {\n\
     out[len] = '\\0';\n\
     return out;\n\
 }\n\
-/* Returns -1 (not a crash) when `needle` isn't found, matching the\n\
-   convention every other language's indexOf/index_of uses. */\n\
 static int64_t __dgn_lib_index_of(const char* s, const char* needle) {\n\
     const char* found = strstr(s, needle);\n\
     if (!found) return -1;\n\
     return (int64_t)(found - s);\n\
 }\n\
-/* Returns \"\" (not a crash) for an out-of-range index. */\n\
 static char* __dgn_lib_char_at(const char* s, int64_t idx) {\n\
     int64_t slen = (int64_t)strlen(s);\n\
     char* out = (char*)malloc(2);\n\
@@ -189,13 +176,14 @@ static char* __dgn_lib_char_at(const char* s, int64_t idx) {\n\
     out[1] = '\\0';\n\
     return out;\n\
 }\n\
-/* Callers of an exported function that returns const char* own that\n\
-   pointer and must release it with this, not their own libc free() --\n\
-   the library may be linked against a different CRT (this matters\n\
-   especially on Windows), so mixing allocators is undefined behavior. */\n\
 DGN_EXPORT void dgn_free_string(char* s) { free(s); }\n\
+static char* __dgn_lib_strdup(const char* s) {\n\
+    size_t n = strlen(s) + 1;\n\
+    char* out = (char*)malloc(n);\n\
+    memcpy(out, s, n);\n\
+    return out;\n\
+}\n\
 \n\
-/* --- list<str> runtime (backs the `strlist` type) ------------------- */\n\
 typedef struct {\n\
     char** items;   /* each entry individually malloc'd, owned by the list */\n\
     int64_t len;\n\
@@ -209,9 +197,6 @@ static DgnListStr* __dgn_list_new(void) {\n\
     l->cap = 0;\n\
     return l;\n\
 }\n\
-/* Takes ownership of `item` -- the caller must not free it separately\n\
-   after pushing; __dgn_list_free will free every pushed item exactly\n\
-   once when the list itself is freed. */\n\
 static void __dgn_list_push(DgnListStr* l, char* item) {\n\
     if (l->len >= l->cap) {\n\
         int64_t new_cap = l->cap == 0 ? 4 : l->cap * 2;\n\
@@ -221,15 +206,21 @@ static void __dgn_list_push(DgnListStr* l, char* item) {\n\
     l->items[l->len] = item;\n\
     l->len++;\n\
 }\n\
-/* Returns a BORROWED pointer -- the caller must NOT free this; it's still\n\
-   owned by the list. Returns \"\" (not a crash) for an out-of-range index\n\
-   or a NULL list, matching char_at's out-of-range convention. */\n\
 static const char* __dgn_list_get(DgnListStr* l, int64_t idx) {\n\
     if (!l || idx < 0 || idx >= l->len) return \"\";\n\
     return l->items[idx];\n\
 }\n\
 static int64_t __dgn_list_len(DgnListStr* l) {\n\
     return l ? l->len : 0;\n\
+}\n\
+static char* __dgn_list_pop(DgnListStr* l) {\n\
+    if (!l || l->len == 0) {\n\
+        char* out = (char*)malloc(1);\n\
+        out[0] = '\\0';\n\
+        return out;\n\
+    }\n\
+    l->len--;\n\
+    return l->items[l->len];\n\
 }\n\
 static void __dgn_list_free(void* ptr) {\n\
     DgnListStr* l = (DgnListStr*)ptr;\n\
@@ -240,12 +231,6 @@ static void __dgn_list_free(void* ptr) {\n\
     free(l->items);\n\
     free(l);\n\
 }\n\
-/* Deep-copies a list -- needed for the same reason a returned bare Str\n\
-   variable needs copying (see the Return codegen): a list a function\n\
-   doesn't itself own (a parameter, or a global read into a local) can't\n\
-   be handed to a caller who will call dgn_free_strlist() on it, since\n\
-   that would free memory this function's own caller (or a global) still\n\
-   needs. */\n\
 static DgnListStr* __dgn_list_clone(DgnListStr* src) {\n\
     DgnListStr* out = __dgn_list_new();\n\
     if (!src) return out;\n\
@@ -257,28 +242,16 @@ static DgnListStr* __dgn_list_clone(DgnListStr* src) {\n\
     }\n\
     return out;\n\
 }\n\
-/* Concatenation for `a + b` on two strlists -- builds a fresh third list\n\
-   with deep copies of every element from both (never aliases either\n\
-   input's items, so freeing the inputs afterward is always safe). */\n\
 static DgnListStr* __dgn_list_concat(DgnListStr* a, DgnListStr* b) {\n\
     DgnListStr* out = __dgn_list_new();\n\
     if (a) { for (int64_t i = 0; i < a->len; i++) { size_t n = strlen(a->items[i]) + 1; char* c = (char*)malloc(n); memcpy(c, a->items[i], n); __dgn_list_push(out, c); } }\n\
     if (b) { for (int64_t i = 0; i < b->len; i++) { size_t n = strlen(b->items[i]) + 1; char* c = (char*)malloc(n); memcpy(c, b->items[i], n); __dgn_list_push(out, c); } }\n\
     return out;\n\
 }\n\
-/* Caller-facing free for a strlist an exported function returned --\n\
-   same convention as dgn_free_string. */\n\
 DGN_EXPORT void dgn_free_strlist(DgnListStr* l) { __dgn_list_free((void*)l); }\n\
 DGN_EXPORT int64_t dgn_strlist_len(DgnListStr* l) { return __dgn_list_len(l); }\n\
 DGN_EXPORT const char* dgn_strlist_get(DgnListStr* l, int64_t idx) { return __dgn_list_get(l, idx); }\n\
 \n\
-/* --- file I/O -------------------------------------------------------- */\n\
-/* Path is whatever the host gives Dragon -- --native has no concept of\n\
-   \"the app's storage directory\" itself (that's a platform-specific\n\
-   Context/Bundle API with no portable plain-C equivalent), so callers on\n\
-   Android/iOS should pass an absolute path from their own app-storage API\n\
-   (e.g. Android's context.filesDir.absolutePath) rather than a bare\n\
-   filename, which would land somewhere unpredictable (or unwritable). */\n\
 static int __dgn_file_write_mode(const char* path, const char* content, const char* mode) {\n\
     FILE* f = fopen(path, mode);\n\
     if (!f) return 0;\n\
@@ -293,10 +266,6 @@ static int __dgn_file_write(const char* path, const char* content) {\n\
 static int __dgn_file_append(const char* path, const char* content) {\n\
     return __dgn_file_write_mode(path, content, \"ab\");\n\
 }\n\
-/* Never NULL -- \"\" both for \"file doesn't exist / can't be read\" and for\n\
-   a genuinely empty file, matching the same never-null convention every\n\
-   other Str-returning helper here follows (e.g. char_at's out-of-range\n\
-   case). Use file_exists() first if you need to tell those apart. */\n\
 static char* __dgn_file_read(const char* path) {\n\
     FILE* f = fopen(path, \"rb\");\n\
     if (!f) {\n\
@@ -328,15 +297,6 @@ static int __dgn_file_delete(const char* path) {\n\
     return remove(path) == 0;\n\
 }\n\
 \n\
-/* --- JSON string escaping -------------------------------------------- */\n\
-/* Per RFC 8259: \" and \\ get a backslash escape; the common control\n\
-   characters get their short escape (\\n, \\t, ...); any other control\n\
-   character (0x00-0x1F) gets a \\u00XX escape; everything else, including\n\
-   UTF-8 multi-byte sequences (always >= 0x80, never colliding with the\n\
-   ASCII bytes checked below), is copied through unchanged. Two passes --\n\
-   first computes the exact output length, second writes it -- so this is\n\
-   a single O(n) allocation rather than the O(n^2) cost of building the\n\
-   result via repeated Dragon-level string concatenation. */\n\
 static char* __dgn_json_escape(const char* s) {\n\
     size_t len = strlen(s);\n\
     size_t out_len = 0;\n\
@@ -381,16 +341,6 @@ fn is_freeable(t: NativeType) -> bool {
     matches!(t, NativeType::Str | NativeType::StrList)
 }
 
-/// True for a bare numeric literal, or a unary-negated one (`-5`, `-5.0`)
-/// -- used to let a whole-number literal like `0` satisfy a `Float`-typed
-/// parameter/target. A literal number's OWN type can't otherwise
-/// distinguish "0" from "0.0" (both parse to the same f64 with no
-/// fractional part, and the lexer's original source text -- which does
-/// preserve that distinction -- doesn't survive into the AST), so this
-/// checks the call/assignment SITE's expected type instead of the
-/// literal's own written form. Safe: C implicitly promotes an int literal
-/// passed where a double is expected, so no codegen change is needed
-/// alongside this, only relaxing the Dragon-level type check.
 fn is_number_literal(e: &Expr) -> bool {
     match &e.node {
         ExprNode::Number(_) => true,
@@ -402,12 +352,9 @@ fn is_number_literal(e: &Expr) -> bool {
 fn free_fn_for(t: NativeType) -> &'static str {
     match t {
         NativeType::StrList => "__dgn_list_free",
-        _ => "free", // Str, and the unreachable-in-practice default for Int/Float/Bool
+        _ => "free",
     }
 }
-
-// ── Type inference / verification for a single function body, given its
-// resolved parameter types and the whole-program signature table. ─────────
 
 struct TypeScope {
     vars: std::collections::HashMap<String, NativeType>,
@@ -433,9 +380,6 @@ fn infer_expr_type(
         ExprNode::Var(name) => scope.get(name),
         ExprNode::List(items) => {
             if items.is_empty() {
-                // An empty list literal's element type can't be inferred
-                // from its contents -- only `str` lists exist right now,
-                // so that's the only thing "[]" can mean here.
                 return Ok(NativeType::StrList);
             }
             for item in items {
@@ -512,6 +456,49 @@ fn infer_expr_type(
             Ok(tt)
         }
         ExprNode::Call(callee, args) => {
+            if let ExprNode::GetAttr(receiver, method) = &callee.node {
+                let recv_name = match &receiver.node {
+                    ExprNode::Var(n) => n.clone(),
+                    _ => return Err(format!(
+                        "--native --lib: in '{}', '.{}(...)' is only supported on a plain variable \
+                         (e.g. `mylist.{}(...)`), not on an arbitrary expression",
+                        fn_name, method, method
+                    )),
+                };
+                let recv_type = infer_expr_type(receiver, scope, sigs, fn_name)?;
+                if recv_type != NativeType::StrList {
+                    return Err(format!(
+                        "--native --lib: in '{}', '.{}()' is only supported on a strlist, but '{}' is {:?}",
+                        fn_name, method, recv_name, recv_type
+                    ));
+                }
+                return match method.as_str() {
+                    "push" => {
+                        if args.len() != 1 {
+                            return Err(format!("--native --lib: in '{}', list.push(item) takes exactly 1 argument", fn_name));
+                        }
+                        let at = infer_expr_type(&args[0], scope, sigs, fn_name)?;
+                        if at != NativeType::Str {
+                            return Err(format!(
+                                "--native --lib: in '{}', list.push(item) expects a str argument, got {:?}",
+                                fn_name, at
+                            ));
+                        }
+                        Ok(NativeType::Int)
+                    }
+                    "pop" => {
+                        if !args.is_empty() {
+                            return Err(format!("--native --lib: in '{}', list.pop() takes no arguments", fn_name));
+                        }
+                        Ok(NativeType::Str)
+                    }
+                    other => Err(format!(
+                        "--native --lib: in '{}', unsupported list method '.{}()' -- only .push(item) \
+                         and .pop() are supported (use len(list) for length and list[i] for indexing)",
+                        fn_name, other
+                    )),
+                };
+            }
             let name = match &callee.node {
                 ExprNode::Var(n) => n,
                 _ => return Err(format!("--native --lib: in '{}', only calling a plain function name is supported", fn_name)),
@@ -558,10 +545,6 @@ fn infer_expr_type(
                     fn_name, et, vname, vt
                 )),
                 Some(vt) => Ok(vt),
-                // First assignment to this name: Dragon implicitly declares
-                // it here (no `let`/`var` keyword needed), matching how the
-                // interpreter and every other codegen path in this compiler
-                // already treat a bare `x = value`.
                 None => {
                     scope.vars.insert(vname, et);
                     Ok(et)
@@ -585,10 +568,6 @@ fn infer_expr_type(
     }
 }
 
-/// First pass: resolve every local variable's type via ConstDecl (a forward
-/// scan is enough since Dragon requires declaration before use), without
-/// emitting anything -- used to build the full symbol table before codegen,
-/// and to validate the function's return type up front.
 fn infer_return_type(
     body: &Stmt,
     scope: &mut TypeScope,
@@ -688,12 +667,6 @@ fn infer_return_type_stmt(
     Ok(())
 }
 
-// ── Codegen ──────────────────────────────────────────────────────────────
-
-/// Syntactic scan (no type resolution needed) for every variable name that
-/// appears as a plain assignment target anywhere inside `stmt`, regardless
-/// of nesting inside if/while/etc. Used only to decide which Str parameters
-/// need a runtime ownership flag declared up front -- see emit_body.
 fn assigned_names(stmt: &Stmt) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     assigned_names_stmt(stmt, &mut out);
@@ -754,20 +727,8 @@ struct NativeTranspiler<'a> {
     sigs: &'a std::collections::HashMap<String, LibFnSig>,
     fn_name: &'a str,
     ret_type: NativeType,
-    // Freeable temps not yet freed, and their type (Str -> free(),
-    // StrList -> __dgn_list_free()). Consumed and freed when used as an
-    // operand of "+"/list push; left alone if returned (ownership
-    // transfers to the caller).
     owned_temps: std::collections::HashMap<String, NativeType>,
-    // Vars with a runtime `_owned` flag, and their type. Ownership can
-    // depend on which if/else branch ran at runtime, so a compile-time-
-    // only "is this owned" check is unreliable (verified: produced a
-    // use-after-free once branches were involved) -- reassignment checks
-    // and updates this flag in the generated C itself.
     freeable_vars_with_flag: std::collections::HashMap<String, NativeType>,
-    // Freeable globals aliased into this function. A global's storage (and
-    // ownership flag) persists across every call, so end-of-function
-    // cleanup must never free them, unlike a local.
     global_freeable_names: std::collections::HashSet<String>,
 }
 
@@ -786,22 +747,16 @@ impl<'a> NativeTranspiler<'a> {
     fn default_return_literal(&self) -> &'static str {
         match self.ret_type {
             NativeType::Str => "\"\"",
-            NativeType::StrList => "NULL", // callers checking a StrList return must treat NULL as empty; see __dgn_list_len
+            NativeType::StrList => "NULL",
             NativeType::Float => "0.0",
             NativeType::Int | NativeType::Bool => "0",
         }
     }
 
-    /// Emits `if (_name_owned) { free((void*)_name); }` for every
-    /// currently-tracked freeable local/param except `exclude` (ownership
-    /// of that one transfers to the caller instead). Called at every
-    /// return point, including the implicit fall-off-the-end case, since a
-    /// local reassigned inside a loop is still owned right up until the
-    /// function returns -- even if the return type itself isn't freeable.
     fn emit_owned_locals_cleanup(&mut self, exclude: Option<&str>) {
         let ind = "    ".repeat(self.indent);
         let mut names: Vec<(String, NativeType)> = self.freeable_vars_with_flag.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        names.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic output only, not load-bearing
+        names.sort_by(|a, b| a.0.cmp(&b.0));
         for (n, ty) in names {
             if Some(n.as_str()) == exclude || self.global_freeable_names.contains(&n) {
                 continue;
@@ -811,14 +766,6 @@ impl<'a> NativeTranspiler<'a> {
     }
 
     fn emit_body(&mut self, body: &Stmt) -> Result<(), String> {
-        // C declarations are block-scoped; Dragon's aren't (a var first
-        // assigned inside an if/while is still visible after it), and
-        // return-point cleanup needs every such var's _owned flag
-        // regardless of which block first assigned it. So every freeable
-        // local gets hoisted to the top of the function; downstream
-        // assignments (including the "first" one) become plain
-        // reassignments. Uses the same return-type-inference pass to learn
-        // which names end up freeable-typed.
         let mut prescan_scope = TypeScope { vars: self.scope.vars.clone() };
         let mut dummy_ret = None;
         let _ = infer_return_type_stmt(body, &mut prescan_scope, self.sigs, self.fn_name, &mut dummy_ret);
@@ -826,14 +773,8 @@ impl<'a> NativeTranspiler<'a> {
             .filter(|(name, ty)| is_freeable(**ty) && !self.scope.vars.contains_key(*name))
             .map(|(name, ty)| (name.clone(), *ty))
             .collect();
-        hoisted_locals.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic output only, not load-bearing
+        hoisted_locals.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Any freeable-typed PARAMETER (not a global -- those already have
-        // their flag macro-aliased to the persistent one above) that gets
-        // reassigned somewhere in this function body needs its runtime
-        // ownership flag declared up front too (parameters start
-        // pre-declared in self.scope.vars, so they'd otherwise never go
-        // through the "first declaration" path that creates one).
         let reassigned = assigned_names(body);
         let param_names: Vec<String> = self.scope.vars.keys().cloned().collect();
         for name in param_names {
@@ -863,14 +804,6 @@ impl<'a> NativeTranspiler<'a> {
 
         let definitely_returns = self.emit_stmt(body)?;
         if !definitely_returns {
-            // Defensive fallback only -- Dragon requires every path to
-            // return explicitly, so this should be unreachable for
-            // well-formed code. Still honors the same invariants as a real
-            // return: free whatever's still owned, and if this function
-            // returns Str, hand back heap memory (never the "" literal
-            // directly), since a caller unconditionally calling
-            // dgn_free_string() on it is exactly the class of bug the rest
-            // of this ownership machinery exists to prevent.
             self.emit_owned_locals_cleanup(None);
             if self.ret_type == NativeType::Str {
                 let ind = "    ".repeat(self.indent);
@@ -885,18 +818,12 @@ impl<'a> NativeTranspiler<'a> {
         Ok(())
     }
 
-    /// Returns true if this statement is guaranteed to return on every path
-    /// it can take (mirrors the same "no implicit fall-through" requirement
-    /// used elsewhere in this compiler) -- used only to decide whether the
-    /// belt-and-suspenders trailing return at the end of a function body is
-    /// reachable, so real code never gets a stray "unreachable" return
-    /// glued after it.
     fn emit_stmt(&mut self, stmt: &Stmt) -> Result<bool, String> {
         match &stmt.node {
             StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
                 let mut returns = false;
                 for s in stmts {
-                    if returns { break; } // dead code after an unconditional return: skip emitting it
+                    if returns { break; }
                     returns = self.emit_stmt(s)?;
                 }
                 Ok(returns)
@@ -911,15 +838,6 @@ impl<'a> NativeTranspiler<'a> {
                     ));
                 }
                 let v = self.emit_expr(e)?;
-                // A non-freeable return's `v` might still be unevaluated
-                // inline call text (Call's codegen leaves a non-freeable
-                // call with no owned-temp args as bare "fn(_lst)" text) --
-                // if it references a var the cleanup below is about to
-                // free, the free runs before the call actually does
-                // (verified use-after-free: `return len(some_list);`).
-                // Force evaluation into a real statement first. Freeable
-                // returns don't need this: Call already always
-                // materializes those into a temp immediately.
                 let v = if !is_freeable(t) {
                     let tmp = self.fresh();
                     let ind = "    ".repeat(self.indent);
@@ -928,17 +846,9 @@ impl<'a> NativeTranspiler<'a> {
                 } else {
                     v
                 };
-                // Free every freeable local still owned at this point
-                // except the one being returned (its ownership transfers
-                // to the caller). Matters even for a non-freeable return
-                // type -- a loop-local reassigned Str is still owned right
-                // up until an unrelated int is returned.
                 let exclude = if is_freeable(t) { Some(v.as_str()) } else { None };
                 self.emit_owned_locals_cleanup(exclude);
                 if is_freeable(t) && self.freeable_vars_with_flag.contains_key(&v) && !self.global_freeable_names.contains(&v) {
-                    // Ownership depends on runtime control flow, so hand-
-                    // off-vs-copy must be decided at runtime too (checking
-                    // the _owned flag), not guessed at compile time.
                     let tmp = self.fresh();
                     let ind = "    ".repeat(self.indent);
                     writeln!(self.out, "{}{} {};", ind, t.c_type(), tmp).unwrap();
@@ -956,12 +866,6 @@ impl<'a> NativeTranspiler<'a> {
                     writeln!(self.out, "{}}}", ind).unwrap();
                     self.line(&format!("return {};", tmp));
                 } else if is_freeable(t) && !self.owned_temps.contains_key(&v) {
-                    // A borrowed pointer with no runtime flag (a parameter
-                    // never reassigned, a global, or a literal). Every
-                    // freeable-returning function here promises a pointer
-                    // safe to dgn_free_string()/dgn_free_strlist(), so this
-                    // still needs a copy or the caller ends up freeing
-                    // memory it doesn't own.
                     let tmp = self.fresh();
                     let ind = "    ".repeat(self.indent);
                     if t == NativeType::StrList {
@@ -982,11 +886,6 @@ impl<'a> NativeTranspiler<'a> {
                 let v = self.emit_expr(e)?;
                 self.line(&format!("(void){};", v));
                 if let Some(ty) = self.owned_temps.remove(&v) {
-                    // A freeable-returning call used as a bare statement
-                    // for its side effects, e.g. `some_fn();` with the
-                    // result never used -- still owned, still needs
-                    // freeing, or it leaks exactly like an unused argument
-                    // would.
                     let ind = "    ".repeat(self.indent);
                     writeln!(self.out, "{}{}((void*){});", ind, free_fn_for(ty), v).unwrap();
                 }
@@ -1031,7 +930,7 @@ impl<'a> NativeTranspiler<'a> {
                 self.emit_stmt(body)?;
                 self.indent -= 1;
                 self.line("}");
-                Ok(false) // a while loop's body might never execute, so it never "definitely" returns
+                Ok(false)
             }
             StmtNode::DoWhile(body, cond) => {
                 self.line("do {");
@@ -1043,22 +942,10 @@ impl<'a> NativeTranspiler<'a> {
                 Ok(false)
             }
             StmtNode::CFor(init, cond, step, body) => {
-                // init runs once before the loop -- an ordinary statement
-                // is correct here (and matches Dragon's function-scoped
-                // variables: a loop counter declared in the init clause
-                // stays usable after the loop too, same as any other
-                // first-assignment elsewhere in this compiler).
                 if let Some(e) = init {
                     self.emit_stmt(&Stmt { node: StmtNode::Expr(e.clone()), line: 0 })?;
                 }
                 let cond_s = match cond { Some(e) => self.emit_expr(e)?, None => "1".to_string() };
-                // step MUST be genuine inline C text embedded in the for(...)
-                // header, not a statement -- emit_expr's Assign case
-                // side-effects via self.line(), which would hoist the
-                // whole increment out of the loop and run it once instead
-                // of every iteration (this was a real, serious bug: an
-                // earlier version of this function used emit_bare_expr,
-                // which called emit_expr for the step too).
                 let step_s = match step { Some(e) => self.emit_inline_step(e)?, None => String::new() };
                 self.line(&format!("for (; {}; {}) {{", cond_s, step_s));
                 self.indent += 1;
@@ -1082,10 +969,6 @@ impl<'a> NativeTranspiler<'a> {
                         self.fn_name, it
                     ));
                 }
-                // Evaluate the iterable expression exactly ONCE, into a
-                // temp -- re-evaluating it every iteration would be wrong
-                // for a side-effecting call, and outright leak a fresh
-                // list on every single iteration if it's a list literal.
                 let lv = self.emit_expr(iter_expr)?;
                 let lv_is_owned_temp = self.owned_temps.contains_key(&lv);
                 let ind = "    ".repeat(self.indent);
@@ -1097,15 +980,6 @@ impl<'a> NativeTranspiler<'a> {
                 self.indent += 1;
                 let ind2 = "    ".repeat(self.indent);
                 let vn = format!("_{}", mangle_plain(var_name));
-                // __dgn_list_get always returns a BORROWED pointer, so this
-                // binding goes through exactly the same free-before-
-                // reassign + flag-update dance as any other borrowed
-                // reassignment (see the Assign case) -- reusing that logic
-                // here rather than duplicating it keeps this consistent
-                // with every other variable in this file, including
-                // whether the loop body itself later reassigns `var_name`
-                // to something it OWNS (correctly handled from then on,
-                // since the flag is already tracked).
                 if self.freeable_vars_with_flag.contains_key(&vn) {
                     writeln!(self.out, "{}if ({}_owned) {{ free((void*){}); }}", ind2, vn, vn).unwrap();
                 }
@@ -1127,14 +1001,10 @@ impl<'a> NativeTranspiler<'a> {
                 self.indent -= 1;
                 self.line("}");
                 if lv_is_owned_temp {
-                    // The iterable was a fresh list (e.g. a literal built
-                    // right here, `for x in [a, b, c] { ... }`) -- nothing
-                    // else references it after the loop, so it must be
-                    // freed now or it leaks every time this statement runs.
                     self.owned_temps.remove(&lv);
                     self.line(&format!("__dgn_list_free((void*){});", lv));
                 }
-                Ok(false) // a for loop's body might never execute (empty list), so it never "definitely" returns
+                Ok(false)
             }
             StmtNode::Break => { self.line("break;"); Ok(false) }
             StmtNode::Continue => { self.line("continue;"); Ok(false) }
@@ -1145,7 +1015,6 @@ impl<'a> NativeTranspiler<'a> {
         }
     }
 
-   
     fn emit_inline_step(&mut self, e: &Expr) -> Result<String, String> {
         match &e.node {
             ExprNode::Assign(target, val) => {
@@ -1236,7 +1105,7 @@ impl<'a> NativeTranspiler<'a> {
             ExprNode::Bool(b) => Ok(if *b { "1".into() } else { "0".into() }),
             ExprNode::Var(name) => Ok(format!("_{}", mangle_plain(name))),
             ExprNode::List(items) => {
-               
+
                 let ind = "    ".repeat(self.indent);
                 let tmp = self.fresh();
                 writeln!(self.out, "{}DgnListStr* {} = __dgn_list_new();", ind, tmp).unwrap();
@@ -1244,7 +1113,7 @@ impl<'a> NativeTranspiler<'a> {
                     let it = infer_expr_type(item, &mut self.scope, self.sigs, self.fn_name)?;
                     let iv = self.emit_expr(item)?;
                     if self.owned_temps.remove(&iv).is_some() {
-                        
+
                         writeln!(self.out, "{}__dgn_list_push({}, (char*){});", ind, tmp, iv).unwrap();
                     } else {
                         let cs = self.to_cstr_expr(it, &iv)?;
@@ -1263,7 +1132,7 @@ impl<'a> NativeTranspiler<'a> {
                 Ok(tmp)
             }
             ExprNode::Index(list_expr, idx_expr) => {
-                
+
                 let lv = self.emit_expr(list_expr)?;
                 let iv = self.emit_expr(idx_expr)?;
                 Ok(format!("__dgn_list_get({}, {})", lv, iv))
@@ -1274,7 +1143,7 @@ impl<'a> NativeTranspiler<'a> {
                 let lv = self.emit_expr(l)?;
                 let rv = self.emit_expr(r)?;
                 if op == "+" && (lt == NativeType::Str || rt == NativeType::Str) {
-                    
+
                     let ls = self.to_cstr_expr(lt, &lv)?;
                     let rs = self.to_cstr_expr(rt, &rv)?;
                     let tmp = self.fresh();
@@ -1282,7 +1151,7 @@ impl<'a> NativeTranspiler<'a> {
                     writeln!(self.out, "{}size_t {}_len = strlen({}) + strlen({}) + 1;", ind, tmp, ls, rs).unwrap();
                     writeln!(self.out, "{}char* {} = (char*)malloc({}_len);", ind, tmp, tmp).unwrap();
                     writeln!(self.out, "{}snprintf({}, {}_len, \"%s%s\", {}, {});", ind, tmp, tmp, ls, rs).unwrap();
-                   
+
                     if self.owned_temps.remove(&ls).is_some() {
                         writeln!(self.out, "{}free((void*){});", ind, ls).unwrap();
                     }
@@ -1292,7 +1161,7 @@ impl<'a> NativeTranspiler<'a> {
                     self.owned_temps.insert(tmp.clone(), NativeType::Str);
                     Ok(tmp)
                 } else if op == "+" && lt == NativeType::StrList && rt == NativeType::StrList {
-            
+
                     let tmp = self.fresh();
                     let ind = "    ".repeat(self.indent);
                     writeln!(self.out, "{}DgnListStr* {} = __dgn_list_concat({}, {});", ind, tmp, lv, rv).unwrap();
@@ -1305,7 +1174,7 @@ impl<'a> NativeTranspiler<'a> {
                     self.owned_temps.insert(tmp.clone(), NativeType::StrList);
                     Ok(tmp)
                 } else if (op == "==" || op == "!=") && lt == NativeType::Str && rt == NativeType::Str {
-                   
+
                     let tmp = self.fresh();
                     let ind = "    ".repeat(self.indent);
                     let c_op = if op == "==" { "==" } else { "!=" };
@@ -1335,13 +1204,13 @@ impl<'a> NativeTranspiler<'a> {
                     _ => return Err(format!("--native --lib: in '{}', assignment target must be a plain variable", self.fn_name)),
                 };
                 let already_declared = self.scope.vars.contains_key(&name);
-                
+
                 let mut scope_peek = TypeScope { vars: self.scope.vars.clone() };
                 let et = infer_expr_type(val, &mut scope_peek, self.sigs, self.fn_name)?;
                 let vv = self.emit_expr(val)?;
                 let n = format!("_{}", mangle_plain(&name));
                 let ind = "    ".repeat(self.indent);
-                
+
                 let rhs_owner_var: Option<String> =
                     if vv != n && self.freeable_vars_with_flag.contains_key(&vv) && !self.global_freeable_names.contains(&vv) {
                         Some(vv.clone())
@@ -1349,7 +1218,7 @@ impl<'a> NativeTranspiler<'a> {
                         None
                     };
                 let rhs_is_fresh_alloc = self.owned_temps.contains_key(&vv);
-            
+
                 let target_is_global = self.global_freeable_names.contains(&n);
                 let source_is_global = self.global_freeable_names.contains(&vv);
                 let (vv, rhs_is_fresh_alloc) = if is_freeable(et) && (target_is_global || source_is_global) && !rhs_is_fresh_alloc && rhs_owner_var.is_none() {
@@ -1366,15 +1235,14 @@ impl<'a> NativeTranspiler<'a> {
                     (vv, rhs_is_fresh_alloc)
                 };
                 if is_freeable(et) && already_declared && self.freeable_vars_with_flag.contains_key(&n) {
-                    
-                  
+
                     writeln!(self.out, "{}if ({}_owned) {{ {}((void*){}); }}", ind, n, free_fn_for(et), n).unwrap();
                 }
                 self.owned_temps.remove(&vv);
                 if already_declared {
                     self.line(&format!("{} = {};", n, vv));
                 } else {
-                    
+
                     self.scope.vars.insert(name, et);
                     self.line(&format!("{} {} = {};", et.c_type(), n, vv));
                 }
@@ -1394,7 +1262,7 @@ impl<'a> NativeTranspiler<'a> {
                         self.line(&format!("{}_owned = {};", n, owned_expr));
                     }
                     if let Some(rv) = rhs_owner_var {
-                    
+
                         self.line(&format!("{}_owned = 0;", rv));
                     }
                 }
@@ -1423,6 +1291,37 @@ impl<'a> NativeTranspiler<'a> {
                 Ok(format!("({} ? {} : {})", cv, tv, ev))
             }
             ExprNode::Call(callee, args) => {
+                if let ExprNode::GetAttr(receiver, method) = &callee.node {
+                    let recv_name = match &receiver.node {
+                        ExprNode::Var(n) => n.clone(),
+                        _ => return Err(format!(
+                            "--native --lib: in '{}', '.{}(...)' is only supported on a plain variable",
+                            self.fn_name, method
+                        )),
+                    };
+                    let recv_c = format!("_{}", mangle_plain(&recv_name));
+                    let ind = "    ".repeat(self.indent);
+                    return match method.as_str() {
+                        "push" => {
+                            let item_val = self.emit_expr(&args[0])?;
+                            writeln!(self.out, "{}if ({} == NULL) {{ {} = __dgn_list_new(); }}", ind, recv_c, recv_c).unwrap();
+                            let dup = self.fresh();
+                            writeln!(self.out, "{}char* {} = __dgn_lib_strdup({});", ind, dup, item_val).unwrap();
+                            if let Some(ty) = self.owned_temps.remove(&item_val) {
+                                writeln!(self.out, "{}{}((void*){});", ind, free_fn_for(ty), item_val).unwrap();
+                            }
+                            writeln!(self.out, "{}__dgn_list_push({}, {});", ind, recv_c, dup).unwrap();
+                            Ok("0LL".to_string())
+                        }
+                        "pop" => {
+                            let tmp = self.fresh();
+                            writeln!(self.out, "{}char* {} = __dgn_list_pop({});", ind, tmp, recv_c).unwrap();
+                            self.owned_temps.insert(tmp.clone(), NativeType::Str);
+                            Ok(tmp)
+                        }
+                        other => Err(format!("--native --lib: in '{}', unsupported list method '.{}()'", self.fn_name, other)),
+                    };
+                }
                 let name = match &callee.node {
                     ExprNode::Var(n) => n.clone(),
                     _ => return Err(format!("--native --lib: in '{}', only calling a plain function name is supported", self.fn_name)),
@@ -1474,7 +1373,6 @@ impl<'a> NativeTranspiler<'a> {
         }
     }
 
-
     fn to_cstr_expr(&mut self, t: NativeType, val: &str) -> Result<String, String> {
         match t {
             NativeType::Str => Ok(val.to_string()),
@@ -1494,7 +1392,6 @@ impl<'a> NativeTranspiler<'a> {
                 self.owned_temps.insert(tmp.clone(), NativeType::Str);
                 Ok(tmp)
             }
-            // A string literal ("true"/"false") -- never owned, never freed.
             NativeType::Bool => Ok(format!("(({}) ? \"true\" : \"false\")", val)),
             NativeType::StrList => Err(format!(
                 "--native --lib: in '{}', a strlist can't be used directly in string concatenation \
@@ -1574,9 +1471,6 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
         return Err("--native --lib: no top-level functions found to export.".into());
     }
 
-    // Pass 1: resolve every function's parameter types (from explicit
-    // annotations only) and build the initial signature table with return
-    // types still unresolved.
     let mut sigs: std::collections::HashMap<String, LibFnSig> = std::collections::HashMap::new();
     let mut bodies: std::collections::HashMap<String, Stmt> = std::collections::HashMap::new();
     for (name, params, body) in &fns {
@@ -1601,12 +1495,10 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
             ))?;
             resolved_params.push((pname, pty));
         }
-        sigs.insert(name.clone(), LibFnSig { params: resolved_params, ret: NativeType::Int /* placeholder */ });
+        sigs.insert(name.clone(), LibFnSig { params: resolved_params, ret: NativeType::Int });
         bodies.insert(name.clone(), body.clone());
     }
 
-    // Pass 2: fixpoint over return types (functions may call each other,
-    // including recursively).
     let mut resolved_ret: std::collections::HashMap<String, Option<NativeType>> =
         sigs.keys().map(|k| (k.clone(), None)).collect();
     let mut progressed = true;
@@ -1636,8 +1528,6 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
                     return Err(format!("--native --lib: function '{}' has no 'return' statement -- every exported function must return a value", name));
                 }
                 Err(e) => {
-                    // Might just be waiting on another not-yet-resolved
-                    // function; remember the error and retry next round.
                     last_errors.insert(name.clone(), e);
                 }
             }
@@ -1650,7 +1540,6 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
         });
         return Err(msg);
     }
-
 
     let mut out = String::new();
     out.push_str("#include <stdint.h>\n");
@@ -1704,8 +1593,6 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
             scope.vars.insert(pname.clone(), *pty);
             param_names_in_fn.insert(pname.clone());
         }
-        // Real Dragon scoping: a parameter shadows a same-named global.
-        // Only alias globals this function doesn't already bind locally.
         let shadowed_globals: Vec<&(String, NativeType, String)> =
             globals.iter().filter(|(gname, _, _)| !param_names_in_fn.contains(gname)).collect();
         for (gname, gty, _) in &shadowed_globals {
@@ -1720,10 +1607,6 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
                 gty.c_type(), mangle_plain(gname), mangle_plain(gname), mangle_plain(gname), mangle_plain(gname)
             ));
             if is_freeable(*gty) {
-                // Alias the flag too, the same way, so every function that
-                // touches this global reads/writes the one persistent
-                // ownership flag rather than getting its own local that
-                // forgets everything between calls.
                 let mn = mangle_plain(gname);
                 out.push_str(&format!(
                     "    int* const __{}_owned_ptr = &_g_{}_owned;\n#define _{}_owned (*__{}_owned_ptr)\n",
@@ -1759,7 +1642,6 @@ pub(crate) fn transpile_native_lib(ast: &Stmt) -> Result<String, String> {
     Ok(out)
 }
 
-
 pub(crate) fn generate_native_lib_header(ast: &Stmt, lib_name: &str) -> Result<String, String> {
     let globals = collect_lib_globals(ast)?;
     let fns = collect_lib_fns(ast);
@@ -1783,11 +1665,6 @@ pub(crate) fn generate_native_lib_header(ast: &Stmt, lib_name: &str) -> Result<S
         progressed = false;
         let names: Vec<String> = sigs.keys().cloned().collect();
         for name in &names {
-            // See the matching comment in transpile_native_lib's Pass 2 --
-            // not skipping already-resolved names is what fixes a real
-            // ordering bug where a function's inference could silently
-            // succeed against another function's still-placeholder Int
-            // return type instead of its real one.
             let mut scope = TypeScope { vars: std::collections::HashMap::new() };
             for (pname, pty) in &sigs[name].params { scope.vars.insert(pname.clone(), *pty); }
             for (gname, gty, _) in &globals { scope.vars.entry(gname.clone()).or_insert(*gty); }
@@ -1842,7 +1719,6 @@ pub(crate) fn generate_native_lib_header(ast: &Stmt, lib_name: &str) -> Result<S
     Ok(out)
 }
 
-
 fn jni_type(t: NativeType) -> Option<&'static str> {
     match t {
         NativeType::Int => Some("jlong"),
@@ -1877,8 +1753,6 @@ fn jni_symbol_name(package: &str, class: &str, method: &str) -> String {
     )
 }
 
-/// Generates one `Java_<package>_<class>_<name>` wrapper per top-level
-/// exported function. Requires the caller to `#include <jni.h>` first.
 pub(crate) fn generate_jni_wrappers(ast: &Stmt, package: &str, class: &str) -> Result<String, String> {
     let globals = collect_lib_globals(ast)?;
     let fns = collect_lib_fns(ast);

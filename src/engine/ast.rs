@@ -48,7 +48,7 @@ pub enum ExprNode {
     FuncExpr(Vec<(String, Option<String>)>, usize, Box<Stmt>),
     New(Box<Expr>, Vec<Expr>),
     Super(String, Vec<Expr>),
-    Await(Box<Expr>), // ADD THIS
+    Await(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -73,4 +73,3 @@ pub enum StmtNode {
     Import(String, Option<String>),
     ConstDecl(String, Expr),
 }
-

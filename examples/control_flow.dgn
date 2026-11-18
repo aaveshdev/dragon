@@ -1,9 +1,3 @@
-// ─────────────────────────────────────────────────────────────
-// control_flow.dgn
-// if/elif/else, while, do-while, for-in, switch/case, break/continue
-// Run with:  dragon control_flow.dgn
-// ─────────────────────────────────────────────────────────────
-
 import math
 
 func classify(n) {
@@ -19,12 +13,10 @@ func classify(n) {
 }
 
 func main() {
-    // ── if / elif / else ──────────────────────────────────
     for n in [-3, 0, 4, 7] {
         showln(`${n} is ${classify(n)}`)
     }
 
-    // ── while loop ─────────────────────────────────────────
     countdown = 5
     while countdown > 0 {
         show(`${countdown} `)
@@ -32,32 +24,28 @@ func main() {
     }
     showln("liftoff!")
 
-    // ── do-while (always runs at least once) ───────────────
     tries = 0
     do {
         tries = tries + 1
         showln(`attempt #${tries}`)
     } while tries < 3
 
-    // ── for-in over a list, with index and value ────────────
     fruits = ["apple", "banana", "cherry"]
     for i, fruit in fruits {
         showln(`${i}: ${fruit}`)
     }
 
-    // ── break / continue ────────────────────────────────────
     for n in math.range(1, 20) {
         if n % 2 != 0 {
-            continue          // skip odd numbers
+            continue
         }
         if n > 10 {
-            break              // stop once we pass 10
+            break
         }
         show(`${n} `)
     }
     showln("")
 
-    // ── switch / case ───────────────────────────────────────
     for day in ["Mon", "Sat", "Sun", "Wed"] {
         switch day {
             case "Sat":
@@ -69,7 +57,6 @@ func main() {
         }
     }
 
-    // ── ternary operator ────────────────────────────────────
     score = 82
     grade = score >= 90 ? "A" : score >= 80 ? "B" : "C"
     showln(`score ${score} -> grade ${grade}`)

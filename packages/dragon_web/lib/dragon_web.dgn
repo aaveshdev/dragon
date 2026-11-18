@@ -1,0 +1,65 @@
+import "json"
+import "dragon/ui" as *
+
+class Web {
+    func idle() { return {tabs: {}, totals: {upgrades: 0}, privateIsolated: False} }
+    func start(everyMs = 400) {
+        if (Web.timer != null) { return }
+        Web.timer = Timer.periodic(Duration(milliseconds: everyMs), func() { Web.refresh() })
+    }
+    func stop_polling() {
+        if (Web.timer != null) { Web.timer.cancel() }
+        Web.timer = null
+    }
+    func refresh() {
+        Platform.invoke("web.state", {}, func(r) {
+            if (r == null) { return }
+            ev = r.events
+            r.remove("events")
+            sig = json.encode(r)
+            if (sig != Web.lastSig) {
+                Web.lastSig = sig
+                Web.state.setValue(r)
+            }
+            if (ev != null and Web.onEvent != null) {
+                for e in ev { Web.onEvent(e) }
+            }
+        })
+    }
+    func configure(options, callback = null) { Platform.invoke("web.config", options, callback) }
+    func open(tab, url, options = null, callback = null) {
+        o = options == null ? {} : options
+        Platform.invoke("web.open", {tab: tab, url: url, private: o.private == True, desktop: o.desktop == True, background: o.background == True}, callback)
+        Web.refresh()
+    }
+    func load(tab, url) { Platform.invoke("web.load", {tab: tab, url: url}); Web.refresh() }
+    func back(tab) { Platform.invoke("web.back", {tab: tab}); Web.refresh() }
+    func forward(tab) { Platform.invoke("web.forward", {tab: tab}); Web.refresh() }
+    func reload(tab) { Platform.invoke("web.reload", {tab: tab}); Web.refresh() }
+    func stop(tab) { Platform.invoke("web.stop", {tab: tab}); Web.refresh() }
+    func close(tab) { Platform.invoke("web.close", {tab: tab}); Web.refresh() }
+    func setDesktop(tab, on) { Platform.invoke("web.desktop", {tab: tab, on: on}); Web.refresh() }
+    func find(tab, text) { Platform.invoke("web.find", {tab: tab, text: text}) }
+    func findNext(tab, forward = True) { Platform.invoke("web.findNext", {tab: tab, forward: forward}) }
+    func findClear(tab) { Platform.invoke("web.findClear", {tab: tab}) }
+    func snapshot(tab, callback) { Platform.invoke("web.snapshot", {tab: tab}, func(r) { callback(r == null ? null : r.path) }) }
+    func favicon(tab, callback) { Platform.invoke("web.favicon", {tab: tab}, func(r) { callback(r == null ? null : r.path) }) }
+    func clearData(options, callback = null) { Platform.invoke("web.clear", options, callback) }
+    func print(tab) { Platform.invoke("web.print", {tab: tab}) }
+    func js(tab, code, callback = null) { Platform.invoke("web.eval", {tab: tab, code: code}, callback) }
+    func zoom(tab, factor) { Platform.invoke("web.zoom", {tab: tab, factor: factor}); Web.refresh() }
+    func devtools(tab) { Platform.invoke("web.devtools", {tab: tab}) }
+    func saveImage(url) { Platform.invoke("web.download", {url: url}) }
+}
+Web.state = Signal(Web.idle())
+Web.timer = null
+Web.lastSig = ""
+Web.onEvent = null
+
+class WebView extends View {
+    func init(tab, key = null) {
+        super.init(key: key)
+        this.tab = tab
+    }
+    func build(context) { return NativeView(kind: "web", id: this.tab, params: {tab: this.tab}) }
+}

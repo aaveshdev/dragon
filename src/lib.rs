@@ -5,6 +5,8 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 
 pub mod engine;
+pub mod ui_host;
+pub mod packages;
 use engine::*;
 use std::panic;
 
@@ -14,7 +16,7 @@ use libc::{Dl_info, dladdr};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 use jni::sys::jstring;
 
 #[macro_use]
@@ -25,20 +27,20 @@ lazy_static! {
     static ref IS_INIT: Mutex<bool> = Mutex::new(false);
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 use jni::{JNIEnv, JavaVM, sys::{jint, JNI_VERSION_1_6}};
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 use jni::objects::{JClass, JObject, JString, JValue, GlobalRef};
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 use std::os::raw::c_void;
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 static mut ANDROID_CALLBACK: Option<GlobalRef> = None;
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 static mut JAVA_VM: Option<JavaVM> = None;
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 fn android_log(msg: &str) {
     use std::ffi::CString;
     use std::os::raw::{c_int, c_char};
@@ -52,7 +54,7 @@ fn android_log(msg: &str) {
 
     let tag = CString::new("DragonNative").unwrap();
     let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("Invalid Log").unwrap());
-    
+
     unsafe {
         __android_log_print(
             ANDROID_LOG_INFO,
@@ -62,10 +64,10 @@ fn android_log(msg: &str) {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 fn get_android_lib_path() -> Option<PathBuf> {
     let mut info: Dl_info = unsafe { std::mem::zeroed() };
-    
+
     unsafe {
         if dladdr(JNI_OnLoad as *const c_void, &mut info) != 0 {
             if !info.dli_fname.is_null() {
@@ -77,7 +79,7 @@ fn get_android_lib_path() -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 #[no_mangle]
 pub extern "system" fn JNI_OnLoad(vm: JavaVM, _: *mut c_void) -> jint {
     let mut env = match vm.get_env() {
@@ -86,7 +88,7 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _: *mut c_void) -> jint {
     };
 
     let class_name = "io/dragon/runtime/DragonBridge";
-    
+
     let bridge_class = match env.find_class(class_name) {
         Ok(c) => c,
         Err(e) => {
@@ -118,7 +120,7 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _: *mut c_void) -> jint {
     JNI_VERSION_1_6
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JObject) {
     let vm = env.get_java_vm().unwrap();
     JAVA_VM = Some(vm);
@@ -132,7 +134,6 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
     }
     populate_builtins(env_arc.clone());
 
-    // 1. EXTRACT THE ABSOLUTE NATIVE LIBRARY DIRECTORY
     let lib_dir_str = if let Some(lib_path) = get_android_lib_path() {
         if let Some(parent) = lib_path.parent() {
             parent.to_string_lossy().to_string()
@@ -144,8 +145,7 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
     };
 
     let mut e = env_arc.lock().unwrap();
-    
-    // 2. EXPOSE THE PATH TO DRAGON AS 'ANDROID_LIB_DIR'
+
     let _ = e.set("ANDROID_LIB_DIR", DgnValue::String(lib_dir_str.clone()));
 
     e.set("showln", native_fn(|args| {
@@ -155,16 +155,15 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
     })).unwrap();
 
     e.set("render_ui", native_fn(|args| {
-        // ... (Keep your existing render_ui code here)
         Ok(DgnValue::Null)
     })).unwrap();
 
     if let Some(lib_path) = get_android_lib_path() {
         android_log(&format!("Checking for embedded bundle in: {:?}", lib_path));
-        
+
         if let Some(payload) = check_for_bundle(&lib_path) {
             android_log("Bundle found! Loading...");
-            
+
             if let Ok(sources) = serde_json::from_str::<HashMap<String, String>>(&payload) {
                 let mut bundle_map = HashMap::new();
                 for (k, v) in &sources {
@@ -173,7 +172,7 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
                 e.store.insert("__bundled_sources__".to_string(), DgnValue::Map(Arc::new(Mutex::new(bundle_map))));
 
                 if let Some(entry_code) = sources.get("__entry__") {
-                    drop(e); 
+                    drop(e);
                     let tokens = match lex(entry_code) {
                         Ok(t) => t,
                         Err(e) => return format!("Syntax Error: {} at line {}, col {}", e.msg, e.line, e.col),
@@ -181,8 +180,7 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
                     let mut parser = Parser::new(tokens);
                     if let Ok(ast) = parser.parse() {
                         let rt = tokio::runtime::Runtime::new().unwrap();
-                        
-                        // 3. PRINT DRAGON RUNTIME ERRORS TO LOGCAT!
+
                         let mut chunk = Chunk::new();
                         Compiler::compile_stmt(&mut chunk, &ast);
                         chunk.emit(Instruction::Halt, 0);
@@ -205,10 +203,9 @@ unsafe extern "C" fn native_init_dragon(mut env: JNIEnv, _: JClass, callback: JO
     *IS_INIT.lock().unwrap() = true;
 }
 
-
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 #[no_mangle]
-#[export_name = "main"] // THIS is the magic line that bypasses the Rust linker
+#[export_name = "main"]
 pub extern "C" fn dragon_android_main(_argc: c_int, _argv: *const *const c_char) -> c_int {
     android_log("SUCCESS: Allegro successfully found and invoked Dragon main()!");
 
@@ -234,7 +231,6 @@ pub extern "C" fn dragon_android_main(_argc: c_int, _argv: *const *const c_char)
         let mut e = env_arc.lock().unwrap();
         let _ = e.set("ANDROID_LIB_DIR", DgnValue::String(lib_dir_str.clone()));
 
-        // Wire up showln to Android Logcat
         let _ = e.set("showln", native_fn(|args| {
             let s = args.iter().map(val_to_string).collect::<Vec<_>>().join(" ");
             android_log(&s);
@@ -244,10 +240,10 @@ pub extern "C" fn dragon_android_main(_argc: c_int, _argv: *const *const c_char)
 
     if let Some(lib_path) = get_android_lib_path() {
         android_log(&format!("Checking for embedded bundle in: {:?}", lib_path));
-        
+
         if let Some(payload) = check_for_bundle(&lib_path) {
             android_log("Bundle found! Loading script...");
-            
+
             if let Ok(sources) = serde_json::from_str::<HashMap<String, String>>(&payload) {
                 let mut bundle_map = HashMap::new();
                 for (k, v) in &sources {
@@ -260,7 +256,7 @@ pub extern "C" fn dragon_android_main(_argc: c_int, _argv: *const *const c_char)
                     let mut parser = Parser::new(tokens);
                     if let Ok(ast) = parser.parse() {
                         let rt = tokio::runtime::Runtime::new().unwrap();
-                        
+
                         let mut chunk = Chunk::new();
                         Compiler::compile_stmt(&mut chunk, &ast);
                         chunk.emit(Instruction::Halt, 0);
@@ -281,14 +277,14 @@ pub extern "C" fn dragon_android_main(_argc: c_int, _argv: *const *const c_char)
     }
 
     *IS_INIT.lock().unwrap() = true;
-    
-    0 // Return 0 so Allegro knows we exited cleanly
+
+    0
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 unsafe extern "C" fn native_run_script(mut env: JNIEnv, _: JClass, bundle_jstr: JString) -> jstring {
     let bundle_b64: String = env.get_string(&bundle_jstr).unwrap().into();
-    
+
     use base64::{Engine as _, engine::general_purpose};
     let mut payload_bytes = match general_purpose::STANDARD.decode(&bundle_b64) {
         Ok(b) => b,
@@ -321,7 +317,7 @@ unsafe extern "C" fn native_run_script(mut env: JNIEnv, _: JClass, bundle_jstr: 
     env.new_string("Executed").unwrap().into_raw()
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "legacy_android"))]
 unsafe extern "C" fn native_trigger_event(mut env: JNIEnv, _: JClass, evt_jstr: JString) {
     let evt: String = env.get_string(&evt_jstr).unwrap().into();
     let env_lock = GLOBAL_ENV.clone();
@@ -343,7 +339,7 @@ pub fn dragon_run_wasm(encoded_payload: &str) -> String {
         Err(e) => return format!("Loader Error: Invalid Data Encoding: {}", e),
     };
 
-    let key = engine::get_key(); 
+    let key = engine::get_key();
     for (i, b) in payload_bytes.iter_mut().enumerate() {
         *b ^= key[i % key.len()];
     }
@@ -356,21 +352,21 @@ pub fn dragon_run_wasm(encoded_payload: &str) -> String {
     let sources: HashMap<String, String> = match serde_json::from_str(&json_str) {
         Ok(map) => map,
         Err(_) => {
-            let mut m = HashMap::new(); 
-            m.insert("__entry__".to_string(), json_str); 
+            let mut m = HashMap::new();
+            m.insert("__entry__".to_string(), json_str);
             m
         }
     };
 
     let env = Arc::new(Mutex::new(Env::new(None, None)));
-    
+
     env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
     populate_builtins(env.clone());
 
     let mut bundle_map = HashMap::new();
     for (k, v) in &sources {
-        if k != "__entry__" { 
-            bundle_map.insert(k.clone(), DgnValue::String(v.clone())); 
+        if k != "__entry__" {
+            bundle_map.insert(k.clone(), DgnValue::String(v.clone()));
         }
     }
     env.lock().unwrap().store.insert("__bundled_sources__".to_string(), DgnValue::Map(Arc::new(Mutex::new(bundle_map))));
@@ -378,7 +374,7 @@ pub fn dragon_run_wasm(encoded_payload: &str) -> String {
     if let Some(entry_code) = sources.get("__entry__") {
         let tokens = lex(entry_code);
         let mut parser = Parser::new(tokens);
-        
+
         match parser.parse() {
             Ok(ast) => {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -406,7 +402,6 @@ pub fn dragon_run_wasm(encoded_payload: &str) -> String {
 pub fn dragon_run_source(source_code: &str) -> String {
     console_error_panic_hook::set_once();
 
-    // Shared output buffer that showln writes into
     let output_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let env = Arc::new(Mutex::new(Env::new(None, None)));
@@ -416,7 +411,6 @@ pub fn dragon_run_source(source_code: &str) -> String {
     );
     populate_builtins(env.clone());
 
-    // Override showln to capture output
     let buf_clone = output_buf.clone();
     env.lock().unwrap().set("showln", native_fn(move |args| {
         let s = args.iter().map(val_to_string).collect::<Vec<_>>().join(" ");
@@ -424,7 +418,6 @@ pub fn dragon_run_source(source_code: &str) -> String {
         Ok(DgnValue::Null)
     })).unwrap();
 
-    // Override show (no newline variant)
     let buf_clone2 = output_buf.clone();
     env.lock().unwrap().set("show", native_fn(move |args| {
         let s = args.iter().map(val_to_string).collect::<Vec<_>>().join(" ");
@@ -500,7 +493,7 @@ fn get_dll_path() -> Option<PathBuf> {
             }
         }
     }
-    None 
+    None
 }
 
 fn dgn_to_json_str(v: &DgnValue) -> String {
@@ -524,9 +517,9 @@ fn dgn_to_json_str(v: &DgnValue) -> String {
 
 #[no_mangle]
 pub extern "C" fn Dragon_Init() -> c_int {
-    let path = match get_dll_path() { 
-        Some(p) => p, 
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")) 
+    let path = match get_dll_path() {
+        Some(p) => p,
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
 
     let env = GLOBAL_ENV.clone();
@@ -547,15 +540,15 @@ pub extern "C" fn Dragon_Init() -> c_int {
         } else if let Ok(content) = std::fs::read_to_string("mylib.dgn") {
             payload = Some(content);
         } else {
-            return -2; 
+            return -2;
         }
     }
 
     let payload_str = payload.unwrap();
 
     let sources: HashMap<String, String> = serde_json::from_str(&payload_str).unwrap_or_else(|_| {
-        let mut m = HashMap::new(); 
-        m.insert("__entry__".to_string(), payload_str); 
+        let mut m = HashMap::new();
+        m.insert("__entry__".to_string(), payload_str);
         m
     });
 
@@ -569,24 +562,22 @@ pub extern "C" fn Dragon_Init() -> c_int {
         let tokens = match lex(entry_code) {
             Ok(t) => t,
             Err(e) => {
-                // Print the error so the developer can see what went wrong
                 eprintln!("Syntax Error: {}", e.with_source(entry_code).format_pretty());
-                // Return -1 to the C caller to indicate failure
                 return -1;
             }
         };
         let mut parser = Parser::new(tokens);
         if let Ok(ast) = parser.parse() {
-            let rt = tokio::runtime::Runtime::new().unwrap(); 
+            let rt = tokio::runtime::Runtime::new().unwrap();
             let mut chunk = Chunk::new();
             Compiler::compile_stmt(&mut chunk, &ast);
             chunk.emit(Instruction::Halt, 0);
-            
+
             if rt.block_on(async {
                 let mut vm = Vm::new();
                 vm.run(&chunk, env.clone()).await
-            }).is_err() { 
-                return -3; 
+            }).is_err() {
+                return -3;
             }
         } else { return -4; }
     }
@@ -600,13 +591,13 @@ pub extern "C" fn Dragon_Call(func_name: *const c_char, json_args: *const c_char
     if func_name.is_null() {
         return CString::new("Error: func_name is a null pointer").unwrap().into_raw();
     }
-    
-    if !*IS_INIT.lock().unwrap() { 
-        return CString::new("Error: Not Initialized (Dragon_Init failed)").unwrap().into_raw(); 
+
+    if !*IS_INIT.lock().unwrap() {
+        return CString::new("Error: Not Initialized (Dragon_Init failed)").unwrap().into_raw();
     }
 
     let name = unsafe { CStr::from_ptr(func_name).to_str().unwrap_or("") };
-    
+
     let args_str = if json_args.is_null() {
         "[]"
     } else {
@@ -653,8 +644,8 @@ pub extern "C" fn Dragon_Call(func_name: *const c_char, json_args: *const c_char
     let func = env.lock().unwrap().get(name);
 
     if let Some(f) = func {
-       let rt = tokio::runtime::Runtime::new().unwrap(); 
-        match rt.block_on(call_dgn_func(f, dgn_args)) {  
+       let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(call_dgn_func(f, dgn_args)) {
             Ok(res) => CString::new(dgn_to_json_str(&res)).unwrap().into_raw(),
             Err(e) => CString::new(format!("{{\"error\": \"{}\"}}", e.msg)).unwrap().into_raw(),
         }

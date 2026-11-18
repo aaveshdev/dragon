@@ -1,0 +1,53 @@
+class Animal {
+    func init(name, sound) {
+        this.name = name
+        this.sound = sound
+    }
+
+    func speak() {
+        return `${this.name} says ${this.sound}`
+    }
+
+    func describe() {
+        return `I am ${this.name}, an animal.`
+    }
+}
+
+class Dog extends Animal {
+    func init(name) {
+        super.init(name, "Woof")
+        this.tricks = []
+    }
+
+    func learn_trick(trick) {
+        this.tricks.push(trick)
+    }
+
+    func describe() {
+        return `I am ${this.name}, a good dog who knows ${len(this.tricks)} trick(s).`
+    }
+}
+
+class Cat extends Animal {
+    func init(name) {
+        super.init(name, "Meow")
+    }
+}
+
+func main() {
+    animals = [new Dog("Rex"), new Cat("Whiskers"), new Animal("Generic Beast", "...")]
+
+    rex = animals[0]
+    rex.learn_trick("sit")
+    rex.learn_trick("roll over")
+
+    for a in animals {
+        showln(a.speak())
+        showln(`  ${a.describe()}`)
+    }
+
+    showln("")
+    showln(`typeof rex: ${typeof(rex)}`)
+}
+
+main()

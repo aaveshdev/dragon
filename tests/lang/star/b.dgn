@@ -1,0 +1,2 @@
+import "a" as *
+func bf(x) { return af(x) * 2 }

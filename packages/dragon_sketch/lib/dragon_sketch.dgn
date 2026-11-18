@@ -1,0 +1,130 @@
+import "json"
+import "dragon/ui" as *
+import "sketch_png" as *
+
+func sketchParse(value) {
+    out = {strokes: [], width: 0, height: 0}
+    if (value == null or value == "") { return out }
+    d = null
+    try { d = json.decode(value) } catch (err) { return out }
+    if (d == null or d.data == null) { return out }
+    if (typeof(d.data) == "list") {
+        out.strokes = d.data
+    } else {
+        if (d.data.strokes != null) { out.strokes = d.data.strokes }
+        if (d.data.width != null) { out.width = d.data.width }
+        if (d.data.height != null) { out.height = d.data.height }
+    }
+    return out
+}
+
+func sketchEncode(strokes, width, height, image = null) {
+    return json.encode({data: {width: width, height: height, strokes: strokes}, image: image, path: null})
+}
+
+func sketchWithImage(value, outW = 640, lineW = 3) {
+    s = sketchParse(value)
+    if (len(s.strokes) == 0) { return "" }
+    w = s.width
+    h = s.height
+    if (w < 1 or h < 1) {
+
+        w = 1
+        h = 1
+        for st in s.strokes {
+            for pt in st {
+                if (pt[0] > w) { w = pt[0] }
+                if (pt[1] > h) { h = pt[1] }
+            }
+        }
+        w = w + 4
+        h = h + 4
+    }
+    png = sketchPngBase64(s.strokes, w, h, outW, lineW)
+    return sketchEncode(s.strokes, w, h, "data:image/png;base64," + png)
+}
+
+class SketchPad extends LiveView {
+    func init(value, onChange, height = 220, margin = 64, penWidth = 2.5, hint = "Draw here", key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.height = height
+        this.margin = margin
+        this.penWidth = penWidth
+        this.hint = hint
+    }
+    func createState() { return SketchPadState() }
+}
+
+class SketchPadState extends Live {
+    func onInit() {
+        this.strokes = sketchParse(this.widget.value).strokes
+        this.w = 0
+    }
+    func emit() {
+        if (len(this.strokes) == 0) { this.widget.onChange(""); return }
+        this.widget.onChange(sketchEncode(this.strokes, this.w, this.widget.height))
+    }
+    func undo() {
+        if (len(this.strokes) == 0) { return }
+        me = this
+        this.update(func() { me.strokes.pop() })
+        this.emit()
+    }
+    func clear() {
+        me = this
+        this.update(func() { me.strokes = [] })
+        this.emit()
+    }
+    func point(o) { return [floor_int(o.dx * 10) / 10, floor_int(o.dy * 10) / 10] }
+    func build(context) {
+        me = this
+        cs = Theme.of(context).colorScheme
+        this.w = floor_int(Display.sizeOf(context).width - this.widget.margin)
+        strokes = this.strokes
+        pen = this.widget.penWidth
+        painter = func(cv, size) {
+            ink = Paint(color: cs.onSurface, style: "stroke", strokeWidth: pen, strokeCap: "round")
+            for s in strokes {
+                if (len(s) < 2) { continue }
+                p = Path()
+                p.moveTo(s[0][0], s[0][1])
+                i = 1
+                while (i < len(s)) {
+                    p.lineTo(s[i][0], s[i][1])
+                    i = i + 1
+                }
+                cv.drawPath(p, ink)
+            }
+        }
+        empty = len(strokes) == 0
+        pad = Touch(
+
+            onPanStart: func(o) { me.update(func() { me.strokes.push([]) }) },
+            onPanUpdate: func(o) {
+                if (len(me.strokes) == 0) { return }
+                me.update(func() { me.strokes[len(me.strokes) - 1].push(me.point(o)) })
+            },
+            onPanEnd: func() {
+                me.update(func() {
+                    kept = []
+                    for st in me.strokes { if (len(st) > 1) { kept.push(st) } }
+                    me.strokes = kept
+                })
+                me.emit()
+            },
+            child: Box(height: this.widget.height, width: this.w, decoration: Look(color: cs.surface, borderRadius: Corners.circular(10),
+                    border: Border.all(color: cs.outline, width: 1)),
+                child: Drawing(painter: painter, size: Size(width: this.w, height: this.widget.height),
+                    child: empty ? Center(child: Text(this.widget.hint, style: Font(fontSize: 13, color: cs.onSurfaceVariant))) : null)))
+        return Col(cross: "stretch", children: [
+            pad,
+            Space(height: 6),
+            Row(main: "end", children: [
+                FlatButton(onTap: func() { me.undo() }, child: Text("Undo")),
+                FlatButton(onTap: func() { me.clear() }, child: Text("Clear"))
+            ])
+        ])
+    }
+}

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>__ASSEMBLY__</AssemblyName>
+    <RootNamespace>DragonRuntime</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RollForward>Major</RollForward>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <PlatformTarget>x64</PlatformTarget>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Resources/Fonts/MaterialIcons-Regular.ttf" Link="Fonts/MaterialIcons-Regular.ttf" />
+    <None Include="Native/dragon_lib.dll" Link="dragon_lib.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('Native/dragon_lib.dll')" />
+    <None Include="Resources/assets/**/*" Link="assets/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+__EXTRA__
+  </ItemGroup>
+</Project>

@@ -1,0 +1,8 @@
+{
+  "name": "ember",
+  "package": "com.example.ember",
+  "platforms": ["windows"],
+  "runtime": "app",
+  "main": "lib/main.dgn",
+  "windows": { "title": "Ember", "width": 1280, "height": 820 }
+}

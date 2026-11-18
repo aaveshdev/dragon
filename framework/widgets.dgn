@@ -1,0 +1,1369 @@
+import "dragon/core" as *
+import "dragon/runtime" as *
+
+func u_dim(v) {
+    if (v == null) { return null }
+    return v
+}
+
+class TextDefaults extends Provider {
+    func init(style, child = null, textAlign = null, maxLines = null, overflow = null, key = null) {
+        super.init(child: child, key: key)
+        this.style = style
+        this.textAlign = textAlign
+        this.maxLines = maxLines
+        this.overflow = overflow
+    }
+    func of(context) {
+        d = context.findInherited("TextDefaults")
+        if (d == null) { return Font() }
+        return d.style
+    }
+}
+
+class Text extends RenderWidget {
+    func init(data, style = null, textAlign = null, maxLines = null, overflow = null, softWrap = null,
+              textScaleFactor = null, semanticsLabel = null, key = null,
+              color = null, size = null, weight = null, bold = False, italic = False, align = null) {
+        super.init(key: key)
+        this.data = data
+        if (color != null or size != null or weight != null or bold or italic) {
+            flat = Font(color: color, fontSize: size, fontWeight: bold ? 700 : weight, fontStyle: italic ? "italic" : null)
+            style = style == null ? flat : style.merge(flat)
+        }
+        if (textAlign == null) { textAlign = align }
+        this.style = style
+        this.textAlign = textAlign
+        this.maxLines = maxLines
+        this.overflow = overflow
+        this.softWrap = softWrap
+        this.textScaleFactor = textScaleFactor
+    }
+    func rich(textSpan, style = null, textAlign = null, maxLines = null, overflow = null, key = null) {
+        return RichText(text: textSpan, style: style, textAlign: textAlign, maxLines: maxLines, overflow: overflow, key: key)
+    }
+    func toNode(context) {
+        dts = context.findInherited("TextDefaults")
+        st = this.style
+        al = this.textAlign
+        ml = this.maxLines
+        ov = this.overflow
+        if (dts != null) {
+            st = dts.style.merge(this.style)
+            if (al == null) { al = dts.textAlign }
+            if (ml == null) { ml = dts.maxLines }
+            if (ov == null) { ov = dts.overflow }
+        }
+        return {
+            type: "text",
+            text: this.data == null ? "" : str(this.data),
+            style: u_style(st),
+            align: al,
+            maxLines: ml,
+            overflow: ov,
+            softWrap: this.softWrap,
+            scale: this.textScaleFactor
+        }
+    }
+}
+
+class RichText extends RenderWidget {
+    func init(text, style = null, textAlign = null, maxLines = null, overflow = null, key = null) {
+        super.init(key: key)
+        this.text = text
+        this.style = style
+        this.textAlign = textAlign
+        this.maxLines = maxLines
+        this.overflow = overflow
+    }
+    func flatten(span, inherited, context, out) {
+        st = inherited
+        if (span.style != null) { st = inherited == null ? span.style : inherited.merge(span.style) }
+        if (span.text != null) {
+            piece = {text: span.text, style: u_style(st)}
+            if (span.onTap != null) { piece.onTap = context.on(span.onTap, "void") }
+            out.push(piece)
+        }
+        if (span.children != null) {
+            for sub in span.children { this.flatten(sub, st, context, out) }
+        }
+    }
+    func toNode(context) {
+        dts = context.findInherited("TextDefaults")
+        base = dts == null ? null : dts.style
+        spans = []
+        this.flatten(this.text, base, context, spans)
+        return {
+            type: "richText",
+            spans: spans,
+            style: u_style(this.style),
+            align: this.textAlign,
+            maxLines: this.maxLines,
+            overflow: this.overflow
+        }
+    }
+}
+
+class SelectableText extends Text {
+    func init(data, style = null, textAlign = null, maxLines = null, key = null) {
+        super.init(data, style: style, textAlign: textAlign, maxLines: maxLines, key: key)
+    }
+}
+
+class Icon extends RenderWidget {
+    func init(icon, size = null, color = null, semanticLabel = null, key = null) {
+        super.init(key: key)
+        this.icon = icon
+        this.size = size
+        this.color = color
+    }
+    func toNode(context) {
+        return {type: "icon", name: this.icon, size: this.size, color: u_color(this.color)}
+    }
+}
+
+class Picture extends RenderWidget {
+    func init(image = null, width = null, height = null, fit = null, color = null, alignment = null,
+              errorBuilder = null, opacity = null, key = null) {
+        super.init(key: key)
+        this.image = image
+        this.width = width
+        this.height = height
+        this.fit = fit
+        this.color = color
+        this.alignment = alignment
+        this.errorBuilder = errorBuilder
+    }
+    func network(src, width = null, height = null, fit = null, color = null, alignment = null, errorBuilder = null, key = null) {
+        return Picture(image: UrlImage(src), width: width, height: height, fit: fit, color: color,
+                     alignment: alignment, errorBuilder: errorBuilder, key: key)
+    }
+    func asset(name, width = null, height = null, fit = null, color = null, alignment = null, errorBuilder = null, key = null) {
+        return Picture(image: AssetImage(name), width: width, height: height, fit: fit, color: color,
+                     alignment: alignment, errorBuilder: errorBuilder, key: key)
+    }
+    func file(path, width = null, height = null, fit = null, color = null, alignment = null, errorBuilder = null, key = null) {
+        return Picture(image: FileImage(path), width: width, height: height, fit: fit, color: color,
+                     alignment: alignment, errorBuilder: errorBuilder, key: key)
+    }
+    func toNode(context) {
+        return {
+            type: "image",
+            src: this.image.src,
+            kind: this.image.kind,
+            width: u_dim(this.width),
+            height: u_dim(this.height),
+            fit: this.fit,
+            color: u_color(this.color),
+            alignment: u_align(this.alignment),
+            error: this.errorBuilder == null ? null : context.build(this.errorBuilder(context, "error"), "err")
+        }
+    }
+}
+
+class NativeView extends RenderWidget {
+    func init(kind, id = "", params = null, key = null) {
+        super.init(key: key)
+        this.kind = kind
+        this.id = id
+        this.params = params == null ? {} : params
+    }
+    func toNode(context) { return {type: "nativeview", kind: this.kind, id: this.id, params: this.params} }
+}
+
+class Box extends RenderWidget {
+    func init(child = null, width = null, height = null, padding = null, margin = null, color = null,
+              decoration = null, alignment = null, constraints = null, transform = null, clipBehavior = null,
+              key = null) {
+        super.init(key: key)
+        this.child = child
+        this.width = width
+        this.height = height
+        this.padding = padding
+        this.margin = margin
+        this.color = color
+        this.decoration = decoration
+        this.alignment = alignment
+        this.constraints = constraints
+        this.clipBehavior = clipBehavior
+    }
+
+    func baseNode(context) {
+        dec = this.decoration
+        node = {
+            type: "container",
+            width: u_dim(this.width),
+            height: u_dim(this.height),
+            padding: u_ins(this.padding),
+            margin: u_ins(this.margin),
+            alignment: u_align(this.alignment),
+            color: u_color(this.color)
+        }
+        if (this.constraints != null) {
+            cn = this.constraints
+            if (cn.minWidth > 0) { node.minWidth = cn.minWidth }
+            if (cn.maxWidth < INFINITY) { node.maxWidth = cn.maxWidth }
+            if (cn.minHeight > 0) { node.minHeight = cn.minHeight }
+            if (cn.maxHeight < INFINITY) { node.maxHeight = cn.maxHeight }
+            if (cn.minWidth >= INFINITY) { node.width = INFINITY }
+            if (cn.minHeight >= INFINITY) { node.height = INFINITY }
+        }
+        if (dec != null) {
+            if (dec.color != null) { node.color = u_color(dec.color) }
+            node.gradient = u_gradient(dec.gradient)
+            node.radius = u_radius(dec.borderRadius)
+            if (dec.border != null) { node.border = dec.border.toJson() }
+            node.shadows = u_shadows(dec.boxShadow)
+            if (dec.shape == "circle") { node.shape = "circle" }
+            if (dec.image != null) {
+                node.bgImage = {src: dec.image.image.src, kind: dec.image.image.kind, fit: dec.image.fit}
+            }
+        }
+        if (this.clipBehavior != null and this.clipBehavior != "none") { node.clip = True }
+        node.child = context.build(this.child, 0)
+        return node
+    }
+
+    func toNode(context) { return this.baseNode(context) }
+}
+
+class Frame extends RenderWidget {
+    func init(decoration, child = null, key = null) {
+        super.init(key: key)
+        this.decoration = decoration
+        this.child = child
+    }
+    func toNode(context) {
+        return Box(child: this.child, decoration: this.decoration).baseNode(context)
+    }
+}
+
+class Tint extends RenderWidget {
+    func init(color, child = null, key = null) {
+        super.init(key: key)
+        this.color = color
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "container", color: u_color(this.color), child: context.build(this.child, 0)}
+    }
+}
+
+class Pad extends RenderWidget {
+    func init(padding, child = null, key = null) {
+        super.init(key: key)
+        this.padding = padding
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "padding", padding: u_ins(this.padding), child: context.build(this.child, 0)}
+    }
+}
+
+class Place extends RenderWidget {
+    func init(alignment = null, child = null, widthFactor = null, heightFactor = null, key = null) {
+        super.init(key: key)
+        this.alignment = alignment == null ? Alignment.center : alignment
+        this.child = child
+        this.widthFactor = widthFactor
+        this.heightFactor = heightFactor
+    }
+    func toNode(context) {
+        return {
+            type: "align", alignment: u_align(this.alignment),
+            widthFactor: this.widthFactor, heightFactor: this.heightFactor,
+            child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Center extends Place {
+    func init(child = null, widthFactor = null, heightFactor = null, key = null) {
+        super.init(alignment: Alignment.center, child: child, widthFactor: widthFactor, heightFactor: heightFactor, key: key)
+    }
+}
+
+class Space extends RenderWidget {
+    func init(width = null, height = null, child = null, key = null) {
+        super.init(key: key)
+        this.width = width
+        this.height = height
+        this.child = child
+    }
+    func shrink() { return Space(width: 0, height: 0) }
+    func expand(child = null) { return Space(width: INFINITY, height: INFINITY, child: child) }
+    func square(dimension = null, child = null) { return Space(width: dimension, height: dimension, child: child) }
+    func fromSize(size, child = null) { return Space(width: size.width, height: size.height, child: child) }
+    func toNode(context) {
+        return {type: "sizedBox", width: u_dim(this.width), height: u_dim(this.height), child: context.build(this.child, 0)}
+    }
+}
+
+class Limit extends RenderWidget {
+    func init(constraints, child = null, key = null) {
+        super.init(key: key)
+        this.constraints = constraints
+        this.child = child
+    }
+    func toNode(context) {
+        cn = this.constraints
+        node = {type: "constrained", child: context.build(this.child, 0)}
+        if (cn.minWidth > 0) { node.minWidth = cn.minWidth }
+        if (cn.maxWidth < INFINITY) { node.maxWidth = cn.maxWidth }
+        if (cn.minHeight > 0) { node.minHeight = cn.minHeight }
+        if (cn.maxHeight < INFINITY) { node.maxHeight = cn.maxHeight }
+        return node
+    }
+}
+
+class LimitMax extends Limit {
+    func init(maxWidth = INFINITY, maxHeight = INFINITY, child = null, key = null) {
+        super.init(Limits(maxWidth: maxWidth, maxHeight: maxHeight), child: child, key: key)
+    }
+}
+
+class Free extends RenderWidget {
+    func init(child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func toNode(context) { return context.build(this.child, 0) }
+}
+
+class Portion extends RenderWidget {
+    func init(widthFactor = null, heightFactor = null, alignment = null, child = null, key = null) {
+        super.init(key: key)
+        this.widthFactor = widthFactor
+        this.heightFactor = heightFactor
+        this.alignment = alignment == null ? Alignment.center : alignment
+        this.child = child
+    }
+    func toNode(context) {
+        return {
+            type: "fractional", widthFactor: this.widthFactor, heightFactor: this.heightFactor,
+            alignment: u_align(this.alignment), child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Ratio extends RenderWidget {
+    func init(aspectRatio, child = null, key = null) {
+        super.init(key: key)
+        this.aspectRatio = aspectRatio
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "aspectRatio", ratio: this.aspectRatio, child: context.build(this.child, 0)}
+    }
+}
+
+class Scaled extends RenderWidget {
+    func init(fit = "contain", alignment = null, child = null, key = null) {
+        super.init(key: key)
+        this.fit = fit
+        this.child = child
+    }
+    func toNode(context) { return context.build(this.child, 0) }
+}
+
+class Fade extends RenderWidget {
+    func init(opacity, child = null, key = null) {
+        super.init(key: key)
+        this.opacity = opacity
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "opacity", opacity: this.opacity, child: context.build(this.child, 0)}
+    }
+}
+
+class Show extends RenderWidget {
+    func init(visible = True, child = null, replacement = null, maintainState = False, maintainSize = False, key = null) {
+        super.init(key: key)
+        this.visible = visible
+        this.child = child
+        this.replacement = replacement
+        this.maintainSize = maintainSize
+    }
+    func toNode(context) {
+        if (this.visible) { return context.build(this.child, 0) }
+        if (this.maintainSize) {
+            return {type: "visibility", visible: False, child: context.build(this.child, 0)}
+        }
+        return context.build(this.replacement, 1)
+    }
+}
+
+class Hidden extends RenderWidget {
+    func init(offstage = True, child = null, key = null) {
+        super.init(key: key)
+        this.offstage = offstage
+        this.child = child
+    }
+    func toNode(context) {
+        if (this.offstage) { return null }
+        return context.build(this.child, 0)
+    }
+}
+
+class NoTouch extends RenderWidget {
+    func init(ignoring = True, child = null, key = null) {
+        super.init(key: key)
+        this.ignoring = ignoring
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "ignorePointer", ignoring: this.ignoring, child: context.build(this.child, 0)}
+    }
+}
+class BlockTouch extends NoTouch {
+    func init(absorbing = True, child = null, key = null) {
+        super.init(ignoring: absorbing, child: child, key: key)
+    }
+}
+
+class Round extends RenderWidget {
+    func init(borderRadius = null, child = null, key = null) {
+        super.init(key: key)
+        this.borderRadius = borderRadius == null ? Corners.zero : borderRadius
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "clip", shape: "rrect", radius: u_radius(this.borderRadius), child: context.build(this.child, 0)}
+    }
+}
+class Oval extends RenderWidget {
+    func init(child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "clip", shape: "oval", child: context.build(this.child, 0)}
+    }
+}
+class Cut extends RenderWidget {
+    func init(child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "clip", shape: "rect", child: context.build(this.child, 0)}
+    }
+}
+
+class Transform extends RenderWidget {
+    func init(child = null, angle = null, scale = null, scaleX = null, scaleY = null, dx = null, dy = null,
+              alignment = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.angle = angle
+        this.scale = scale
+        this.scaleX = scaleX
+        this.scaleY = scaleY
+        this.dx = dx
+        this.dy = dy
+        this.alignment = alignment
+    }
+    func rotate(angle, child = null, alignment = null, key = null) {
+        return Transform(angle: angle, child: child, alignment: alignment, key: key)
+    }
+    func scale(scale, child = null, alignment = null, key = null) {
+        return Transform(scale: scale, child: child, alignment: alignment, key: key)
+    }
+    func translate(offset, child = null, key = null) {
+        return Transform(dx: offset.dx, dy: offset.dy, child: child, key: key)
+    }
+    func toNode(context) {
+        return {
+            type: "transform", rotate: this.angle, scale: this.scale, scaleX: this.scaleX, scaleY: this.scaleY,
+            dx: this.dx, dy: this.dy, alignment: u_align(this.alignment), child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Turn extends RenderWidget {
+    func init(quarterTurns, child = null, key = null) {
+        super.init(key: key)
+        this.quarterTurns = quarterTurns
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "transform", rotate: this.quarterTurns * 1.5707963267948966, child: context.build(this.child, 0)}
+    }
+}
+
+class Safe extends RenderWidget {
+    func init(child = null, top = True, bottom = True, left = True, right = True, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.top = top
+        this.bottom = bottom
+        this.left = left
+        this.right = right
+    }
+    func toNode(context) {
+        return {
+            type: "safeArea", top: this.top, bottom: this.bottom, left: this.left, right: this.right,
+            child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Hero extends RenderWidget {
+    func init(tag = null, child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func toNode(context) { return context.build(this.child, 0) }
+}
+class Hint extends RenderWidget {
+    func init(message = "", child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func toNode(context) { return context.build(this.child, 0) }
+}
+class Label extends RenderWidget {
+    func init(label = null, child = null, key = null) {
+        super.init(key: key)
+        this.child = child
+    }
+    func toNode(context) { return context.build(this.child, 0) }
+}
+class NoLabel extends Label {
+    func init(child = null, key = null) {
+        super.init(child: child, key: key)
+    }
+}
+class Isolate extends Label {
+    func init(child = null, key = null) {
+        super.init(child: child, key: key)
+    }
+}
+
+class Placeholder extends RenderWidget {
+    func init(color = null, width = null, height = null, key = null) {
+        super.init(key: key)
+        this.color = color
+        this.width = width
+        this.height = height
+    }
+    func toNode(context) {
+        return {
+            type: "container", width: this.width, height: this.height == null ? 100 : this.height,
+            border: {color: "#FF455A64", width: 1.0}, alignment: {x: 0, y: 0},
+            child: {type: "icon", name: "close", color: "#FF455A64"}
+        }
+    }
+}
+
+class FlexBox extends RenderWidget {
+    func init(direction, children = null, main = "start", cross = "center",
+              mainSize = "max", gap = null, verticalDirection = null, key = null) {
+        super.init(key: key)
+        this.direction = direction
+        this.children = children == null ? [] : children
+        this.main = main
+        this.cross = cross
+        this.mainSize = mainSize
+        this.gap = gap
+        this.verticalDirection = verticalDirection
+    }
+    func toNode(context) {
+        kids = context.buildAll(this.children)
+        if (this.verticalDirection == "up") { kids.reverse() }
+        return {
+            type: "flex", dir: this.direction, main: this.main, cross: this.cross,
+            mainSize: this.mainSize, spacing: this.gap, children: kids
+        }
+    }
+}
+
+class Row extends FlexBox {
+    func init(children = null, main = "start", cross = "center",
+              mainSize = "max", gap = null, textDirection = null, key = null) {
+        super.init("horizontal", children: children, main: main,
+                   cross: cross, mainSize: mainSize, gap: gap, key: key)
+    }
+}
+
+class Col extends FlexBox {
+    func init(children = null, main = "start", cross = "center",
+              mainSize = "max", gap = null, verticalDirection = null, key = null) {
+        super.init("vertical", children: children, main: main,
+                   cross: cross, mainSize: mainSize, gap: gap,
+                   verticalDirection: verticalDirection, key: key)
+    }
+}
+
+class Weighted extends RenderWidget {
+    func init(child = null, flex = 1, fit = "loose", key = null) {
+        super.init(key: key)
+        this.child = child
+        this.flex = flex
+        this.fit = fit
+    }
+    func toNode(context) {
+        return {type: "flexible", flex: this.flex, fit: this.fit, child: context.build(this.child, 0)}
+    }
+}
+
+class Grow extends Weighted {
+    func init(child = null, flex = 1, key = null) {
+        super.init(child: child, flex: flex, fit: "tight", key: key)
+    }
+}
+
+class Spring extends Weighted {
+    func init(flex = 1, key = null) {
+        super.init(child: null, flex: flex, fit: "tight", key: key)
+    }
+}
+
+class Layers extends RenderWidget {
+    func init(children = null, alignment = null, fit = "loose", clipBehavior = null, key = null) {
+        super.init(key: key)
+        this.children = children == null ? [] : children
+        this.alignment = alignment == null ? Alignment.topLeft : alignment
+        this.fit = fit
+        this.clipBehavior = clipBehavior
+    }
+    func toNode(context) {
+        return {
+            type: "stack", alignment: u_align(this.alignment), fit: this.fit,
+            clip: this.clipBehavior == "none" ? False : null, children: context.buildAll(this.children)
+        }
+    }
+}
+
+class Pick extends RenderWidget {
+    func init(index = 0, children = null, alignment = null, key = null) {
+        super.init(key: key)
+        this.index = index
+        this.children = children == null ? [] : children
+        this.alignment = alignment == null ? Alignment.topLeft : alignment
+    }
+    func toNode(context) {
+        if (this.index < 0 or this.index >= len(this.children)) { return null }
+        return {
+            type: "stack", alignment: u_align(this.alignment),
+            children: [context.build(this.children[this.index], this.index)]
+        }
+    }
+}
+
+class Pin extends RenderWidget {
+    func init(child = null, left = null, top = null, right = null, bottom = null, width = null, height = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.left = left
+        this.top = top
+        this.right = right
+        this.bottom = bottom
+        this.width = width
+        this.height = height
+    }
+    func fill(child = null, left = 0, top = 0, right = 0, bottom = 0, key = null) {
+        return Pin(child: child, left: left, top: top, right: right, bottom: bottom, key: key)
+    }
+    func toNode(context) {
+        return {
+            type: "positioned", left: this.left, top: this.top, right: this.right, bottom: this.bottom,
+            width: this.width, height: this.height, child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Flow extends RenderWidget {
+    func init(children = null, direction = "horizontal", gap = 0, lineGap = 0, alignment = "start",
+              runAlignment = "start", cross = "start", key = null) {
+        super.init(key: key)
+        this.children = children == null ? [] : children
+        this.direction = direction
+        this.gap = gap
+        this.lineGap = lineGap
+        this.alignment = alignment
+        this.runAlignment = runAlignment
+        this.cross = cross
+    }
+    func toNode(context) {
+        return {
+            type: "wrap", dir: this.direction, spacing: this.gap, runSpacing: this.lineGap,
+            alignment: this.alignment, runAlignment: this.runAlignment, cross: this.cross,
+            children: context.buildAll(this.children)
+        }
+    }
+}
+
+class Rule extends RenderWidget {
+    func init(height = null, thickness = null, indent = null, endIndent = null, color = null, key = null) {
+        super.init(key: key)
+        this.height = height
+        this.thickness = thickness
+        this.indent = indent
+        this.endIndent = endIndent
+        this.color = color
+    }
+    func toNode(context) {
+        return {
+            type: "divider", dir: "horizontal", space: this.height, thickness: this.thickness,
+            indent: this.indent, endIndent: this.endIndent, color: u_color(this.color)
+        }
+    }
+}
+
+class VRule extends RenderWidget {
+    func init(width = null, thickness = null, indent = null, endIndent = null, color = null, key = null) {
+        super.init(key: key)
+        this.width = width
+        this.thickness = thickness
+        this.indent = indent
+        this.endIndent = endIndent
+        this.color = color
+    }
+    func toNode(context) {
+        return {
+            type: "divider", dir: "vertical", space: this.width, thickness: this.thickness,
+            indent: this.indent, endIndent: this.endIndent, color: u_color(this.color)
+        }
+    }
+}
+
+class ScrollController {
+    func init() {
+        ScrollController.seq = ScrollController.seq + 1
+        this.id = "sc" + str(ScrollController.seq)
+        this.offset = 0
+        this.winStart = 0
+    }
+    func jumpTo(offset) {
+        RT.command({cmd: "scroll", id: this.id, offset: offset, animate: False})
+    }
+    func animateTo(offset, duration = null, curve = null) {
+        RT.command({cmd: "scroll", id: this.id, offset: offset, animate: True})
+    }
+    func scrollToEnd(animate = True) {
+        RT.command({cmd: "scroll", id: this.id, end: True, animate: animate})
+    }
+    func scrollToIndex(index, animate = True) {
+        RT.command({cmd: "scroll", id: this.id, index: index, animate: animate})
+    }
+    func onExit() { }
+}
+ScrollController.seq = 0
+
+class Scroll extends RenderWidget {
+    func init(child = null, scrollDirection = "vertical", padding = null, reverse = False, physics = null,
+              controller = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.scrollDirection = scrollDirection
+        this.padding = padding
+        this.reverse = reverse
+        this.physics = physics
+        this.controller = controller
+    }
+    func toNode(context) {
+        return {
+            type: "scroll", dir: this.scrollDirection, padding: u_ins(this.padding), reverse: this.reverse,
+            controller: this.controller == null ? null : this.controller.id,
+            noScroll: this.physics == "never" ? True : null,
+            child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Feed extends RenderWidget {
+    func init(children = null, padding = null, scrollDirection = "vertical", shrinkWrap = False, reverse = False,
+              itemCount = null, itemBuilder = null, separatorBuilder = null, itemExtent = null, physics = null,
+              controller = null, onEndReached = null, virtual = False, key = null) {
+        super.init(key: key)
+        this.children = children
+        this.virtual = virtual
+        this.padding = padding
+        this.scrollDirection = scrollDirection
+        this.shrinkWrap = shrinkWrap
+        this.reverse = reverse
+        this.itemCount = itemCount
+        this.itemBuilder = itemBuilder
+        this.separatorBuilder = separatorBuilder
+        this.itemExtent = itemExtent
+        this.physics = physics
+        this.controller = controller
+        this.onEndReached = onEndReached
+    }
+    func builder(itemCount, itemBuilder, padding = null, scrollDirection = "vertical", shrinkWrap = False,
+                 reverse = False, itemExtent = null, physics = null, controller = null, onEndReached = null,
+                 virtual = False, key = null) {
+        return Feed(itemCount: itemCount, itemBuilder: itemBuilder, padding: padding,
+                        scrollDirection: scrollDirection, shrinkWrap: shrinkWrap, reverse: reverse,
+                        itemExtent: itemExtent, physics: physics, controller: controller, virtual: virtual,
+                        onEndReached: onEndReached, key: key)
+    }
+    func separated(itemCount, itemBuilder, separatorBuilder, padding = null, scrollDirection = "vertical",
+                   shrinkWrap = False, reverse = False, physics = null, controller = null, onEndReached = null, key = null) {
+        return Feed(itemCount: itemCount, itemBuilder: itemBuilder, separatorBuilder: separatorBuilder,
+                        padding: padding, scrollDirection: scrollDirection, shrinkWrap: shrinkWrap,
+                        reverse: reverse, physics: physics, controller: controller,
+                        onEndReached: onEndReached, key: key)
+    }
+    func toNode(context) {
+        kids = []
+        if (this.virtual and this.itemBuilder != null and this.itemExtent != null and this.controller != null
+            and this.scrollDirection == "vertical" and not this.shrinkWrap) {
+            total = this.itemCount == null ? 0 : this.itemCount
+            ctl = this.controller
+            start = ctl.winStart
+            if (start > total - 1) { start = total - 1 }
+            if (start < 0) { start = 0 }
+            stop = start + 48
+            if (stop > total) { stop = total }
+            idx = start
+            while (idx < stop) {
+                node = context.build(this.itemBuilder(context, idx), idx)
+                if (node != null) { kids.push(node) }
+                idx = idx + 1
+            }
+            return {
+                type: "list", dir: "vertical", padding: u_ins(this.padding), shrinkWrap: False,
+                reverse: this.reverse, itemExtent: this.itemExtent, controller: ctl.id,
+                total: total, offset: start,
+                onWindow: context.on(func(first) {
+                    t = first - 14
+                    if (t < 0) { t = 0 }
+                    ctl.winStart = t
+                }, "int"),
+                onEnd: context.on(this.onEndReached, "void"),
+                children: kids
+            }
+        }
+        if (this.itemBuilder != null) {
+            n = this.itemCount == null ? 0 : this.itemCount
+            idx = 0
+            while (idx < n) {
+                node = context.build(this.itemBuilder(context, idx), idx)
+                if (node != null) { kids.push(node) }
+                if (this.separatorBuilder != null and idx < n - 1) {
+                    sep = context.build(this.separatorBuilder(context, idx), "s" + str(idx))
+                    if (sep != null) { kids.push(sep) }
+                }
+                idx = idx + 1
+            }
+        } else {
+            kids = context.buildAll(this.children)
+        }
+        return {
+            type: "list", dir: this.scrollDirection, padding: u_ins(this.padding), shrinkWrap: this.shrinkWrap,
+            reverse: this.reverse, itemExtent: this.itemExtent,
+            controller: this.controller == null ? null : this.controller.id,
+            noScroll: this.physics == "never" ? True : null,
+            onEnd: context.on(this.onEndReached, "void"),
+            children: kids
+        }
+    }
+}
+
+class GridColumns {
+    func init(columns, mainAxisSpacing = 0, crossAxisSpacing = 0, ratio = 1.0) {
+        this.columns = columns
+        this.mainAxisSpacing = mainAxisSpacing
+        this.crossAxisSpacing = crossAxisSpacing
+        this.ratio = ratio
+        this.maxCrossAxisExtent = null
+    }
+}
+class GridMaxWidth {
+    func init(maxCrossAxisExtent, mainAxisSpacing = 0, crossAxisSpacing = 0, ratio = 1.0) {
+        this.maxCrossAxisExtent = maxCrossAxisExtent
+        this.mainAxisSpacing = mainAxisSpacing
+        this.crossAxisSpacing = crossAxisSpacing
+        this.ratio = ratio
+        this.columns = null
+    }
+}
+
+class Grid extends RenderWidget {
+    func init(gridDelegate, children = null, padding = null, scrollDirection = "vertical", shrinkWrap = False,
+              itemCount = null, itemBuilder = null, physics = null, controller = null, onEndReached = null, key = null) {
+        super.init(key: key)
+        this.gridDelegate = gridDelegate
+        this.children = children
+        this.padding = padding
+        this.scrollDirection = scrollDirection
+        this.shrinkWrap = shrinkWrap
+        this.itemCount = itemCount
+        this.itemBuilder = itemBuilder
+        this.physics = physics
+        this.controller = controller
+        this.onEndReached = onEndReached
+    }
+    func count(columns, children = null, mainAxisSpacing = 0, crossAxisSpacing = 0, ratio = 1.0,
+               padding = null, shrinkWrap = False, scrollDirection = "vertical", physics = null, controller = null, key = null) {
+        return Grid(
+            GridColumns(columns: columns, mainAxisSpacing: mainAxisSpacing,
+                crossAxisSpacing: crossAxisSpacing, ratio: ratio),
+            children: children, padding: padding, shrinkWrap: shrinkWrap, scrollDirection: scrollDirection,
+            physics: physics, controller: controller, key: key)
+    }
+    func extent(maxCrossAxisExtent, children = null, mainAxisSpacing = 0, crossAxisSpacing = 0, ratio = 1.0,
+                padding = null, shrinkWrap = False, scrollDirection = "vertical", physics = null, controller = null, key = null) {
+        return Grid(
+            GridMaxWidth(maxCrossAxisExtent: maxCrossAxisExtent, mainAxisSpacing: mainAxisSpacing,
+                crossAxisSpacing: crossAxisSpacing, ratio: ratio),
+            children: children, padding: padding, shrinkWrap: shrinkWrap, scrollDirection: scrollDirection,
+            physics: physics, controller: controller, key: key)
+    }
+    func builder(gridDelegate, itemCount, itemBuilder, padding = null, shrinkWrap = False, scrollDirection = "vertical",
+                 physics = null, controller = null, onEndReached = null, key = null) {
+        return Grid(gridDelegate, itemCount: itemCount, itemBuilder: itemBuilder, padding: padding,
+                        shrinkWrap: shrinkWrap, scrollDirection: scrollDirection, physics: physics,
+                        controller: controller, onEndReached: onEndReached, key: key)
+    }
+    func toNode(context) {
+        kids = []
+        if (this.itemBuilder != null) {
+            n = this.itemCount == null ? 0 : this.itemCount
+            idx = 0
+            while (idx < n) {
+                node = context.build(this.itemBuilder(context, idx), idx)
+                if (node != null) { kids.push(node) }
+                idx = idx + 1
+            }
+        } else {
+            kids = context.buildAll(this.children)
+        }
+        gd = this.gridDelegate
+        return {
+            type: "grid", dir: this.scrollDirection, columns: gd.columns, maxExtent: gd.maxCrossAxisExtent,
+            mainSpacing: gd.mainAxisSpacing, crossSpacing: gd.crossAxisSpacing, ratio: gd.ratio,
+            padding: u_ins(this.padding), shrinkWrap: this.shrinkWrap,
+            controller: this.controller == null ? null : this.controller.id,
+            noScroll: this.physics == "never" ? True : null,
+            onEnd: context.on(this.onEndReached, "void"),
+            children: kids
+        }
+    }
+}
+
+class PageController {
+    func init(initialPage = 0) {
+        this.page = initialPage
+        this.initialPage = initialPage
+    }
+    func jumpToPage(index) {
+        this.page = index
+        RT.dirty = True
+    }
+    func animateToPage(index, duration = null, curve = null) {
+        this.page = index
+        RT.dirty = True
+    }
+    func nextPage(duration = null, curve = null) { this.animateToPage(this.page + 1) }
+    func previousPage(duration = null, curve = null) { this.animateToPage(this.page - 1) }
+    func onExit() { }
+}
+
+class Pager extends RenderWidget {
+    func init(children = null, controller = null, onPageChanged = null, scrollDirection = "horizontal",
+              physics = null, itemCount = null, itemBuilder = null, key = null) {
+        super.init(key: key)
+        this.children = children
+        this.controller = controller
+        this.onPageChanged = onPageChanged
+        this.scrollDirection = scrollDirection
+        this.physics = physics
+        this.itemCount = itemCount
+        this.itemBuilder = itemBuilder
+    }
+    func builder(itemCount, itemBuilder, controller = null, onPageChanged = null, scrollDirection = "horizontal", key = null) {
+        return Pager(itemCount: itemCount, itemBuilder: itemBuilder, controller: controller,
+                        onPageChanged: onPageChanged, scrollDirection: scrollDirection, key: key)
+    }
+    func toNode(context) {
+        kids = []
+        if (this.itemBuilder != null) {
+            idx = 0
+            while (idx < this.itemCount) {
+                node = context.build(this.itemBuilder(context, idx), idx)
+                if (node != null) { kids.push(node) }
+                idx = idx + 1
+            }
+        } else {
+            kids = context.buildAll(this.children)
+        }
+        ctl = this.controller
+        cb = this.onPageChanged
+        handler = func(i) {
+            if (ctl != null) { ctl.page = i }
+            if (cb != null) { cb(i) }
+        }
+        return {
+            type: "pageView", dir: this.scrollDirection, index: ctl == null ? 0 : ctl.page,
+            noScroll: this.physics == "never" ? True : null,
+            onChanged: context.on(handler, "int"), children: kids
+        }
+    }
+}
+
+class GlobalKey {
+    func init(debugLabel = null) {
+        GlobalKey.seq = GlobalKey.seq + 1
+        this.id = GlobalKey.seq
+        this.currentState = null
+        this.currentContext = null
+    }
+    func keyString() { return "g:" + str(this.id) }
+}
+GlobalKey.seq = 0
+
+class Builder extends View {
+    func init(builder, key = null) {
+        super.init(key: key)
+        this.builder = builder
+    }
+    func build(context) { return this.builder(context) }
+}
+
+class LiveBuilder extends LiveView {
+    func init(builder, key = null) {
+        super.init(key: key)
+        this.builder = builder
+    }
+    func createState() { return StatefulBuilderState() }
+}
+class StatefulBuilderState extends Live {
+    func build(context) {
+        me = this
+        return this.widget.builder(context, func(fn) { me.update(fn) })
+    }
+}
+
+class SizeBuilder extends View {
+    func init(builder, key = null) {
+        super.init(key: key)
+        this.builder = builder
+    }
+    func build(context) {
+        return this.builder(context, Limits(minWidth: 0, maxWidth: RT.media.width, minHeight: 0, maxHeight: RT.media.height))
+    }
+}
+
+class OrientationBuilder extends View {
+    func init(builder, key = null) {
+        super.init(key: key)
+        this.builder = builder
+    }
+    func build(context) {
+        o = RT.media.width > RT.media.height ? "landscape" : "portrait"
+        return this.builder(context, o)
+    }
+}
+
+class Notifier {
+    func init() {
+        this.listeners = []
+    }
+    func addListener(fn) { this.listeners.push(fn) }
+    func removeListener(fn) {
+        keep = []
+        for f in this.listeners {
+            if (not same(f, fn)) { keep.push(f) }
+        }
+        this.listeners = keep
+    }
+    func notifyListeners() {
+        for f in this.listeners { f() }
+        RT.dirty = True
+    }
+    func onExit() { this.listeners = [] }
+}
+
+class Signal extends Notifier {
+    func init(value = null) {
+        super.init()
+        this.value = value
+    }
+    func setValue(v) {
+        this.value = v
+        this.notifyListeners()
+    }
+}
+
+class NotifierBuilder extends View {
+    func init(listenable, builder, child = null, key = null) {
+        super.init(key: key)
+        this.listenable = listenable
+        this.builder = builder
+        this.child = child
+    }
+    func build(context) { return this.builder(context, this.child) }
+}
+
+class SignalBuilder extends View {
+    func init(valueListenable, builder, child = null, key = null) {
+        super.init(key: key)
+        this.valueListenable = valueListenable
+        this.builder = builder
+        this.child = child
+    }
+    func build(context) { return this.builder(context, this.valueListenable.value, this.child) }
+}
+
+class Touch extends RenderWidget {
+    func init(child = null, onTap = null, onDoubleTap = null, onLongPress = null, onTapDown = null,
+              onPanStart = null, onPanUpdate = null, onPanEnd = null,
+              onHorizontalDragUpdate = null, onVerticalDragUpdate = null,
+              onHorizontalDragEnd = null, onVerticalDragEnd = null, behavior = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.onTap = onTap
+        this.onDoubleTap = onDoubleTap
+        this.onLongPress = onLongPress
+        this.onTapDown = onTapDown
+        this.onPanStart = onPanStart
+        this.onPanUpdate = onPanUpdate
+        this.onPanEnd = onPanEnd
+        this.onHorizontalDragUpdate = onHorizontalDragUpdate
+        this.onVerticalDragUpdate = onVerticalDragUpdate
+        this.onHorizontalDragEnd = onHorizontalDragEnd
+        this.onVerticalDragEnd = onVerticalDragEnd
+        this.ripple = False
+        this.borderRadius = null
+    }
+    func toNode(context) {
+        return {
+            type: "gesture",
+            ripple: this.ripple ? True : null,
+            radius: u_radius(this.borderRadius),
+            onTap: context.on(this.onTap, "void"),
+            onDoubleTap: context.on(this.onDoubleTap, "void"),
+            onLongPress: context.on(this.onLongPress, "void"),
+            onTapDown: context.on(this.onTapDown, "pos"),
+            onPanStart: context.on(this.onPanStart, "pos"),
+            onPanUpdate: context.on(this.onPanUpdate, "pos"),
+            onPanEnd: context.on(this.onPanEnd, "void"),
+            onHDrag: context.on(this.onHorizontalDragUpdate, "num"),
+            onVDrag: context.on(this.onVerticalDragUpdate, "num"),
+            onHDragEnd: context.on(this.onHorizontalDragEnd, "void"),
+            onVDragEnd: context.on(this.onVerticalDragEnd, "void"),
+            child: context.build(this.child, 0)
+        }
+    }
+}
+
+class Tap extends Touch {
+    func init(child = null, onTap = null, onDoubleTap = null, onLongPress = null, borderRadius = null, key = null) {
+        super.init(child: child, onTap: onTap, onDoubleTap: onDoubleTap, onLongPress: onLongPress, key: key)
+        this.ripple = True
+        this.borderRadius = borderRadius
+    }
+}
+class TapArea extends Tap {
+    func init(child = null, onTap = null, onLongPress = null, key = null) {
+        super.init(child: child, onTap: onTap, onLongPress: onLongPress, key: key)
+    }
+}
+
+class Swipe extends RenderWidget {
+    func init(key, child, onDismissed = null, background = null, direction = "horizontal", confirmDismiss = null) {
+        super.init(key: key)
+        this.child = child
+        this.onDismissed = onDismissed
+        this.background = background
+        this.direction = direction
+    }
+    func toNode(context) {
+        cb = this.onDismissed
+        handler = func(dir) { if (cb != null) { cb(dir) } }
+        return {
+            type: "dismissible", direction: this.direction, onDismissed: context.on(handler, "str"),
+            background: context.build(this.background, "bg"), child: context.build(this.child, 0)
+        }
+    }
+}
+
+class AnimBox extends Box {
+    func init(child = null, duration = null, curve = null, width = null, height = null, padding = null,
+              margin = null, color = null, decoration = null, alignment = null, constraints = null, key = null) {
+        super.init(child: child, width: width, height: height, padding: padding, margin: margin, color: color,
+                   decoration: decoration, alignment: alignment, constraints: constraints, key: key)
+        this.duration = duration
+        this.curve = curve
+    }
+    func toNode(context) {
+        node = this.baseNode(context)
+        node.duration = u_ms(this.duration)
+        node.curve = this.curve
+        return node
+    }
+}
+
+class AnimFade extends RenderWidget {
+    func init(opacity, duration, child = null, curve = null, key = null) {
+        super.init(key: key)
+        this.opacity = opacity
+        this.duration = duration
+        this.child = child
+        this.curve = curve
+    }
+    func toNode(context) {
+        return {type: "opacity", opacity: this.opacity, duration: u_ms(this.duration), curve: this.curve,
+                child: context.build(this.child, 0)}
+    }
+}
+
+class AnimPad extends RenderWidget {
+    func init(padding, duration, child = null, curve = null, key = null) {
+        super.init(key: key)
+        this.padding = padding
+        this.duration = duration
+        this.child = child
+        this.curve = curve
+    }
+    func toNode(context) {
+        return {type: "padding", padding: u_ins(this.padding), duration: u_ms(this.duration), curve: this.curve,
+                child: context.build(this.child, 0)}
+    }
+}
+
+class AnimPlace extends RenderWidget {
+    func init(alignment, duration, child = null, curve = null, key = null) {
+        super.init(key: key)
+        this.alignment = alignment
+        this.duration = duration
+        this.child = child
+        this.curve = curve
+    }
+    func toNode(context) {
+        return {type: "align", alignment: u_align(this.alignment), duration: u_ms(this.duration), curve: this.curve,
+                child: context.build(this.child, 0)}
+    }
+}
+
+class AnimSwap extends RenderWidget {
+    func init(duration, child = null, key = null) {
+        super.init(key: key)
+        this.duration = duration
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "animatedSwitcher", duration: u_ms(this.duration), child: context.build(this.child, 0)}
+    }
+}
+
+class CrossFadeState {
+    showFirst = "showFirst"
+    showSecond = "showSecond"
+}
+
+class AnimCross extends RenderWidget {
+    func init(firstChild, secondChild, crossFadeState, duration, key = null) {
+        super.init(key: key)
+        this.firstChild = firstChild
+        this.secondChild = secondChild
+        this.crossFadeState = crossFadeState
+        this.duration = duration
+    }
+    func toNode(context) {
+        first = this.crossFadeState == "showFirst"
+        picked = first ? this.firstChild : this.secondChild
+        inner = context.build(picked, first ? "a" : "b")
+        if (inner != null) { inner.wkey = first ? "a" : "b" }
+        return {type: "animatedSwitcher", duration: u_ms(this.duration), child: inner}
+    }
+}
+
+class Paint {
+    func init(color = null, style = "fill", strokeWidth = 1.0, strokeCap = "butt", isAntiAlias = True) {
+        this.color = color
+        this.style = style
+        this.strokeWidth = strokeWidth
+        this.strokeCap = strokeCap
+    }
+    func toJson() {
+        return {color: u_color(this.color == null ? Colors.black : this.color), style: this.style,
+                width: this.strokeWidth, cap: this.strokeCap}
+    }
+}
+PaintingStyle = {fill: "fill", stroke: "stroke"}
+StrokeCap = {butt: "butt", round: "round", square: "square"}
+
+class Path {
+    func init() { this.cmds = [] }
+    func moveTo(x, y) { this.cmds.push(["M", x, y]) }
+    func lineTo(x, y) { this.cmds.push(["L", x, y]) }
+    func quadraticBezierTo(x1, y1, x2, y2) { this.cmds.push(["Q", x1, y1, x2, y2]) }
+    func cubicTo(x1, y1, x2, y2, x3, y3) { this.cmds.push(["C", x1, y1, x2, y2, x3, y3]) }
+    func close() { this.cmds.push(["Z"]) }
+}
+
+class Canvas {
+    func init() { this.ops = [] }
+    func drawLine(p1, p2, paint) {
+        this.ops.push({op: "line", x1: p1.dx, y1: p1.dy, x2: p2.dx, y2: p2.dy, paint: paint.toJson()})
+    }
+    func drawRect(x, y, w, h, paint) {
+        this.ops.push({op: "rect", x: x, y: y, w: w, h: h, paint: paint.toJson()})
+    }
+    func drawRRect(x, y, w, h, radius, paint) {
+        this.ops.push({op: "rrect", x: x, y: y, w: w, h: h, r: radius, paint: paint.toJson()})
+    }
+    func drawCircle(center, radius, paint) {
+        this.ops.push({op: "circle", x: center.dx, y: center.dy, r: radius, paint: paint.toJson()})
+    }
+    func drawOval(x, y, w, h, paint) {
+        this.ops.push({op: "oval", x: x, y: y, w: w, h: h, paint: paint.toJson()})
+    }
+    func drawArc(x, y, w, h, startAngle, sweepAngle, useCenter, paint) {
+        this.ops.push({op: "arc", x: x, y: y, w: w, h: h, start: startAngle, sweep: sweepAngle,
+                       center: useCenter, paint: paint.toJson()})
+    }
+    func drawPath(path, paint) {
+        this.ops.push({op: "path", cmds: path.cmds, paint: paint.toJson()})
+    }
+    func drawText(text, x, y, style = null, align = null) {
+        this.ops.push({op: "text", text: text, x: x, y: y, style: u_style(style), align: align})
+    }
+}
+
+class Drawing extends RenderWidget {
+    func init(painter = null, size = null, child = null, key = null) {
+        super.init(key: key)
+        this.painter = painter
+        this.size = size == null ? Size(width: 100, height: 100) : size
+        this.child = child
+    }
+    func toNode(context) {
+        cv = Canvas()
+        if (this.painter != null) {
+            if (typeof(this.painter) == "function") {
+                this.painter(cv, this.size)
+            } else {
+                this.painter.paint(cv, this.size)
+            }
+        }
+        return {
+            type: "canvas", width: this.size.width, height: this.size.height, ops: cv.ops,
+            child: context.build(this.child, 0)
+        }
+    }
+}
+
+WRAP.add("pad", func(w, a, b, c) { return Pad(a, w) })
+WRAP.add("inset", func(w, a, b, c) { return Box(child: w, margin: a) })
+WRAP.add("bg", func(w, a, b, c) { return Box(child: w, color: a) })
+WRAP.add("sized", func(w, a, b, c) { return Space(width: a, height: b, child: w) })
+WRAP.add("round", func(w, a, b, c) { return Round(a, child: w) })
+WRAP.add("outline", func(w, a, b, c) {
+    return Box(child: w, decoration: Look(border: Border.all(color: a == null ? Colors.grey : a, width: b), borderRadius: c))
+})
+WRAP.add("centered", func(w, a, b, c) { return Center(child: w) })
+WRAP.add("aligned", func(w, a, b, c) { return Place(alignment: a, child: w) })
+WRAP.add("grow", func(w, a, b, c) { return Grow(w, flex: a) })
+WRAP.add("tap", func(w, a, b, c) { return Tap(child: w, onTap: a) })
+WRAP.add("longPress", func(w, a, b, c) { return Tap(child: w, onLongPress: a) })
+WRAP.add("faded", func(w, a, b, c) { return Fade(a, child: w) })
+WRAP.add("when", func(w, a, b, c) { return a ? w : Space() })
+WRAP.add("scrolls", func(w, a, b, c) { return Scroll(child: w) })
+WRAP.add("safe", func(w, a, b, c) { return Safe(child: w) })
+WRAP.add("tip", func(w, a, b, c) { return Hint(a, child: w) })

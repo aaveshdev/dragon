@@ -1,0 +1,56 @@
+calls = 0
+func tick(v) {
+    calls += 1
+    return v
+}
+r = tick(True) or tick(False)
+showln("or: calls=" + str(calls) + " r=" + str(r))
+calls = 0
+r = tick(5) ?? tick(6)
+showln("??: calls=" + str(calls) + " r=" + str(r))
+calls = 0
+r = tick(False) or tick(7)
+showln("or falls through: calls=" + str(calls) + " r=" + str(r))
+
+func f1(n) {
+    try {
+        if n == 0 { raise "zero" }
+        return "ret" + str(n)
+    } catch (e) {
+        return "caught " + e
+    } finally {
+        show("[fin" + str(n) + "] ")
+    }
+}
+showln(f1(0))
+showln(f1(1))
+try {
+    try { raise "inner" } finally { show("[cleanup] ") }
+} catch (e) { showln("outer got " + e) }
+func f2() {
+    for i in [1, 2, 3] {
+        try {
+            if i == 2 { continue }
+            if i == 3 { break }
+            show("body" + str(i) + " ")
+        } finally {
+            show("[f" + str(i) + "] ")
+        }
+    }
+    showln("")
+}
+f2()
+func f3() {
+    try {
+        try { raise "a" } catch (e) { raise "b" } finally { show("[in] ") }
+    } catch (e2) { showln("got " + e2) }
+}
+f3()
+func f4() { try { return 1 } finally { show("[f4] ") } }
+showln(f4())
+
+words = ["new", "not", "(", ")", "[", "]", "{", "}", "await", "and", "or", "in", ".", "="]
+showln(words.join(" "))
+kw = "new"
+if kw == "new" { showln("string new ok") }
+showln(len(["(", ")"]), "(" + ")")

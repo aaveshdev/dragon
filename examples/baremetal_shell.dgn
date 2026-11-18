@@ -1,0 +1,75 @@
+import hw
+import task
+
+func fib(n) {
+    if (n < 2) { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+func is_prime(n) {
+    if (n < 2) { return False }
+    i = 2
+    while (i * i <= n) {
+        if (n % i == 0) { return False }
+        i = i + 1
+    }
+    return True
+}
+
+func primes(limit) {
+    out = []
+    n = 2
+    while (n <= limit) {
+        if (is_prime(n)) { out.push(n) }
+        n = n + 1
+    }
+    return out
+}
+
+func help() {
+    showln("commands:")
+    showln("  help            this list")
+    showln("  echo <text>     print text")
+    showln("  fib <n>         n-th Fibonacci number")
+    showln("  primes <n>      primes up to n")
+    showln("  add <a> <b>     add two numbers")
+    showln("  bg <n>          compute fib(n) as a background job")
+    showln("  ps              number of running tasks")
+    showln("  uptime          milliseconds since boot")
+    showln("  peek <addr>     read one byte at a physical address")
+    showln("  halt            power off")
+}
+
+jobs = [0]
+func job(n) {
+    r = fib(n)
+    showln("[job] fib(" + str(n) + ") = " + str(r))
+}
+
+func run(line) {
+    parts = line.split(" ")
+    cmd = parts[0]
+    if (cmd == "") { return }
+    if (cmd == "help") { help() }
+    elif (cmd == "echo") { showln(line.substring(5, len(line))) }
+    elif (cmd == "fib") { showln(str(fib(parse_int(parts[1])))) }
+    elif (cmd == "primes") { showln(str(primes(parse_int(parts[1])).join(" "))) }
+    elif (cmd == "add") { showln(str(parse_float(parts[1]) + parse_float(parts[2]))) }
+    elif (cmd == "bg") { jobs[0] = jobs[0] + 1; showln("started job " + str(task.spawn(job, parse_int(parts[1])))) }
+    elif (cmd == "ps") { showln(str(task.count()) + " task(s) (including this shell)") }
+    elif (cmd == "uptime") { showln(str(hw.millis()) + " ms") }
+    elif (cmd == "peek") { showln(str(hw.peek8(parse_int(parts[1])))) }
+    elif (cmd == "halt") { showln("bye"); exit(0) }
+    else { showln("unknown command: " + cmd + "  (try help)") }
+}
+
+func main() {
+    showln("")
+    showln("Dragon on bare metal (RISC-V 64, no operating system)")
+    showln("type help")
+    while (True) {
+        line = readln("dragon> ")
+        run(line)
+    }
+}
+main()

@@ -24,4 +24,3 @@ pub(crate) fn escape_c_string(s: &str) -> String {
     }
     out
 }
-

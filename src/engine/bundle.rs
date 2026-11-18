@@ -19,15 +19,12 @@ pub fn check_for_bundle(exe_path: &Path) -> Option<String> {
 
     if &footer[8..24] != BUNDLE_SIGNATURE { return None; }
 
-
     let script_len = u64::from_le_bytes(footer[0..8].try_into().unwrap());
     if script_len > len - 24 { return None; }
-
 
     if file.seek(SeekFrom::End(-(24 + script_len as i64))).is_err() { return None; }
     let mut script_buf = vec![0u8; script_len as usize];
     if file.read_exact(&mut script_buf).is_err() { return None; }
-
 
     let decrypted = decrypt_payload(&script_buf)?;
     String::from_utf8(decrypted).ok()
@@ -44,10 +41,6 @@ pub fn gather_sources(path: &Path, sources: &mut HashMap<String, String>, is_roo
     let re = Regex::new(r#"import[ \t]+["']([^"']+)["']"#).unwrap();
     for cap in re.captures_iter(&code) {
         let import_ref = &cap[1];
-        
-        // // Skip built-ins so the bundler doesn't try to look for them on disk
-        // let builtins = ["math", "json", "base64", "file", "os", "path", "time", "net", "ffi", "struct", "mem", "thread", "uuid"];
-        // if builtins.contains(&import_ref.as_str()) { continue; }
 
         let current_dir = path.parent().unwrap_or(Path::new("."));
         let mut search_dirs = vec![current_dir.to_path_buf(), current_dir.join("dgn_modules")];
@@ -88,4 +81,3 @@ pub fn gather_sources(path: &Path, sources: &mut HashMap<String, String>, is_roo
     }
     Ok(())
 }
-

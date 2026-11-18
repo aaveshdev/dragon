@@ -1,0 +1,136 @@
+import "dragon/ui" as *
+
+class ThemeScope extends Provider {
+    func init(label, child = null, key = null) {
+        super.init(child: child, key: key)
+        this.label = label
+    }
+}
+
+class Probe extends View {
+    func build(context) {
+        s = context.findInherited("ThemeScope")
+        return Text("scope=" + (s == null ? "none" : s.label))
+    }
+}
+
+class LoadingDots extends LiveView {
+    func createState() { return SpinnerState() }
+}
+class SpinnerState extends Live {
+    func onInit() {
+        this.ctl = Animator(duration: Duration(milliseconds: 1000), vsync: this)
+        this.ctl.repeat()
+        this.ticks = 0
+        me = this
+        this.timer = Timer.periodic(Duration(milliseconds: 500), func() { me.update(func() { me.ticks = me.ticks + 1 }) })
+    }
+    func onExit() {
+        this.ctl.onExit()
+        this.timer.cancel()
+    }
+    func build(context) {
+        ctl = this.ctl
+        return AnimBuilder(animation: ctl, builder: func(c, child) {
+            return Transform.rotate(angle: ctl.value * 6.28318, child: Icon(Icons.refresh, size: 32))
+        })
+    }
+}
+
+class Painter {
+    func paint(canvas, size) {
+        canvas.drawCircle(Offset(dx: 50, dy: 50), 30, Paint(color: Colors.red, style: PaintingStyle.fill))
+        canvas.drawLine(Offset(dx: 0, dy: 0), Offset(dx: 100, dy: 100), Paint(color: Colors.blue, strokeWidth: 3))
+    }
+}
+
+class Home extends LiveView {
+    func createState() { return HomeState() }
+}
+class HomeState extends Live {
+    func onInit() {
+        this.form = GlobalKey()
+        this.name = TextController()
+        this.radio = "a"
+        this.fav = False
+        this.vn = Signal(5)
+        this.page = PageController()
+        this.sel = 0
+    }
+    func build(context) {
+        me = this
+        return TabHost(length: 3, child: Screen(
+            topBar: TopBar(title: Text("Kitchen"), bottom: Tabs(tabs: [TabLabel(text: "Form"), TabLabel(text: "Lists"), TabLabel(text: "Misc")])),
+            sideMenu: SideMenu(child: Feed(children: [SideMenuHeader(child: Text("Hi")), Item(title: Text("Item"), onTap: func() { Nav.pop(context) })])),
+            body: TabPages(children: [this.formTab(context), this.listTab(context), this.miscTab(context)])
+        ))
+    }
+    func formTab(context) {
+        me = this
+        return Scroll(padding: Insets.all(16), child: Form(key: this.form, child: Col(cross: Cross.stretch, gap: 12, children: [
+            FormInput(controller: this.name, decoration: FieldLook(labelText: "Name", border: OutlineField()),
+                validator: func(v) { return v == "" ? "Required" : null }),
+            RadioItem(value: "a", groupValue: this.radio, title: Text("A"), onChange: func(v) { me.update(func() { me.radio = v }) }),
+            RadioItem(value: "b", groupValue: this.radio, title: Text("B"), onChange: func(v) { me.update(func() { me.radio = v }) }),
+            SwitchItem(value: this.fav, title: Text("Fav"), onChange: func(v) { me.update(func() { me.fav = v }) }),
+            Button(onTap: func() { me.form.currentState.validate() }, child: Text("Validate")),
+            Button(onTap: func() { Nav.pushNamed(context, "/second", arguments: "hello") }, child: Text("Go named")),
+            Probe(),
+            ThemeScope(label: "inner", child: Probe())
+        ])))
+    }
+    func listTab(context) {
+        me = this
+        return Col(children: [
+            Grow(child: Feed.builder(itemCount: 30, itemBuilder: func(c, i) {
+                return Item(leading: Avatar(child: Text(str(i))), title: Text("Row " + str(i)), subtitle: Text("sub"), trailing: Icon(Icons.chevron_right))
+            })),
+            Space(height: 120, child: Grid.count(columns: 3, children: [
+                Box(color: Colors.red), Box(color: Colors.green), Box(color: Colors.blue),
+                Box(color: Colors.orange), Box(color: Colors.pink), Box(color: Colors.teal)]))
+        ])
+    }
+    func miscTab(context) {
+        me = this
+        return Feed(children: [
+            Layers(children: [Box(width: 100, height: 100, color: Colors.amber), Pin(right: 4, bottom: 4, child: Icon(Icons.star))]),
+            Drawing(size: Size(width: 100, height: 100), painter: Painter()),
+            LoadingDots(),
+            SignalBuilder(valueListenable: this.vn, builder: func(c, v, child) { return Text("vn=" + str(v)) }),
+            FlatButton(onTap: func() { me.vn.value = me.vn.value + 1 }, child: Text("inc vn")),
+            Expander(title: Text("Expand"), children: [Text("inside")]),
+            Row(children: [Tag(label: Text("c1")), ActionTag(label: Text("c2"), onTap: func() { }), Badge(label: Text("3"), child: Icon(Icons.email))]),
+            Menu(itemBuilder: func(c) { return [MenuItem(value: 1, child: Text("One")), MenuItem(value: 2, child: Text("Two"))] },
+                onSelected: func(v) { me.update(func() { me.sel = v }) }),
+            Text("sel=" + str(this.sel)),
+            FlatButton(onTap: func() { showSheet(context: context, builder: func(c) { return Box(padding: Insets.all(24), child: Text("Sheet")) }) }, child: Text("Sheet")),
+            FlatButton(onTap: func() { showDialog(context: context, builder: func(c) { return ChoiceDialog(title: Text("Pick"), children: [ChoiceOption(onTap: func() { Nav.pop(c) }, child: Text("Opt"))]) }) }, child: Text("Simple")),
+            FlatButton(onTap: func() { Screen.of(context).openDrawer() }, child: Text("OpenDrawer")),
+            FlatButton(onTap: func() { Prefs.set("k", "v1")
+                Toast.show("saved " + Prefs.get("k", "none")) }, child: Text("Prefs")),
+            FlatButton(onTap: func() { Http.get("http://example.com", func(r) { me.update(func() { me.sel = r.statusCode }) }) }, child: Text("Http")),
+            FlatButton(onTap: func() { showDatePicker(func(d) { me.update(func() { me.sel = d == null ? "none" : d.format() }) }) }, child: Text("Date")),
+            AnimCross(firstChild: Text("first"), secondChild: Text("second"), crossFadeState: this.fav ? CrossFadeState.showSecond : CrossFadeState.showFirst, duration: Duration(milliseconds: 200)),
+            Flow(gap: 4, children: [Text("a"), Text("b")]),
+            Fade(opacity: 0.5, child: Text("faded")),
+            Round(borderRadius: Corners.circular(8), child: Box(width: 40, height: 40, color: Colors.purple)),
+            RichText(text: Span(text: "Hello ", style: Font(color: Colors.red), children: [Span(text: "world", style: Font(fontWeight: Weight.bold))])),
+            ProgressBar(), Spinner(),
+            Slider(value: 0.5, onChange: func(v) { }),
+            Portion(widthFactor: 0.5, child: Rule()),
+            Ratio(aspectRatio: 2, child: Box(color: Colors.cyan)),
+            Picture.network("http://example.com/x.png", width: 20, height: 20)
+        ])
+    }
+}
+
+class SecondPage extends View {
+    func build(context) {
+        args = RouteInfo.of(context).settings.arguments
+        return Screen(topBar: TopBar(title: Text("Second")), body: Center(child: Text("args=" + str(args))))
+    }
+}
+
+func main() {
+    runApp(App(title: "Kitchen", home: Home(), routes: {"/second": func(c) { return SecondPage() }}))
+}

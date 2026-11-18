@@ -5,10 +5,6 @@ plugins {
 
 android {
     namespace = "__DRAGON_PACKAGE__"
-    // 26+ so the adaptive icon (res/mipmap-anydpi-v26) needs no legacy PNG
-    // fallback -- replace the placeholder icon in res/drawable/ before you
-    // ship, but this sidesteps needing per-density PNGs just to get a
-    // build running.
     compileSdk = 34
 
     defaultConfig {
@@ -17,10 +13,6 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-        // Match this to whatever `--target` list you actually built with
-        // (`dragon ... --target android-all` builds all four; narrow this
-        // if you only built a subset, to avoid Gradle complaining about a
-        // missing .so for an ABI it expects but wasn't generated).
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
         }
@@ -47,10 +39,6 @@ android {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
 
-    // The .so under src/main/jniLibs/<abi>/ is PRE-BUILT by `dragon
-    // --native --lib --target android-all ...` (a separate step, not part
-    // of this Gradle build) -- no externalNativeBuild/CMake/NDK plugin
-    // needed here, since Gradle picks up jniLibs/ automatically.
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
@@ -61,18 +49,14 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.0")
-    // XML theme parent used by res/values/themes.xml (Theme.Material3.*)
-    // -- a DIFFERENT artifact from the Compose material3 dependency below;
-    // Compose's own MaterialTheme doesn't supply XML styles, and AAPT
-    // resource linking fails without this even though the actual UI never
-    // touches it beyond the initial window background.
     implementation("com.google.android.material:material:1.12.0")
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.compose.foundation:foundation")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    // image() needs this -- remove if you don't use image().
     implementation("io.coil-kt:coil-compose:2.6.0")
 }

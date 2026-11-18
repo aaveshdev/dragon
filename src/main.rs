@@ -2,10 +2,14 @@ mod engine;
 mod codegen_c;
 mod tui;
 mod android_project;
-// mod aot_compiler;
+mod ios_project;
+mod platforms;
+mod windows_project;
+mod packages;
+mod migrate;
+mod ui_host;
+mod ui_preview;
 use engine::*;
-// use engine::{Chunk, Compiler, Instruction, lint_ast, lex, Parser};
-// use aot_compiler::*;
 
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap};
@@ -15,7 +19,7 @@ use std::io::{Write, Read, Seek, SeekFrom};
 use std::env;
 use std::panic;
 
-macro_rules! VERSION { () => { "1.0.7" } }
+macro_rules! VERSION { () => { "1.0.8" } }
 const DGN_VERSION: &str = concat!("Dragon Programming Language v", VERSION!());
 const DGN_BUILD: &str = concat!("Build ", env!("DGN_BUILD_DATE"));
 const DGN_AUTHOR: &str = "Aavesh Jilani";
@@ -41,11 +45,11 @@ fn main() {
         let env = Arc::new(Mutex::new(Env::new(None, Some(exe_path.clone()))));
         env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
         populate_builtins(env.clone());
-        
+
         let sources: HashMap<String, String> = serde_json::from_str(&payload).unwrap_or_else(|_| {
             let mut m = HashMap::new(); m.insert("__entry__".to_string(), payload); m
         });
-        
+
         let mut bundle_map = HashMap::new();
         for (k, v) in &sources { if k != "__entry__" { bundle_map.insert(k.clone(), DgnValue::String(v.clone())); } }
         env.lock().unwrap().store.insert("__bundled_sources__".to_string(), DgnValue::Map(Arc::new(Mutex::new(bundle_map))));
@@ -56,9 +60,9 @@ fn main() {
         let entry = sources.get("__entry__").unwrap();
         let tokens = match lex(entry) {
             Ok(t) => t,
-            Err(e) => { 
-                eprintln!("Syntax Error: {}", e.with_source(entry).format_pretty()); 
-                std::process::exit(1); 
+            Err(e) => {
+                eprintln!("Syntax Error: {}", e.with_source(entry).format_pretty());
+                std::process::exit(1);
             }
         };
         let mut parser = Parser::new(tokens);
@@ -123,19 +127,27 @@ fn main() {
         println!("                     no separate CMake/JNI bridge library needed.");
         println!("        Requires ANDROID_NDK_HOME for Android slices; iOS slices require building on macOS with Xcode.");
         println!("");
-        println!("  dragon create <name> [--package <id>]   Scaffold a new Android app project");
-        println!("        Generates package.json, lib/main.dgn + lib/ui.dgn, and a full Android Gradle project.");
+        println!("  dragon create <name> [--package <id>] [--legacy-native]   Scaffold a new Android app project");
+        println!("        Default: Flutter-style widget framework (import \"dragon/ui\" as *), compiled to a native");
+        println!("        .so for Android (no source/interpreter on the device). Generates package.json,");
+        println!("        lib/main.dgn, assets/ and a Gradle project. Needs ANDROID_NDK_HOME to build.");
+        println!("        --legacy-native  use the old C-transpiled function-based UI instead.");
+        println!("  dragon preview [dir] [--port N] [--open]   Live browser preview of a widget app (hot reload; dev tool, interpreted)");
+        println!("  dragon migrate [paths] [--dry-run]   Port Dragon 1 code (Flutter-style names) to the Dragon 2 vocabulary");
+        println!("  dragon ui-dump [dir] [--tap ID|--event E|--tick MS|--back|--pretty|--all]");
+        println!("        Headless: print the widget tree frame as JSON; useful for tests and CI.");
         println!("        Run `dragon run`/`dragon build` inside the created directory from here on.");
         println!("  dragon run                              Run the current project");
         println!("        Inside a project made by `dragon create`: builds (native lib + Gradle), installs on a");
         println!("        connected device/emulator (via adb), and launches it.");
         println!("        Elsewhere: reads package.json's \"main\"/\"entry\" field and interprets that script.");
+        println!("        --watch / -w  Rebuild + reinstall + relaunch automatically whenever lib/**/*.dgn");
+        println!("                      changes (full restart each time; app state is not preserved).");
         println!("  dragon build [--release]                Build an APK (inside a `dragon create` project)");
         println!("        Debug APK by default; --release for a release build. Does not install/launch --");
         println!("        use `dragon run` for that.");
         println!("");
         println!("  dragon --ide                      Launch TurboDragon IDE");
-        // println!("  dragon -c <in> -o <out> --web     Compile script to Web Bundle");
         println!("  dragon -v, --version              Show version information");
         println!("");
         return;
@@ -154,7 +166,7 @@ fn main() {
         println!("-------------------------------------");
 
         let input_path = Path::new("lib/main.dgn");
-        
+
         let jni_dir = Path::new("app/src/main/jniLibs/x86_64");
         let output_so = jni_dir.join("libdragon_android.so");
 
@@ -164,7 +176,7 @@ fn main() {
         }
 
         let template_path = Path::new("libdragon_android.so");
-        
+
         if !template_path.exists() {
             println!("Error: Template 'libdragon_android.so' not found in current directory.");
             println!("Please ensure the pre-compiled Android library is in: {:?}", env::current_dir().unwrap());
@@ -178,7 +190,6 @@ fn main() {
 
         println!("Compiling Script: {}", input_path.display());
 
-
         let mut sources = HashMap::new();
         if let Err(e) = gather_sources(input_path, &mut sources, true) {
             eprintln!("Build Failed: {}", e);
@@ -186,24 +197,21 @@ fn main() {
         }
 
         let payload = serde_json::to_string(&sources).expect("Serialization failed");
-        // let mut payload_bytes = payload.into_bytes();
-        // let payload_len = payload_bytes.len() as u64;
 
         let payload_bytes = encrypt_payload(payload.as_bytes());
         let payload_len = payload_bytes.len() as u64;
 
-  
         println!("Installing Engine to: {:?}", output_so);
         fs::copy(&template_path, &output_so).expect("Failed to copy library template");
 
         println!("Injecting Encrypted Bytecode...");
-        
+
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
             .open(&output_so)
             .expect("Failed to open .so for writing");
-        
+
         file.write_all(&payload_bytes).expect("Write failed");
         file.write_all(&payload_len.to_le_bytes()).expect("Write len failed");
         file.write_all(BUNDLE_SIGNATURE).expect("Write sig failed");
@@ -234,7 +242,7 @@ fn main() {
         let android_api: u32 = args.iter().position(|a| a == "--android-api")
             .and_then(|i| args.get(i + 1))
             .and_then(|s| s.parse().ok())
-            .unwrap_or(24); // NDK r27+ default floor; override with --android-api <level>
+            .unwrap_or(24);
         let ios_min_version = args.iter().position(|a| a == "--ios-min")
             .and_then(|i| args.get(i + 1))
             .cloned()
@@ -267,7 +275,20 @@ fn main() {
 
         println!("Compiling {}...", input_path.display());
 
-        // ── --native path: transpile Dragon AST → C, then invoke gcc/clang/msvc ──
+        if is_native_mode && args.contains(&"--app".to_string()) {
+            let test_main = args.contains(&"--test-main".to_string());
+            match codegen_c::compile_app(input_path, output_path, keep_c_mode, &cross_opts, test_main) {
+                Ok(()) => {
+                    if !cross_opts.targets.is_empty() { println!("Success! Cross-compiled app library built."); }
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Native app compilation failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         if is_native_mode {
             let src = match fs::read_to_string(input_path) {
                 Ok(s) => s,
@@ -294,12 +315,6 @@ fn main() {
                 }
             };
 
-            // Lint the AST. For --native --lib, imports are resolved and
-            // merged first (native has no runtime import mechanism -- it's
-            // one flat C translation unit), so the linter sees the same
-            // fully-merged function/global set the actual compile step
-            // will use; otherwise every function pulled in from an
-            // imported file would incorrectly look undefined here.
             let base_dir_for_lint = input_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
             let flattened_for_lint;
             let ast_for_lint: &Stmt = if is_lib_mode {
@@ -314,12 +329,6 @@ fn main() {
                 &ast
             };
 
-            // --native --lib has its own bare-name builtin allowlist (see
-            // codegen_c::native::builtin_call) that's intentionally
-            // different from the interpreter's namespaced builtins (e.g.
-            // `sqrt(x)` here vs. `math.sqrt(x)` in a normal script), so the
-            // linter needs to be told about those too or it flags every
-            // one of them as an undefined function.
             let native_extra_builtins = [
                 "sqrt", "abs", "floor", "ceil", "pow", "min", "max",
                 "substr", "index_of", "char_at", "parse_int", "parse_float",
@@ -330,6 +339,39 @@ fn main() {
                 report.print();
                 if !report.errors.is_empty() {
                     std::process::exit(1);
+                }
+            }
+
+            if let Some(arch) = args.iter().position(|a| a == "--baremetal").and_then(|i| args.get(i + 1)) {
+                println!("  [baremetal] Transpiling to C...");
+                let run_qemu = args.contains(&"--qemu".to_string());
+                // --embed FILE, --embed-dir DIR, --embed-list FILE: embedded files (the last two avoid the 8191-char Windows command line)
+                let mut embeds: Vec<String> = args.iter().enumerate().filter(|(_, a)| a.as_str() == "--embed").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+                for (i, a) in args.iter().enumerate() {
+                    if a == "--embed-dir" {
+                        if let Some(d) = args.get(i + 1) {
+                            if let Ok(rd) = std::fs::read_dir(d) {
+                                let mut names: Vec<String> = rd.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).map(|e| e.path().to_string_lossy().to_string()).collect();
+                                names.sort();
+                                embeds.extend(names);
+                            }
+                        }
+                    } else if a == "--embed-list" {
+                        if let Some(f) = args.get(i + 1) {
+                            if let Ok(t) = std::fs::read_to_string(f) {
+                                embeds.extend(t.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).map(|l| l.to_string()));
+                            }
+                        }
+                    }
+                }
+                match codegen_c::baremetal::compile_baremetal(&ast, input_path, output_path, keep_c_mode, arch, run_qemu,
+                    &embeds,
+                    args.iter().position(|a| a == "--sdk").and_then(|i| args.get(i + 1)).map(|s| s.as_str())) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        eprintln!("Bare-metal compilation failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
 
@@ -346,10 +388,6 @@ fn main() {
                 Ok(()) => {
                     #[cfg(unix)]
                     {
-                        // Cross-compiled artifacts (Android .so / iOS .a) are
-                        // written under out_dir/jniLibs and out_dir/ios, not to
-                        // output_path itself, so there's nothing at output_path
-                        // to chmod in that case.
                         if cross_opts.targets.is_empty() {
                             use std::os::unix::fs::PermissionsExt;
                             if let Ok(metadata) = fs::metadata(output_path) {
@@ -373,206 +411,29 @@ fn main() {
             return;
         }
 
-
        let mut sources = HashMap::new();
-        
+
         if let Err(e) = gather_sources(input_path, &mut sources, true) {
             eprintln!("Compilation Error: {}", e);
             std::process::exit(1);
         }
-        
+
        let payload = serde_json::to_string(&sources).expect("Failed to serialize bundle");
-        
+
         let payload_bytes = encrypt_payload(payload.as_bytes());
         let payload_len = payload_bytes.len() as u64;
-//         if is_aot_mode {
-//             // ── AOT path ──────────────────────────────────────────────────
-//             println!("Compiling {} (AOT mode)...", input_path.display());
-
-//             let src = match fs::read_to_string(input_path) {
-//                 Ok(s) => s,
-//                 Err(e) => { eprintln!("Error reading {}: {}", input_path.display(), e); std::process::exit(1); }
-//             };
-
-//             let tokens = lex(&src);
-//             let mut parser = Parser::new(tokens);
-//             let ast = match parser.parse() {
-//                 Ok(a) => a,
-//                 Err(e) => { eprintln!("Parse Error: {}", e); std::process::exit(1); }
-//             };
-
-//             // Lint first
-//             let report = lint_ast(&ast);
-//             if !report.is_clean() {
-//                 report.print();
-//                 if !report.errors.is_empty() { std::process::exit(1); }
-//             }
-
-//             // Compile AST → bytecode Chunk (reuse existing compiler)
-//             let mut chunk = Chunk::new();
-//             Compiler::compile_stmt(&mut chunk, &ast);
-//             chunk.emit(Instruction::Halt, 0);
-
-//             // Compile Chunk → .o via Cranelift
-//             let obj_path = output_path.with_extension("o");
-//             if let Err(e) = aot_compiler::compile_to_object(&chunk, &obj_path) {
-//                 eprintln!("AOT Compile Error: {}", e);
-//                 std::process::exit(1);
-//             }
-
-//             // Link: .o + dragon_runtime.a → final binary
-//             println!("Linking {}...", output_path.display());
-//          let link_status = if cfg!(target_os = "windows") {
-//     // ── Compile the C shim if the .obj is not already present ─────────
-//     // (Do this once; skip if already built)
-//     let shim_obj = std::path::Path::new("aot_main_shim.obj");
-//     if !shim_obj.exists() {
-//         let shim_c = std::path::Path::new("aot_main_shim.c");
-//         if shim_c.exists() {
-//             let status = std::process::Command::new("cl")
-//                 .args(["/c", "/MT", "aot_main_shim.c", "/Fo:aot_main_shim.obj"])
-//                 .status();
-//             if !matches!(status, Ok(s) if s.success()) {
-//                 eprintln!("AOT: Failed to compile aot_main_shim.c");
-//                 std::process::exit(1);
-//             }
-//         } else {
-//             eprintln!("AOT: aot_main_shim.c not found — cannot build entry point");
-//             eprintln!("     Place aot_main_shim.c in the same directory as dragon.exe");
-//             std::process::exit(1);
-//         }
-//     }
-
-//     if is_lib_mode {
-//         // ── Windows DLL ───────────────────────────────────────────────
-//         std::process::Command::new("cl")
-//             .args([
-//                 "/LD",                               // build a DLL
-//                 "/MT",                               // static CRT (no DLL dependency)
-//                 obj_path.to_str().unwrap(),          // user's .o from Cranelift
-//                 "dragon_runtime.lib",
-//                 &format!("/Fe:{}", output_path.to_str().unwrap()),
-//                 "/link",
-//                 "ws2_32.lib", "user32.lib", "advapi32.lib",
-//                 "bcrypt.lib", "ntdll.lib", "kernel32.lib",
-//                 "shell32.lib", "ole32.lib",
-//             ])
-//             .status()
-//     } else {
-//         // ── Windows EXE ───────────────────────────────────────────────
-//         std::process::Command::new("cl")
-//             .args([
-//                 "/MT",                               // static CRT — provides:
-//                                                      //   mainCRTStartup, memcpy,
-//                                                      //   memmove, memset, fmod,
-//                                                      //   __chkstk, __CxxFrameHandler3
-//                 obj_path.to_str().unwrap(),          // user's Cranelift .o
-//                 "aot_main_shim.obj",                 // C entry point (not Rust)
-//                 "dragon_runtime.lib",                // static runtime
-//                 &format!("/Fe:{}", output_path.to_str().unwrap()),
-//                 "/link",
-//                 // Windows system libs (cover all __imp_* symbols)
-//                 "ws2_32.lib",    // sockets
-//                 "user32.lib",    // UI / console
-//                 "advapi32.lib",  // registry / security
-//                 "bcrypt.lib",    // crypto
-//                 "ntdll.lib",     // NT internals
-//                 "kernel32.lib",  // HeapAlloc/Free/ReAlloc, GetProcess*, etc.
-//                 "shell32.lib",
-//                 "ole32.lib",
-//                 "/SUBSYSTEM:CONSOLE",
-//                 "/ENTRY:mainCRTStartup",
-//             ])
-//             .status()
-//     }
-// } else if cfg!(target_os = "macos") {
-//     // ── macOS ─────────────────────────────────────────────────────────
-//     if is_lib_mode {
-//         std::process::Command::new("cc")
-//             .args([
-//                 "-dynamiclib",
-//                 obj_path.to_str().unwrap(),
-//                 "aot_main_shim.o",
-//                 "-L.", "-ldragon_runtime",
-//                 "-lpthread", "-ldl", "-lm",
-//                 "-o", output_path.to_str().unwrap(),
-//             ])
-//             .status()
-//     } else {
-//         std::process::Command::new("cc")
-//             .args([
-//                 obj_path.to_str().unwrap(),
-//                 "aot_main_shim.o",
-//                 "-L.", "-ldragon_runtime",
-//                 "-lpthread", "-ldl", "-lm",
-//                 "-o", output_path.to_str().unwrap(),
-//             ])
-//             .status()
-//     }
-// } else {
-//     // ── Linux ─────────────────────────────────────────────────────────
-//     if is_lib_mode {
-//         std::process::Command::new("cc")
-//             .args([
-//                 "-shared", "-fPIC",
-//                 obj_path.to_str().unwrap(),
-//                 "-L.", "-ldragon_runtime",
-//                 "-lpthread", "-ldl", "-lm",
-//                 "-o", output_path.to_str().unwrap(),
-//             ])
-//             .status()
-//     } else {
-//         std::process::Command::new("cc")
-//             .args([
-//                 obj_path.to_str().unwrap(),
-//                 "aot_main_shim.o",
-//                 "-L.", "-ldragon_runtime",
-//                 "-lpthread", "-ldl", "-lm",
-//                 "-o", output_path.to_str().unwrap(),
-//             ])
-//             .status()
-//     }
-// };
-
-//             match link_status {
-//                 Ok(s) if s.success() => {
-//                     println!("Success! AOT binary: {}", output_path.display());
-//                     // Clean up intermediate .o
-//                     let _ = fs::remove_file(&obj_path);
-//                 }
-//                 Ok(s) => {
-//                     eprintln!("Linker exited with status {}", s);
-//                     std::process::exit(1);
-//                 }
-//                 Err(e) => {
-//                     eprintln!("Linker error: {}", e);
-//                     std::process::exit(1);
-//                 }
-//             }
-
-//             #[cfg(unix)]
-//             {
-//                 use std::os::unix::fs::PermissionsExt;
-//                 if let Ok(meta) = fs::metadata(output_path) {
-//                     let mut perms = meta.permissions();
-//                     perms.set_mode(0o755);
-//                     let _ = fs::set_permissions(output_path, perms);
-//                 }
-//             }
-//             return;
-//         }
 
        if is_lib_mode {
             let mut template_dir = exe_path.parent().unwrap().to_path_buf();
 
             let out_name = output_path.file_name().unwrap().to_string_lossy();
-            
+
             let template_name = if out_name.ends_with(".so") {
                 "libdragon_lib.so"
             } else if out_name.ends_with(".dylib") {
                 "libdragon_lib.dylib"
             } else {
-                "dragon_lib.dll" 
+                "dragon_lib.dll"
             };
 
             let template = template_dir.join(template_name);
@@ -584,7 +445,7 @@ fn main() {
             }
             fs::copy(&template, output_path).expect("Copy failed");
             println!("Created Shared Library: {:?}", output_path);
-        } 
+        }
         else {
             fs::copy(&exe_path, output_path).expect("Copy failed");
             println!("Created Executable: {:?}", output_path);
@@ -602,7 +463,7 @@ fn main() {
         outfile.write_all(&payload_bytes).unwrap();
         outfile.write_all(&payload_len.to_le_bytes()).unwrap();
         outfile.write_all(BUNDLE_SIGNATURE).unwrap();
-        
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -625,8 +486,6 @@ fn main() {
         env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
         populate_builtins(env.clone());
 
-        // The REPL shares one persistent VM so variables defined in one line
-        // are visible in the next — the env acts as the persistent scope.
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut repl_vm = Vm::new();
 
@@ -672,9 +531,19 @@ fn main() {
 
     let mut filename = command.to_string();
 
+    if command == "preview" {
+        std::process::exit(ui_preview::run_preview(&args[2..]));
+    }
+    if command == "migrate" {
+        std::process::exit(migrate::run(&args[2..]));
+    }
+    if command == "ui-dump" {
+        std::process::exit(ui_preview::run_dump(&args[2..]));
+    }
+
     if command == "create" {
         if args.len() < 3 {
-            eprintln!("Usage: dragon create <name> [--package <reverse.dns.name>]");
+            eprintln!("Usage: dragon create <name> [--package <reverse.dns.name>] [--platforms android,ios,windows|all] [--legacy-native]");
             std::process::exit(1);
         }
         let name = &args[2];
@@ -682,31 +551,96 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
             .unwrap_or_else(|| format!("com.example.{}", name.replace(['-', ' '], "_")));
-        if let Err(e) = android_project::create_project(name, &package) {
+        let legacy = args.iter().any(|a| a == "--legacy-native");
+        let plats = match platforms::flag_value(&args, "--platforms").or_else(|| platforms::flag_value(&args, "--platform")) {
+            Some(v) => platforms::parse_list(&v),
+            None => Ok(platforms::ALL.iter().map(|s| s.to_string()).collect()),
+        };
+        let plats = match plats {
+            Ok(p) => p,
+            Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+        };
+        let created = if legacy {
+            android_project::create_project(name, &package)
+        } else {
+            android_project::create_project_vm(name, &package, &plats)
+        };
+        if let Err(e) = created {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
         return;
     }
 
+    if command == "ios" {
+        let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+        let r = match sub {
+            "init" => ios_project::ios_init(),
+            "build" => ios_project::ios_build(args.iter().any(|a| a == "--simulator")),
+            _ => Err("Usage: dragon ios init | dragon ios build [--simulator]   (iOS support is UNTESTED, see docs/IOS.md)".to_string()),
+        };
+        if let Err(e) = r { eprintln!("Error: {}", e); std::process::exit(1); }
+        return;
+    }
+
+    if command == "windows" {
+        let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+        let release = args.iter().any(|a| a == "--release");
+        let r = match sub {
+            "init" => windows_project::windows_init(),
+            "build" => windows_project::windows_build(release).map(|_| ()),
+            "run" => windows_project::windows_run(release),
+            _ => Err("Usage: dragon windows init | build [--release] | run [--release]   (Windows support is UNTESTED, see docs/WINDOWS.md)".to_string()),
+        };
+        if let Err(e) = r { eprintln!("Error: {}", e); std::process::exit(1); }
+        return;
+    }
+
     if command == "build" {
         let release = args.iter().any(|a| a == "--release");
         let dragon_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("dragon"));
-        match android_project::build_android(&dragon_exe, release) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+        let declared = platforms::declared(Path::new("package.json"));
+        let wanted = match platforms::requested_build(&args, &declared) {
+            Ok(w) => w,
+            Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+        };
+        let mut failed: Vec<String> = Vec::new();
+        for p in &wanted {
+            println!("== {} ==", p);
+            let r = match p.as_str() {
+                "android" => android_project::build_android(&dragon_exe, release).map(|_| ()),
+                "ios" => ios_project::ios_build(args.iter().any(|a| a == "--simulator")),
+                "windows" => windows_project::windows_build(release).map(|_| ()),
+                _ => Ok(()),
+            };
+            if let Err(e) = r { eprintln!("Error ({}): {}", p, e); failed.push(p.clone()); }
         }
+        if !failed.is_empty() { eprintln!("Failed: {}", failed.join(", ")); std::process::exit(1); }
         return;
     }
 
     if command == "run" {
         let pkg_path = Path::new("package.json");
-        if pkg_path.exists() && android_project::is_android_project(pkg_path) {
+        let app_project = pkg_path.exists() && fs::read_to_string(pkg_path).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .map(|j| j.get("platform").is_some() || j.get("platforms").is_some()).unwrap_or(false);
+        if app_project {
             let dragon_exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("dragon"));
-            match android_project::run_android(&dragon_exe) {
+            let watch = args.iter().any(|a| a == "--watch" || a == "-w");
+            let release = args.iter().any(|a| a == "--release");
+            let declared = platforms::declared(pkg_path);
+            let target = match platforms::requested(&args, &declared) {
+                Ok(t) => t.into_iter().next().unwrap(),
+                Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+            };
+            let result = match target.as_str() {
+                "android" if watch => android_project::watch_android(&dragon_exe),
+                "android" => android_project::run_android(&dragon_exe),
+                "ios" => ios_project::ios_run(),
+                "windows" => windows_project::windows_run(release),
+                _ => Ok(()),
+            };
+            match result {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("Error: {}", e);
@@ -744,7 +678,7 @@ fn main() {
             let env = Arc::new(Mutex::new(Env::new(None, Some(abs_path))));
             env.lock().unwrap().store.insert("__modules__".into(), DgnValue::Map(Arc::new(Mutex::new(HashMap::new()))));
             populate_builtins(env.clone());
-            
+
             let mut argv_list = Vec::new();
             for a in args.iter().skip(2) { argv_list.push(DgnValue::String(a.clone())); }
             let _ = env.lock().unwrap().set("argv", DgnValue::List(Arc::new(Mutex::new(argv_list))));
@@ -790,35 +724,33 @@ fn main() {
     }
 }
 
-
-
 fn hide_windows_console(path: &Path) -> std::io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let mut dos_header = [0u8; 64];
-    
+
     if file.read_exact(&mut dos_header).is_err() {
-        return Ok(()); 
+        return Ok(());
     }
-    
+
     if dos_header[0] != b'M' || dos_header[1] != b'Z' {
-        return Ok(()); 
+        return Ok(());
     }
-    
+
     let pe_offset = u32::from_le_bytes(dos_header[60..64].try_into().unwrap()) as u64;
-    
+
     file.seek(SeekFrom::Start(pe_offset))?;
     let mut pe_sig = [0u8; 4];
     file.read_exact(&mut pe_sig)?;
 
     if &pe_sig != b"PE\0\0" {
-        return Ok(()); 
+        return Ok(());
     }
-    
+
     let subsystem_offset = pe_offset + 92;
     file.seek(SeekFrom::Start(subsystem_offset))?;
-    
+
     let gui_subsystem: u16 = 2;
     file.write_all(&gui_subsystem.to_le_bytes())?;
-    
+
     Ok(())
 }

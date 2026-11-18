@@ -43,8 +43,8 @@ struct Buffer {
     lines:   Vec<Vec<char>>,
     dirty:   bool,
     path:    Option<String>,
-    undo_stack: Vec<(Vec<Vec<char>>, usize, usize)>, 
-    redo_stack: Vec<(Vec<Vec<char>>, usize, usize)>, 
+    undo_stack: Vec<(Vec<Vec<char>>, usize, usize)>,
+    redo_stack: Vec<(Vec<Vec<char>>, usize, usize)>,
 }
 
 impl Buffer {
@@ -54,8 +54,8 @@ impl Buffer {
             lines: src.lines().map(|l| l.chars().collect()).collect(),
             dirty: false,
             path:  None,
-            undo_stack: Vec::new(), 
-            redo_stack: Vec::new(), 
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -126,12 +126,10 @@ impl Buffer {
 
     fn insert_newline(&mut self, row: usize, col: usize) -> (usize, usize) {
         let rest: Vec<char> = self.lines[row].drain(col..).collect();
-        // auto-indent: count leading spaces of current line
         let indent: Vec<char> = self.lines[row].iter()
             .take_while(|&&c| c == ' ')
             .cloned()
             .collect();
-        // extra indent after '{'
         let extra = if self.lines[row].last() == Some(&'{') { 2usize } else { 0 };
         let mut new_line = indent.clone();
         for _ in 0..extra { new_line.push(' '); }
@@ -151,7 +149,6 @@ impl Buffer {
     }
 
      fn snapshot(&mut self, row: usize, col: usize) {
-        // Keep at most 200 undo steps
         if self.undo_stack.len() >= 200 { self.undo_stack.remove(0); }
         self.undo_stack.push((self.lines.clone(), row, col));
         self.redo_stack.clear();
@@ -176,7 +173,6 @@ impl Buffer {
     }
 }
 
-// ── Output log ───────────────────────────────────────────────────
 struct OutputLog {
     lines: Vec<(Color, String)>,
 }
@@ -193,7 +189,6 @@ impl OutputLog {
     }
 }
 
-// ── Modal ────────────────────────────────────────────────────────
 struct Modal {
     title:   String,
     lines:   Vec<String>,
@@ -215,13 +210,13 @@ struct Editor {
     active:     usize,
     cur_row:    usize,
     cur_col:    usize,
-    scroll_top: usize,   
+    scroll_top: usize,
     output:     OutputLog,
     modal:      Modal,
     status:     String,
-    menu_focus: bool,   
+    menu_focus: bool,
     search_term:   String,
-    search_pos:    Option<(usize, usize)>,   
+    search_pos:    Option<(usize, usize)>,
     version:       String,
 }
 
@@ -279,7 +274,6 @@ impl Editor {
     }
 
     fn open_file(&mut self, path: &str) {
-        // check if already open
         if let Some(i) = self.buffers.iter().position(|b| b.path.as_deref() == Some(path)) {
             self.switch_file(i);
             return;
@@ -325,7 +319,7 @@ impl Editor {
         crate::engine::populate_builtins(env.clone());
 
         let output_cap = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         let cap_clone1 = output_cap.clone();
         let _ = env.lock().unwrap().set("show", crate::engine::native_fn(move |args| {
             let s = args.iter().map(crate::engine::val_to_string).collect::<Vec<_>>().join(" ");
@@ -344,19 +338,19 @@ impl Editor {
         let (tx_reply,  rx_reply)  = std::sync::mpsc::channel::<String>();
 
         let tx_p = tx_prompt.clone();
-        let rx_r_arc = std::sync::Arc::new(std::sync::Mutex::new(rx_reply));          
+        let rx_r_arc = std::sync::Arc::new(std::sync::Mutex::new(rx_reply));
 
         let _ = env.lock().unwrap().set("readln", crate::engine::native_fn(move |args| {
             let prompt = args.get(0)
                 .map(crate::engine::val_to_string)
                 .unwrap_or_default();
             let _ = tx_p.send(prompt);
-            
+
             let reply = rx_r_arc.lock().unwrap().recv().unwrap_or_default();
-            
+
             Ok(crate::engine::DgnValue::String(reply))
         }));
-    
+
         let mut vm = crate::engine::Vm::new();
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -395,7 +389,7 @@ impl Editor {
         {
             let lines = output_cap.lock().unwrap();
             for line in lines.iter() {
-                for sub in line.lines() { 
+                for sub in line.lines() {
                     self.output.push(C_WHITE, sub);
                 }
             }
@@ -528,7 +522,6 @@ fn tokenize(line: &str) -> Vec<Token> {
     let mut i = 0usize;
 
     while i < len {
-        // string literal
         if bytes[i] == b'"' {
             let start = i;
             i += 1;
@@ -537,14 +530,12 @@ fn tokenize(line: &str) -> Vec<Token> {
             tokens.push(Token::StringLit(&line[start..i]));
             continue;
         }
-        // number
         if bytes[i].is_ascii_digit() {
             let start = i;
             while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') { i += 1; }
             tokens.push(Token::Number(&line[start..i]));
             continue;
         }
-        // identifier / keyword
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
@@ -556,7 +547,6 @@ fn tokenize(line: &str) -> Vec<Token> {
             }
             continue;
         }
-        // single char
         tokens.push(Token::Other(&line[i..i+1]));
         i += 1;
     }
@@ -662,7 +652,6 @@ fn render(stdout: &mut io::Stdout, ed: &Editor, cols: u16, rows: u16) -> io::Res
             let fill = editor_width.saturating_sub(used + if is_cursor_row { 1 } else { 0 });
             queue!(stdout, SetBackgroundColor(bg), Print(" ".repeat(fill)))?;
         } else {
-            // empty row
             queue!(stdout, Print(format!("{:<width$}", "", width=editor_width)))?;
         }
         queue!(stdout, ResetColor)?;
@@ -713,7 +702,7 @@ fn print_highlighted(stdout: &mut io::Stdout, text: &str, bg: Color) -> io::Resu
             Token::Number(s)   => { queue!(stdout, SetForegroundColor(C_MGNT),   Print(s))?; }
             Token::Other(s)    => { queue!(stdout, SetForegroundColor(C_WHITE),  Print(s))?; }
         }
-        let _ = bg; 
+        let _ = bg;
     }
     Ok(())
 }
@@ -926,7 +915,7 @@ fn tui_readln(
     cols: u16,
     rows: u16,
 ) -> io::Result<String> {
-    let out_row = rows - 2; 
+    let out_row = rows - 2;
     queue!(
         stdout,
         cursor::MoveTo(0, out_row),
@@ -970,7 +959,6 @@ fn tui_readln(
     Ok(input)
 }
 
-// ── Main event loop ───────────────────────────────────────────────
 fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -> io::Result<()> {
     let mut ed = Editor::new(version, build, author);
     let (mut cols, mut rows) = terminal::size()?;
@@ -994,7 +982,6 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                 }
 
                 match (code, modifiers) {
-                    // ── Quit ──────────────────────────────────────
                     (KeyCode::Char('q'), KeyModifiers::CONTROL) => break,
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
 
@@ -1100,7 +1087,7 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         let r = ed.cur_row;
                         let c = ed.cur_col;
                         let (new_r, new_c) = ed.buf_mut().backspace(r, c);
-                        ed.cur_row = new_r; 
+                        ed.cur_row = new_r;
                         ed.cur_col = new_c;
                     }
 
@@ -1216,7 +1203,7 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         let r = ed.cur_row;
                         let c = ed.cur_col;
                         let (new_r, new_c) = ed.buf_mut().backspace(r, c);
-                        ed.cur_row = new_r; 
+                        ed.cur_row = new_r;
                         ed.cur_col = new_c;
                     }
                     (KeyCode::Delete, _) => {
@@ -1233,7 +1220,7 @@ fn ide_loop(stdout: &mut io::Stdout, version: &str, build: &str, author: &str) -
                         let r = ed.cur_row;
                         let c = ed.cur_col;
                         let (new_r, new_c) = ed.buf_mut().insert_newline(r, c);
-                        ed.cur_row = new_r; 
+                        ed.cur_row = new_r;
                         ed.cur_col = new_c;
                     }
                     (KeyCode::Char(ch), m)

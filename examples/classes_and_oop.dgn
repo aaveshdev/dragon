@@ -1,9 +1,3 @@
-// ─────────────────────────────────────────────────────────────
-// classes_and_oop.dgn
-// Classes, constructors, inheritance, and method overriding
-// Run with:  dragon classes_and_oop.dgn
-// ─────────────────────────────────────────────────────────────
-
 class Animal {
     func init(name, sound) {
         this.name = name
@@ -29,7 +23,6 @@ class Dog extends Animal {
         this.tricks.push(trick)
     }
 
-    // Override the parent's describe() method
     func describe() {
         return `I am ${this.name}, a good dog who knows ${len(this.tricks)} trick(s).`
     }

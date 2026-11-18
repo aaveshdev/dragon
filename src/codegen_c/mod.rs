@@ -1,11 +1,3 @@
-//! codegen_c.rs — Dragon → C transpiler
-//!
-//! Translates a Dragon AST into a self-contained C99 source file that can be
-//! compiled by GCC, Clang, or MSVC on any platform.
-//!
-//! Usage (from main.rs):
-//!   dragon -c input.dgn -o app --native
-
 #![allow(dead_code)]
 
 use std::fmt::Write as FmtWrite;
@@ -16,40 +8,32 @@ use std::process::Command;
 use std::path::PathBuf;
 use crate::engine::{Expr, ExprNode, Stmt, StmtNode, lex, Parser};
 
-mod target;
+pub mod target;
 pub use target::CrossTarget;
 use target::{ndk_clang_path, ios_clang_and_sysroot};
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Public entry point
-// ─────────────────────────────────────────────────────────────────────────────
 fn is_builtin_module(name: &str) -> bool {
     matches!(
         name,
         "math" | "file" | "os" | "path" | "time" | "json" | "base64"
         | "net" | "http" | "ffi" | "struct" | "mem" | "thread"
-        | "uuid" | "crypto" | "pdf" | "xml" | "zip"
+        | "uuid" | "crypto" | "pdf" | "xml" | "zip" | "hw" | "task" | "gfx" | "input" | "con" | "disk" | "proc" | "blob"
     )
 }
 
-/// Cross-compilation options for `--native --lib --target ...`. Empty
-/// `targets` means "compile for the host" (the original behavior).
 #[derive(Default, Clone)]
 pub struct CrossBuildOptions {
     pub targets: Vec<CrossTarget>,
-    pub android_api: u32,       // default 24 — see main.rs
-    pub ios_min_version: String, // e.g. "13.0"
+    pub android_api: u32,
+    pub ios_min_version: String,
     pub make_xcframework: bool,
-    /// When both are set, Android slices additionally get
-    /// `Java_<package>_<class>_<fn>` JNI wrappers spliced in, so the .so is
-    /// directly `System.loadLibrary()`-able — no separate JNI bridge needed.
     pub jni_package: Option<String>,
     pub jni_class: Option<String>,
 }
 
 pub fn compile_to_native_c(
     ast: &Stmt,
-    src_path: &Path,          // ← new: path to the .dgn entry file
+    src_path: &Path,
     out_path: &Path,
     keep_c: bool,
     is_lib: bool,
@@ -66,17 +50,14 @@ pub fn compile_to_native_c(
     }
 
     let base_dir = src_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    // --native --lib has no runtime import mechanism (it's one flat C
-    // translation unit), so `import "file.dgn";` is resolved here, once,
-    // at compile time: recursively load and merge every imported file's
-    // top-level declarations into a single combined AST before anything
-    // downstream (transpilation, header generation, JNI wrapper
-    // generation) ever looks at it -- all three need to see the same
-    // fully-merged function/global set, not just the entry file's own.
     let flattened_lib_ast;
+    let flattened_exe_ast;
     let ast: &Stmt = if is_lib {
         flattened_lib_ast = flatten_imports_for_lib(ast, &base_dir, &mut std::collections::HashSet::new())?;
         &flattened_lib_ast
+    } else if let Some(f) = app::flatten_for_executable(ast, src_path)? {
+        flattened_exe_ast = f;
+        &flattened_exe_ast
     } else {
         ast
     };
@@ -84,7 +65,7 @@ pub fn compile_to_native_c(
     let c_src = if is_lib {
         transpile_native_lib(ast).map_err(|e| e)?
     } else {
-        transpile(ast, false, &base_dir)   // ← pass base_dir
+        transpile(ast, false, &base_dir)
     };
 
     let c_path = {
@@ -107,16 +88,9 @@ pub fn compile_to_native_c(
             return Err("C compiler exited with non-zero status".into());
         }
     } else {
-        // Cross-compiling: the generated header is needed up front so it can
-        // be bundled alongside each iOS static-library slice for xcframework
-        // packaging (the host path only needs it after the build succeeds).
         let stem = out_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
         let header_text = generate_native_lib_header(ast, &stem).ok();
 
-        // If JNI wrappers were requested, build a second, Android-only
-        // source file with `#include <jni.h>` + the Java_-prefixed wrappers
-        // appended — this must stay separate from `c_path` because iOS
-        // slices compile from the same base source and have no `<jni.h>`.
         let mut android_jni_path: Option<PathBuf> = None;
         if is_lib {
             if let (Some(pkg), Some(cls)) = (&cross.jni_package, &cross.jni_class) {
@@ -165,12 +139,6 @@ pub fn compile_to_native_c(
                 }
             }
             Err(e) => {
-                // The library itself already compiled successfully (this
-                // function only re-derives signatures for the header, using
-                // the exact same rules) — a failure here would only happen
-                // if transpile_native_lib itself had already errored out
-                // above, so this is unreachable in practice, but fail soft
-                // rather than losing an otherwise-successful build.
                 println!("  [native] warning: could not generate header: {}", e);
             }
         }
@@ -178,10 +146,6 @@ pub fn compile_to_native_c(
 
     Ok(())
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Compiler detection + invocation
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn invoke_compiler(
     c_path: &Path,
@@ -191,7 +155,6 @@ fn invoke_compiler(
 ) -> Result<bool, String> {
     let c_str = c_path.to_str().unwrap();
 
-    // For shared libraries, ensure the output has the correct platform extension.
     let lib_path_buf;
     let o_str = if is_lib {
         let stem = out_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -215,19 +178,17 @@ fn invoke_compiler(
         if which_exists("cl") {
             let fe_arg = format!("/Fe:{}", o_str);
             let mut args: Vec<&str> = vec![c_str, &fe_arg, "/O2", "/nologo"];
-            
+
             args.push("/DDGN_NO_GC");
-            
+
             if is_lib {
-                // /LDd would be debug; /LD /MT = release DLL with static CRT
-                // Static CRT (/MT) means no VCRUNTIME140.dll dependency — loads anywhere
                 args.push("/LD");
                 args.push("/MT");
             } else {
                 args.push("/MT");
             }
             if is_window { args.extend(&["/link", "/SUBSYSTEM:WINDOWS"]); }
-            
+
             let ok = Command::new("cl").args(&args).status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -272,16 +233,6 @@ fn run_gcc(
     is_lib: bool,
     is_window: bool,
 ) -> Result<bool, String> {
-    // Optimization level.
-    //
-    // The GC-safety restriction below (plain -O3's more aggressive inlining
-    // can hide a live pointer from our conservative stack-scanning GC —
-    // see the long comment in the else-branch) simply doesn't apply here
-    // when compiling a --lib build: transpile_native_lib emits plain C with
-    // no DgnVal boxing, no dgn_gc_alloc, no GC at all, so there's nothing
-    // for aggressive inlining to hide from a collector that was never
-    // going to run. Full -O3 is safe and strictly better for a compiled
-    // shared library other languages will call into a lot.
     let opt_flags: &[&str] = if is_lib {
         &["-O3"]
     } else if cc == "gcc" {
@@ -296,8 +247,6 @@ fn run_gcc(
         args.push("-shared");
         args.push("-fPIC");
     }
-    // On Windows with gcc/clang (MSYS2/MinGW), -mwindows sets SUBSYSTEM:WINDOWS
-    // which hides the console window. Not valid on Linux/macOS.
     if is_window && cfg!(target_os = "windows") {
         args.push("-mwindows");
     }
@@ -321,7 +270,6 @@ fn which_exists(name: &str) -> bool {
     .map(|o| o.status.success())
     .unwrap_or(false)
 }
-
 
 fn invoke_cross_compiler(
     c_path: &Path,
@@ -352,7 +300,7 @@ fn invoke_cross_compiler(
                     }
                     let so_name = format!("lib{}.so", stem);
                     let so_path = abi_dir.join(&so_name);
- 
+
                     let soname_flag = format!("-Wl,-soname,{}", so_name);
                     let args = [
                         android_c_str, "-shared", "-fPIC", "-O3",
@@ -373,14 +321,13 @@ fn invoke_cross_compiler(
         }
     }
 
-
     let ios_targets: Vec<CrossTarget> =
         cross.targets.iter().copied().filter(|t| t.is_ios()).collect();
     let mut built_slices: Vec<(CrossTarget, PathBuf)> = Vec::new();
     if !ios_targets.is_empty() {
         let ios_dir = out_dir.join("ios");
         for t in ios_targets {
-            match build_ios_slice(c_str, &ios_dir, stem, t, &cross.ios_min_version) {
+            match build_ios_slice(c_str, &ios_dir, stem, t, &cross.ios_min_version, &[]) {
                 Ok(a_path) => built_slices.push((t, a_path)),
                 Err(e) => errors.push(format!("[{}] {}", t.label(), e)),
             }
@@ -407,12 +354,13 @@ fn invoke_cross_compiler(
     }
 }
 
-fn build_ios_slice(
+pub(crate) fn build_ios_slice(
     c_str: &str,
     ios_dir: &Path,
     stem: &str,
     target: CrossTarget,
     min_version: &str,
+    extra: &[&str],
 ) -> Result<PathBuf, String> {
     let (clang, sysroot) = ios_clang_and_sysroot(target)?;
     let slice_dir = ios_dir.join(target.label());
@@ -425,9 +373,10 @@ fn build_ios_slice(
         "-arch", target.ios_arch(),
         "-target", &triple,
         "-isysroot", sysroot.to_str().unwrap(),
-        "-O3", "-fPIC",
+        "-O2", "-fPIC",
         "-o", obj_path.to_str().unwrap(),
     ];
+    let compile_args: Vec<&str> = compile_args.iter().copied().chain(extra.iter().copied()).collect();
     println!("  [native] [{}] compiling with {} (-target {})", target.label(), clang.display(), triple);
     let status = Command::new(&clang).args(compile_args).status()
         .map_err(|e| format!("failed to launch {}: {}", clang.display(), e))?;
@@ -447,10 +396,7 @@ fn build_ios_slice(
     Ok(a_path)
 }
 
-/// Merges the built slices per platform-variant (lipo-ing the two simulator
-/// archs into one fat `.a` if both were built) and calls
-/// `xcodebuild -create-xcframework` to produce `<stem>.xcframework`.
-fn package_xcframework(
+pub(crate) fn package_xcframework(
     out_dir: &Path,
     stem: &str,
     slices: &[(CrossTarget, PathBuf)],
@@ -489,7 +435,7 @@ fn package_xcframework(
     }
 
     let xc_path = out_dir.join(format!("{}.xcframework", stem));
-    let _ = fs::remove_dir_all(&xc_path); // xcodebuild refuses to overwrite an existing bundle
+    let _ = fs::remove_dir_all(&xc_path);
     let mut args = vec!["xcodebuild".to_string(), "-create-xcframework".to_string()];
     if let Some(ref d) = device_lib {
         args.push("-library".into());
@@ -514,11 +460,15 @@ fn package_xcframework(
     Ok(xc_path)
 }
 
+mod app;
+pub mod baremetal;
+mod modpass;
 mod mangle;
 mod native;
 mod runtime;
 mod transpiler;
 
+pub use app::compile_app;
 pub(crate) use mangle::*;
 pub(crate) use native::*;
 pub(crate) use runtime::*;

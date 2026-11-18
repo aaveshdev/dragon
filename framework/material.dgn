@@ -1,0 +1,1660 @@
+import "dragon/core" as *
+import "dragon/runtime" as *
+import "dragon/widgets" as *
+
+func u_eq(a, b) {
+    if (typeof(a) == "instance" or typeof(b) == "instance") { return same(a, b) }
+    return a == b
+}
+
+func u_hue_to_rgb(p, q, t) {
+    k = t
+    if (k < 0) { k = k + 1 }
+    if (k > 1) { k = k - 1 }
+    if (k < 1 / 6) { return p + (q - p) * 6 * k }
+    if (k < 1 / 2) { return q }
+    if (k < 2 / 3) { return p + (q - p) * (2 / 3 - k) * 6 }
+    return p
+}
+
+func u_hsl(h, s, l) {
+    hh = (h % 360) / 360
+    if (hh < 0) { hh = hh + 1 }
+    if (s <= 0) {
+        v = round_int(l * 255)
+        return Color.fromARGB(255, v, v, v)
+    }
+    q = l < 0.5 ? l * (1 + s) : l + s - l * s
+    p = 2 * l - q
+    return Color.fromARGB(255,
+        round_int(u_hue_to_rgb(p, q, hh + 1 / 3) * 255),
+        round_int(u_hue_to_rgb(p, q, hh) * 255),
+        round_int(u_hue_to_rgb(p, q, hh - 1 / 3) * 255))
+}
+
+func u_to_hsl(c) {
+    r = c.r / 255
+    g = c.g / 255
+    b = c.b / 255
+    mx = max(r, max(g, b))
+    mn = min(r, min(g, b))
+    l = (mx + mn) / 2
+    h = 0
+    s = 0
+    d = mx - mn
+    if (d > 0.00001) {
+        s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn)
+        if (mx == r) { h = (g - b) / d + (g < b ? 6 : 0) }
+        elif (mx == g) { h = (b - r) / d + 2 }
+        else { h = (r - g) / d + 4 }
+        h = h * 60
+    }
+    return [h, s, l]
+}
+
+class Palette {
+    func init(primary, onPrimary = null, primaryContainer = null, onPrimaryContainer = null,
+              secondary = null, onSecondary = null, secondaryContainer = null, onSecondaryContainer = null,
+              tertiary = null, error = null, onError = null, surface = null, onSurface = null,
+              surfaceVariant = null, onSurfaceVariant = null, outline = null, outlineVariant = null,
+              inverseSurface = null, onInverseSurface = null, background = null, onBackground = null,
+              brightness = "light") {
+        this.brightness = brightness
+        this.primary = primary
+        this.onPrimary = onPrimary ?? Colors.white
+        this.primaryContainer = primaryContainer ?? primary.lighten(0.7)
+        this.onPrimaryContainer = onPrimaryContainer ?? primary.darken(0.6)
+        this.secondary = secondary ?? primary
+        this.onSecondary = onSecondary ?? Colors.white
+        this.secondaryContainer = secondaryContainer ?? primary.lighten(0.8)
+        this.onSecondaryContainer = onSecondaryContainer ?? primary.darken(0.6)
+        this.tertiary = tertiary ?? primary
+        this.error = error ?? Color(4290190364)
+        this.onError = onError ?? Colors.white
+        this.surface = surface ?? Colors.white
+        this.onSurface = onSurface ?? Colors.black
+        this.surfaceVariant = surfaceVariant ?? Colors.grey.shade200
+        this.onSurfaceVariant = onSurfaceVariant ?? Colors.grey.shade700
+        this.outline = outline ?? Colors.grey.shade500
+        this.outlineVariant = outlineVariant ?? Colors.grey.shade300
+        this.inverseSurface = inverseSurface ?? Colors.grey.shade900
+        this.onInverseSurface = onInverseSurface ?? Colors.white
+        this.background = background ?? this.surface
+        this.onBackground = onBackground ?? this.onSurface
+    }
+
+    func fromSeed(seedColor, brightness = "light") {
+        hsl = u_to_hsl(seedColor)
+        h = hsl[0]
+        s = u_clamp(hsl[1], 0.30, 0.90)
+        if (brightness == "dark") {
+            return Palette(
+                primary: u_hsl(h, s, 0.78), onPrimary: u_hsl(h, s, 0.18),
+                primaryContainer: u_hsl(h, s * 0.8, 0.28), onPrimaryContainer: u_hsl(h, s, 0.90),
+                secondary: u_hsl(h, s * 0.35, 0.78), onSecondary: u_hsl(h, s * 0.35, 0.18),
+                secondaryContainer: u_hsl(h, s * 0.30, 0.28), onSecondaryContainer: u_hsl(h, s * 0.35, 0.90),
+                tertiary: u_hsl(h + 60, s * 0.5, 0.78),
+                error: Color(4294948011), onError: Color(4285071365),
+                surface: u_hsl(h, 0.10, 0.10), onSurface: u_hsl(h, 0.08, 0.90),
+                surfaceVariant: u_hsl(h, 0.10, 0.25), onSurfaceVariant: u_hsl(h, 0.10, 0.78),
+                outline: u_hsl(h, 0.06, 0.60), outlineVariant: u_hsl(h, 0.08, 0.30),
+                inverseSurface: u_hsl(h, 0.08, 0.90), onInverseSurface: u_hsl(h, 0.10, 0.15),
+                brightness: "dark")
+        }
+        return Palette(
+            primary: u_hsl(h, s, 0.40), onPrimary: Colors.white,
+            primaryContainer: u_hsl(h, s * 0.9, 0.90), onPrimaryContainer: u_hsl(h, s, 0.12),
+            secondary: u_hsl(h, s * 0.35, 0.40), onSecondary: Colors.white,
+            secondaryContainer: u_hsl(h, s * 0.35, 0.90), onSecondaryContainer: u_hsl(h, s * 0.4, 0.12),
+            tertiary: u_hsl(h + 60, s * 0.5, 0.40),
+            error: Color(4290190364), onError: Colors.white,
+            surface: u_hsl(h, 0.20, 0.98), onSurface: u_hsl(h, 0.08, 0.10),
+            surfaceVariant: u_hsl(h, 0.15, 0.90), onSurfaceVariant: u_hsl(h, 0.10, 0.30),
+            outline: u_hsl(h, 0.06, 0.46), outlineVariant: u_hsl(h, 0.10, 0.80),
+            inverseSurface: u_hsl(h, 0.08, 0.20), onInverseSurface: u_hsl(h, 0.10, 0.95),
+            brightness: "light")
+    }
+
+    func light(primary = null) {
+        return Palette.fromSeed(primary == null ? Colors.indigo : primary, "light")
+    }
+    func dark(primary = null) {
+        return Palette.fromSeed(primary == null ? Colors.indigo : primary, "dark")
+    }
+
+    func toJson() {
+        return {
+            dark: this.brightness == "dark",
+            primary: u_color(this.primary), onPrimary: u_color(this.onPrimary),
+            primaryContainer: u_color(this.primaryContainer), onPrimaryContainer: u_color(this.onPrimaryContainer),
+            secondary: u_color(this.secondary), onSecondary: u_color(this.onSecondary),
+            secondaryContainer: u_color(this.secondaryContainer), onSecondaryContainer: u_color(this.onSecondaryContainer),
+            tertiary: u_color(this.tertiary),
+            error: u_color(this.error), onError: u_color(this.onError),
+            surface: u_color(this.surface), onSurface: u_color(this.onSurface),
+            surfaceVariant: u_color(this.surfaceVariant), onSurfaceVariant: u_color(this.onSurfaceVariant),
+            outline: u_color(this.outline), outlineVariant: u_color(this.outlineVariant),
+            inverseSurface: u_color(this.inverseSurface), onInverseSurface: u_color(this.onInverseSurface),
+            background: u_color(this.background), onBackground: u_color(this.onBackground)
+        }
+    }
+}
+
+class FontSet {
+    func init() {
+        this.displayLarge = Font(fontSize: 57, height: 1.12)
+        this.displayMedium = Font(fontSize: 45, height: 1.16)
+        this.displaySmall = Font(fontSize: 36, height: 1.22)
+        this.headlineLarge = Font(fontSize: 32, height: 1.25)
+        this.headlineMedium = Font(fontSize: 28, height: 1.29)
+        this.headlineSmall = Font(fontSize: 24, height: 1.33)
+        this.titleLarge = Font(fontSize: 22, height: 1.27)
+        this.titleMedium = Font(fontSize: 16, fontWeight: 500, height: 1.5)
+        this.titleSmall = Font(fontSize: 14, fontWeight: 500, height: 1.43)
+        this.bodyLarge = Font(fontSize: 16, height: 1.5)
+        this.bodyMedium = Font(fontSize: 14, height: 1.43)
+        this.bodySmall = Font(fontSize: 12, height: 1.33)
+        this.labelLarge = Font(fontSize: 14, fontWeight: 500, height: 1.43)
+        this.labelMedium = Font(fontSize: 12, fontWeight: 500, height: 1.33)
+        this.labelSmall = Font(fontSize: 11, fontWeight: 500, height: 1.45)
+    }
+}
+
+class TopBarTheme {
+    func init(backgroundColor = null, foregroundColor = null, elevation = null, centerTitle = null, titleTextStyle = null) {
+        this.backgroundColor = backgroundColor
+        this.foregroundColor = foregroundColor
+        this.elevation = elevation
+        this.centerTitle = centerTitle
+        this.titleTextStyle = titleTextStyle
+    }
+}
+
+class ThemeSpec {
+    func init(colorScheme = null, primarySwatch = null, primaryColor = null, brightness = "light",
+              useMaterial3 = True, scaffoldBackgroundColor = null, appBarTheme = null, fontFamily = null,
+              textTheme = null, cardColor = null, dividerColor = null, visualDensity = null) {
+        base = colorScheme
+        if (base == null) {
+            seed = primarySwatch ?? primaryColor ?? Colors.indigo
+            base = Palette.fromSeed(seed, brightness)
+        }
+        this.colorScheme = base
+        this.brightness = base.brightness
+        this.useMaterial3 = useMaterial3
+        this.primaryColor = base.primary
+        this.scaffoldBackgroundColor = scaffoldBackgroundColor ?? base.surface
+        this.appBarTheme = appBarTheme ?? TopBarTheme()
+        this.fontFamily = fontFamily
+        this.textTheme = textTheme ?? FontSet()
+        this.cardColor = cardColor ?? (base.brightness == "dark" ? base.surface.lighten(0.06) : Colors.white)
+        this.dividerColor = dividerColor ?? base.outlineVariant
+    }
+    func light() { return ThemeSpec(brightness: "light") }
+    func dark() { return ThemeSpec(brightness: "dark") }
+    func copyWith(colorScheme = null, scaffoldBackgroundColor = null, appBarTheme = null, fontFamily = null, textTheme = null) {
+        return ThemeSpec(
+            colorScheme: colorScheme ?? this.colorScheme,
+            scaffoldBackgroundColor: scaffoldBackgroundColor ?? this.scaffoldBackgroundColor,
+            appBarTheme: appBarTheme ?? this.appBarTheme,
+            fontFamily: fontFamily ?? this.fontFamily,
+            textTheme: textTheme ?? this.textTheme,
+            useMaterial3: this.useMaterial3,
+            cardColor: this.cardColor,
+            dividerColor: this.dividerColor)
+    }
+    func toJson() {
+        out = {
+            scheme: this.colorScheme.toJson(),
+            dark: this.colorScheme.brightness == "dark",
+            background: u_color(this.scaffoldBackgroundColor),
+            font: this.fontFamily,
+            material3: this.useMaterial3,
+            divider: u_color(this.dividerColor)
+        }
+        return out
+    }
+}
+
+class Theme extends Provider {
+    func init(data, child = null, key = null) {
+        super.init(child: child, key: key)
+        this.data = data
+    }
+    func of(context) {
+        t = context.findInherited("Theme")
+        if (t == null) {
+            if (RT.fallback_theme == null) { RT.fallback_theme = ThemeSpec() }
+            return RT.fallback_theme
+        }
+        return t.data
+    }
+}
+RT.fallback_theme = null
+
+class DisplayInfo {
+    func init(m) {
+        this.size = Size(width: m.width, height: m.height)
+        this.devicePixelRatio = m.pixelRatio
+        this.padding = Insets(left: m.left, top: m.top, right: m.right, bottom: m.bottom)
+        this.viewPadding = this.padding
+        this.viewInsets = Insets(left: 0, top: 0, right: 0, bottom: m.keyboard)
+        this.platformBrightness = m.brightness
+        this.textScaleFactor = m.textScale
+        this.orientation = m.width > m.height ? "landscape" : "portrait"
+        this.locale = m.locale
+    }
+}
+
+class Display {
+    func of(context) { return DisplayInfo(RT.media) }
+    func sizeOf(context) { return Size(width: RT.media.width, height: RT.media.height) }
+}
+
+class App extends View {
+    func init(home = null, routes = null, initialRoute = null, onGenerateRoute = null, onUnknownRoute = null,
+              title = "", theme = null, darkTheme = null, themeMode = "system", builder = null,
+              debugShowCheckedModeBanner = True, navigatorKey = null, locale = null, key = null) {
+        super.init(key: key)
+        this.home = home
+        this.routes = routes
+        this.initialRoute = initialRoute
+        this.onGenerateRoute = onGenerateRoute
+        this.onUnknownRoute = onUnknownRoute
+        this.title = title
+        this.theme = theme
+        this.darkTheme = darkTheme
+        this.themeMode = themeMode
+        this.builder = builder
+    }
+    func build(context) {
+        wantDark = this.themeMode == "dark" or (this.themeMode == "system" and RT.media.brightness == "dark")
+        light = this.theme == null ? ThemeSpec() : this.theme
+        chosen = light
+        if (wantDark) {
+            if (this.darkTheme != null) {
+                chosen = this.darkTheme
+            } else {
+                chosen = ThemeSpec(brightness: "dark", colorScheme: Palette.fromSeed(light.colorScheme.primary, "dark"),
+                                   fontFamily: light.fontFamily, useMaterial3: light.useMaterial3)
+            }
+        }
+        RT.theme_json = chosen.toJson()
+        RT.fallback_theme = chosen
+        RT.title = this.title
+        body = NavHost(app: this)
+        if (this.builder != null) {
+            nav = body
+            body = Builder(builder: func(ctx) { return this.builder(ctx, nav) })
+        }
+        return Theme(data: chosen, child: TextDefaults(style: Font(), child: body))
+    }
+}
+
+class StateValue {
+    func init(value) { this.value = value }
+}
+class WidgetStateProperty {
+    func all(value) { return StateValue(value) }
+    func resolveWith(fn) { return StateValue(fn([])) }
+}
+MaterialStateProperty = WidgetStateProperty
+
+func u_sv(x) {
+    if (x == null) { return null }
+    if (typeof(x) == "instance" and class_name(x) == "StateValue") { return x.value }
+    return x
+}
+
+class ButtonLook {
+    func init(backgroundColor = null, foregroundColor = null, padding = null, shape = null, elevation = null,
+              minimumSize = null, side = null, textStyle = null, fixedSize = null) {
+        this.backgroundColor = u_sv(backgroundColor)
+        this.foregroundColor = u_sv(foregroundColor)
+        this.padding = u_sv(padding)
+        this.shape = u_sv(shape)
+        this.elevation = u_sv(elevation)
+        this.minimumSize = u_sv(minimumSize)
+        this.side = u_sv(side)
+        this.textStyle = u_sv(textStyle)
+        this.fixedSize = u_sv(fixedSize)
+    }
+}
+
+func u_style_from(backgroundColor, foregroundColor, padding, shape, elevation, minimumSize, side, textStyle, fixedSize) {
+    return ButtonLook(backgroundColor: backgroundColor, foregroundColor: foregroundColor, padding: padding,
+                       shape: shape, elevation: elevation, minimumSize: minimumSize, side: side,
+                       textStyle: textStyle, fixedSize: fixedSize)
+}
+
+func u_button_node(context, variant, onTap, onLongPress, child, style, extra) {
+    node = {
+        type: "button", variant: variant, enabled: onTap != null,
+        onPressed: context.on(onTap, "void"),
+        onLongPress: context.on(onLongPress, "void"),
+        child: context.build(child, 0)
+    }
+    if (style != null) {
+        node.bg = u_color(style.backgroundColor)
+        node.fg = u_color(style.foregroundColor)
+        node.padding = u_ins(style.padding)
+        node.elevation = style.elevation
+        if (style.shape != null) { node.shape = u_shape(style.shape) }
+        if (style.minimumSize != null) {
+            node.minWidth = style.minimumSize.width
+            node.minHeight = style.minimumSize.height
+        }
+        if (style.fixedSize != null) {
+            node.width = style.fixedSize.width
+            node.height = style.fixedSize.height
+        }
+        if (style.side != null) {
+            node.borderColor = u_color(style.side.color)
+            node.borderWidth = style.side.width
+        }
+        if (style.textStyle != null) { node.textStyle = u_style(style.textStyle) }
+    }
+    if (extra != null) {
+        for k in extra.keys() { node[k] = extra[k] }
+    }
+    return node
+}
+
+class Button extends RenderWidget {
+    func init(label = null, onTap = null, kind = "raised", icon = null, child = null, style = null, onLongPress = null, key = null) {
+        super.init(key: key)
+        if (typeof(icon) == "string") { icon = Icon(icon) }
+        this.label = label
+        this.onTap = onTap
+        this.kind = kind
+        this.icon = icon
+        this.style = style
+        this.onLongPress = onLongPress
+        if (child != null) {
+            this.child = child
+        } else if (icon != null and label != null) {
+            this.child = Row([icon, Text(label)], mainSize: "min", gap: 8)
+        } else if (label != null) {
+            this.child = Text(label)
+        } else {
+            this.child = icon
+        }
+    }
+    func styleFrom(backgroundColor = null, foregroundColor = null, padding = null, shape = null, elevation = null,
+                   minimumSize = null, side = null, textStyle = null, fixedSize = null) {
+        return u_style_from(backgroundColor, foregroundColor, padding, shape, elevation, minimumSize, side, textStyle, fixedSize)
+    }
+    func variantName() {
+        k = this.kind
+        if (k == "solid" or k == "filled") { return "filled" }
+        if (k == "tonal") { return "tonal" }
+        if (k == "line" or k == "outlined") { return "outlined" }
+        if (k == "flat" or k == "text") { return "text" }
+        return "elevated"
+    }
+    func toNode(context) {
+        return u_button_node(context, this.variantName(), this.onTap, this.onLongPress, this.child, this.style, null)
+    }
+}
+
+class SolidButton extends Button {
+    func init(label = null, onTap = null, icon = null, child = null, style = null, onLongPress = null, key = null) {
+        super.init(label, onTap: onTap, kind: "solid", icon: icon, child: child, style: style, onLongPress: onLongPress, key: key)
+    }
+}
+class LineButton extends Button {
+    func init(label = null, onTap = null, icon = null, child = null, style = null, onLongPress = null, key = null) {
+        super.init(label, onTap: onTap, kind: "line", icon: icon, child: child, style: style, onLongPress: onLongPress, key: key)
+    }
+}
+class FlatButton extends Button {
+    func init(label = null, onTap = null, icon = null, child = null, style = null, onLongPress = null, key = null) {
+        super.init(label, onTap: onTap, kind: "flat", icon: icon, child: child, style: style, onLongPress: onLongPress, key: key)
+    }
+}
+
+class IconButton extends RenderWidget {
+    func init(onTap, icon = null, color = null, iconSize = null, tooltip = null, style = null, key = null) {
+        super.init(key: key)
+        this.onTap = onTap
+        this.icon = icon
+        this.color = color
+        this.iconSize = iconSize
+        this.style = style
+        this.variant = "icon"
+    }
+    func filled(onTap, icon = null, color = null, iconSize = null, key = null) {
+        b = IconButton(onTap, icon: icon, color: color, iconSize: iconSize, key: key)
+        b.variant = "iconFilled"
+        return b
+    }
+    func tonal(onTap, icon = null, color = null, iconSize = null, key = null) {
+        b = IconButton(onTap, icon: icon, color: color, iconSize: iconSize, key: key)
+        b.variant = "iconTonal"
+        return b
+    }
+    func outlined(onTap, icon = null, color = null, iconSize = null, key = null) {
+        b = IconButton(onTap, icon: icon, color: color, iconSize: iconSize, key: key)
+        b.variant = "iconOutlined"
+        return b
+    }
+    func toNode(context) {
+        extra = {fg: u_color(this.color), iconSize: this.iconSize}
+        return u_button_node(context, this.variant, this.onTap, null, this.icon, this.style, extra)
+    }
+}
+
+class ActionButton extends RenderWidget {
+    func init(onTap, child = null, backgroundColor = null, foregroundColor = null, mini = False, tooltip = null,
+              shape = null, label = null, heroTag = null, elevation = null, key = null) {
+        super.init(key: key)
+        this.onTap = onTap
+        this.child = child
+        this.backgroundColor = backgroundColor
+        this.foregroundColor = foregroundColor
+        this.mini = mini
+        this.shape = shape
+        this.label = label
+        this.variant = mini ? "fabSmall" : "fab"
+        this.elevation = elevation
+    }
+    func small(onTap, child = null, backgroundColor = null, foregroundColor = null, key = null) {
+        f = ActionButton(onTap, child: child, backgroundColor: backgroundColor, foregroundColor: foregroundColor, key: key)
+        f.variant = "fabSmall"
+        return f
+    }
+    func large(onTap, child = null, backgroundColor = null, foregroundColor = null, key = null) {
+        f = ActionButton(onTap, child: child, backgroundColor: backgroundColor, foregroundColor: foregroundColor, key: key)
+        f.variant = "fabLarge"
+        return f
+    }
+    func extended(onTap, label, icon = null, backgroundColor = null, foregroundColor = null, key = null) {
+        f = ActionButton(onTap, child: icon, backgroundColor: backgroundColor, foregroundColor: foregroundColor, key: key)
+        f.label = label
+        f.variant = "fabExtended"
+        return f
+    }
+    func toNode(context) {
+        node = {
+            type: "button", variant: this.variant, enabled: True,
+            onPressed: context.on(this.onTap, "void"),
+            bg: u_color(this.backgroundColor), fg: u_color(this.foregroundColor),
+            elevation: this.elevation, shape: u_shape(this.shape),
+            child: context.build(this.child, 0)
+        }
+        if (this.label != null) { node.label = context.build(this.label, 1) }
+        return node
+    }
+}
+
+class Surface extends RenderWidget {
+    func init(child = null, color = null, elevation = 0, borderRadius = null, shape = null, type = "canvas",
+              padding = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.color = color
+        this.elevation = elevation
+        this.borderRadius = borderRadius
+        this.shape = shape
+        this.padding = padding
+    }
+    func toNode(context) {
+        th = Theme.of(context)
+        node = {
+            type: "container", color: u_color(this.color ?? th.scaffoldBackgroundColor),
+            padding: u_ins(this.padding), elevation: this.elevation, clip: True,
+            child: context.build(this.child, 0)
+        }
+        if (this.borderRadius != null) { node.radius = u_radius(this.borderRadius) }
+        if (this.shape != null) {
+            node.radius = this.shape.borderRadius == null ? null : u_radius(this.shape.borderRadius)
+            if (this.shape.kind == "circle") { node.shape = "circle" }
+            if (this.shape.kind == "stadium") { node.radius = u_radius(999) }
+        }
+        return node
+    }
+}
+
+class Card extends RenderWidget {
+    func init(child = null, color = null, elevation = null, margin = null, shape = null, borderRadius = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.color = color
+        this.elevation = elevation
+        this.margin = margin
+        this.shape = shape
+        this.borderRadius = borderRadius
+    }
+    func toNode(context) {
+        th = Theme.of(context)
+        radius = u_radius(Corners.circular(12))
+        if (this.shape != null and this.shape.borderRadius != null) { radius = u_radius(this.shape.borderRadius) }
+        elev = this.elevation == null ? 1 : this.elevation
+        node = {
+            type: "container", color: u_color(this.color ?? th.cardColor), radius: radius,
+            margin: u_ins(this.margin == null ? Insets.all(4) : this.margin),
+            elevation: elev, clip: True, child: context.build(this.child, 0)
+        }
+        if (this.shape != null and this.shape.side != null) {
+            node.border = {color: u_color(this.shape.side.color), width: this.shape.side.width}
+        }
+        return node
+    }
+}
+
+class Avatar extends View {
+    func init(child = null, backgroundColor = null, foregroundColor = null, backgroundImage = null, radius = 20, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.backgroundColor = backgroundColor
+        this.foregroundColor = foregroundColor
+        this.backgroundImage = backgroundImage
+        this.radius = radius
+    }
+    func build(context) {
+        th = Theme.of(context)
+        bg = this.backgroundColor ?? th.colorScheme.primaryContainer
+        fg = this.foregroundColor ?? th.colorScheme.onPrimaryContainer
+        d = this.radius * 2
+        inner = this.child
+        if (inner != null) {
+            inner = TextDefaults(style: Font(color: fg, fontSize: this.radius * 0.8, fontWeight: 500), child: inner)
+        }
+        return Box(
+            width: d, height: d, alignment: Alignment.center, child: inner,
+            decoration: Look(color: bg, shape: "circle",
+                image: this.backgroundImage == null ? null : BgImage(image: this.backgroundImage, fit: "cover")),
+            clipBehavior: "antiAlias")
+    }
+}
+
+class Item extends View {
+    func init(title = null, subtitle = null, leading = null, trailing = null, onTap = null, onLongPress = null,
+              dense = False, selected = False, enabled = True, contentPadding = null, tileColor = null,
+              selectedTileColor = null, isThreeLine = False, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.subtitle = subtitle
+        this.leading = leading
+        this.trailing = trailing
+        this.onTap = onTap
+        this.onLongPress = onLongPress
+        this.dense = dense
+        this.selected = selected
+        this.enabled = enabled
+        this.contentPadding = contentPadding
+        this.tileColor = tileColor
+        this.selectedTileColor = selectedTileColor
+    }
+    func build(context) {
+        th = Theme.of(context)
+        cs = th.colorScheme
+        tt = th.textTheme
+        titleColor = this.selected ? cs.primary : (this.enabled ? null : cs.onSurface.withOpacity(0.38))
+        row = []
+        if (this.leading != null) {
+            row.push(Pad(padding: Insets.only(right: 16), child: IconDefaults.wrap(this.leading, this.selected ? cs.primary : cs.onSurfaceVariant)))
+        }
+        texts = []
+        if (this.title != null) {
+            texts.push(TextDefaults(style: tt.bodyLarge.copyWith(color: titleColor, fontSize: this.dense ? 14 : 16), child: this.title))
+        }
+        if (this.subtitle != null) {
+            texts.push(TextDefaults(style: tt.bodyMedium.copyWith(color: cs.onSurfaceVariant), child: this.subtitle))
+        }
+        row.push(Grow(child: Col(cross: "start", mainSize: "min", children: texts)))
+        if (this.trailing != null) {
+            row.push(Pad(padding: Insets.only(left: 16), child: IconDefaults.wrap(this.trailing, cs.onSurfaceVariant)))
+        }
+        minH = this.subtitle != null ? 72 : (this.dense ? 48 : 56)
+        pad = this.contentPadding == null ? Insets.symmetric(horizontal: 16, vertical: 8) : this.contentPadding
+        bg = this.selected ? (this.selectedTileColor ?? cs.primaryContainer.withOpacity(0.4)) : this.tileColor
+        body = Box(
+            color: bg, padding: pad, constraints: Limits(minHeight: minH), alignment: Alignment.centerLeft,
+            child: Row(children: row))
+        if (this.onTap == null and this.onLongPress == null) { return body }
+        return Tap(onTap: this.enabled ? this.onTap : null, onLongPress: this.onLongPress, child: body)
+    }
+}
+
+class IconDefaults {
+    func wrap(w, color) {
+        if (typeof(w) == "instance" and class_name(w) == "Icon" and w.color == null) {
+            return Icon(w.icon, size: w.size, color: color)
+        }
+        return w
+    }
+}
+
+class SwitchItem extends View {
+    func init(value, onChange, title = null, subtitle = null, secondary = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.title = title
+        this.subtitle = subtitle
+        this.secondary = secondary
+    }
+    func build(context) {
+        cb = this.onChange
+        v = this.value
+        return Item(title: this.title, subtitle: this.subtitle, leading: this.secondary,
+            trailing: Toggle(value: v, onChange: cb), onTap: func() { if (cb != null) { cb(not v) } })
+    }
+}
+
+class CheckItem extends View {
+    func init(value, onChange, title = null, subtitle = null, secondary = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.title = title
+        this.subtitle = subtitle
+        this.secondary = secondary
+    }
+    func build(context) {
+        cb = this.onChange
+        v = this.value
+        return Item(title: this.title, subtitle: this.subtitle, leading: Check(value: v, onChange: cb),
+            trailing: this.secondary, onTap: func() { if (cb != null) { cb(not v) } })
+    }
+}
+
+class RadioItem extends View {
+    func init(value, groupValue, onChange, title = null, subtitle = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.groupValue = groupValue
+        this.onChange = onChange
+        this.title = title
+        this.subtitle = subtitle
+    }
+    func build(context) {
+        cb = this.onChange
+        v = this.value
+        return Item(title: this.title, subtitle: this.subtitle,
+            leading: Radio(value: v, groupValue: this.groupValue, onChange: cb),
+            onTap: func() { if (cb != null) { cb(v) } })
+    }
+}
+
+class Expander extends LiveView {
+    func init(title, children = null, subtitle = null, leading = null, initiallyExpanded = False, onExpansionChanged = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.children = children == null ? [] : children
+        this.subtitle = subtitle
+        this.leading = leading
+        this.initiallyExpanded = initiallyExpanded
+        this.onExpansionChanged = onExpansionChanged
+    }
+    func createState() { return ExpanderState() }
+}
+class ExpanderState extends Live {
+    func onInit() { this.open = this.widget.initiallyExpanded }
+    func build(context) {
+        me = this
+        w = this.widget
+        parts = [
+            Item(title: w.title, subtitle: w.subtitle, leading: w.leading,
+                trailing: Icon(this.open ? Icons.expand_less : Icons.expand_more),
+                onTap: func() {
+                    me.update(func() { me.open = not me.open })
+                    if (w.onExpansionChanged != null) { w.onExpansionChanged(me.open) }
+                })
+        ]
+        if (this.open) { parts.push(Col(children: w.children)) }
+        return Col(mainSize: "min", cross: "stretch", children: parts)
+    }
+}
+
+class Badge extends View {
+    func init(label = null, child = null, backgroundColor = null, key = null) {
+        super.init(key: key)
+        this.label = label
+        this.child = child
+        this.backgroundColor = backgroundColor
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        if (this.child == null) { return this.dot(cs) }
+        return Layers(clipBehavior: "none", children: [
+            this.child,
+            Pin(top: -6, right: -8, child: this.dot(cs))
+        ])
+    }
+    func dot(cs) {
+        bg = this.backgroundColor ?? cs.error
+        if (this.label == null) {
+            return Box(width: 8, height: 8, decoration: Look(color: bg, shape: "circle"))
+        }
+        return Box(
+            constraints: Limits(minWidth: 16, minHeight: 16), padding: Insets.symmetric(horizontal: 4),
+            alignment: Alignment.center, decoration: Look(color: bg, borderRadius: Corners.circular(8)),
+            child: TextDefaults(style: Font(color: cs.onError, fontSize: 11), child: this.label))
+    }
+}
+
+class TagBase extends View {
+    func init(label, avatar = null, selected = False, onTap = null, onDeleted = null, backgroundColor = null,
+              showCheck = False, key = null) {
+        super.init(key: key)
+        this.label = label
+        this.avatar = avatar
+        this.selected = selected
+        this.onTap = onTap
+        this.onDeleted = onDeleted
+        this.backgroundColor = backgroundColor
+        this.showCheck = showCheck
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        row = []
+        if (this.selected and this.showCheck) { row.push(Icon(Icons.check, size: 18, color: cs.onSecondaryContainer)) }
+        elif (this.avatar != null) { row.push(this.avatar) }
+        row.push(TextDefaults(
+            style: Font(fontSize: 14, fontWeight: 500, color: this.selected ? cs.onSecondaryContainer : cs.onSurfaceVariant),
+            child: this.label))
+        if (this.onDeleted != null) {
+            row.push(Touch(onTap: this.onDeleted, child: Icon(Icons.close, size: 18, color: cs.onSurfaceVariant)))
+        }
+        body = Box(
+            padding: Insets.symmetric(horizontal: 12, vertical: 6),
+            decoration: Look(
+                color: this.selected ? cs.secondaryContainer : this.backgroundColor,
+                borderRadius: Corners.circular(8),
+                border: this.selected ? null : Border.all(color: cs.outlineVariant, width: 1)),
+            child: Row(mainSize: "min", gap: 8, children: row))
+        if (this.onTap == null) { return body }
+        return Tap(onTap: this.onTap, borderRadius: Corners.circular(8), child: body)
+    }
+}
+class Tag extends TagBase {
+    func init(label, avatar = null, onDeleted = null, backgroundColor = null, key = null) {
+        super.init(label, avatar: avatar, onDeleted: onDeleted, backgroundColor: backgroundColor, key: key)
+    }
+}
+class ActionTag extends TagBase {
+    func init(label, onTap = null, avatar = null, backgroundColor = null, key = null) {
+        super.init(label, avatar: avatar, onTap: onTap, backgroundColor: backgroundColor, key: key)
+    }
+}
+class InputTag extends TagBase {
+    func init(label, avatar = null, onTap = null, onDeleted = null, selected = False, key = null) {
+        super.init(label, avatar: avatar, onTap: onTap, onDeleted: onDeleted, selected: selected, key: key)
+    }
+}
+class FilterTag extends TagBase {
+    func init(label, selected, onSelected, avatar = null, key = null) {
+        sel = selected
+        cb = onSelected
+        super.init(label, avatar: avatar, selected: selected, showCheck: True,
+            onTap: func() { if (cb != null) { cb(not sel) } }, key: key)
+    }
+}
+class ChoiceTag extends TagBase {
+    func init(label, selected, onSelected, avatar = null, key = null) {
+        sel = selected
+        cb = onSelected
+        super.init(label, avatar: avatar, selected: selected,
+            onTap: func() { if (cb != null) { cb(not sel) } }, key: key)
+    }
+}
+
+class Spinner extends RenderWidget {
+    func init(value = null, color = null, backgroundColor = null, strokeWidth = 4.0, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.color = color
+        this.backgroundColor = backgroundColor
+        this.strokeWidth = strokeWidth
+    }
+    func adaptive(value = null, color = null, key = null) {
+        return Spinner(value: value, color: color, key: key)
+    }
+    func toNode(context) {
+        return {type: "progress", kind: "circular", value: this.value, color: u_color(this.color),
+                track: u_color(this.backgroundColor), stroke: this.strokeWidth}
+    }
+}
+class ProgressBar extends RenderWidget {
+    func init(value = null, color = null, backgroundColor = null, minHeight = 4.0, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.color = color
+        this.backgroundColor = backgroundColor
+        this.minHeight = minHeight
+    }
+    func toNode(context) {
+        return {type: "progress", kind: "linear", value: this.value, color: u_color(this.color),
+                track: u_color(this.backgroundColor), height: this.minHeight}
+    }
+}
+
+class PullRefresh extends RenderWidget {
+    func init(onRefresh, child = null, key = null) {
+        super.init(key: key)
+        this.onRefresh = onRefresh
+        this.child = child
+    }
+    func toNode(context) {
+        return {type: "refresh", onRefresh: context.on(this.onRefresh, "void"), child: context.build(this.child, 0)}
+    }
+}
+
+class Check extends RenderWidget {
+    func init(value, onChange, activeColor = null, checkColor = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.activeColor = activeColor
+    }
+    func toNode(context) {
+        return {type: "checkbox", value: this.value == True, enabled: this.onChange != null,
+                color: u_color(this.activeColor), onChanged: context.on(this.onChange, "bool")}
+    }
+}
+
+class Toggle extends RenderWidget {
+    func init(value, onChange, activeColor = null, activeTrackColor = null, inactiveThumbColor = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.activeColor = activeColor
+    }
+    func adaptive(value, onChange, activeColor = null, key = null) {
+        return Toggle(value: value, onChange: onChange, activeColor: activeColor, key: key)
+    }
+    func toNode(context) {
+        return {type: "switch", value: this.value == True, enabled: this.onChange != null,
+                color: u_color(this.activeColor), onChanged: context.on(this.onChange, "bool")}
+    }
+}
+
+class Radio extends RenderWidget {
+    func init(value, groupValue, onChange, activeColor = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.groupValue = groupValue
+        this.onChange = onChange
+        this.activeColor = activeColor
+    }
+    func toNode(context) {
+        cb = this.onChange
+        val = this.value
+        return {type: "radio", selected: u_eq(this.value, this.groupValue), enabled: cb != null,
+                color: u_color(this.activeColor),
+                onChanged: context.on(func() { if (cb != null) { cb(val) } }, "void")}
+    }
+}
+
+class Slider extends RenderWidget {
+    func init(value, onChange, min = 0.0, max = 1.0, divisions = null, label = null, activeColor = null,
+              inactiveColor = null, onChangeEnd = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.min = min
+        this.max = max
+        this.divisions = divisions
+        this.label = label
+        this.activeColor = activeColor
+        this.inactiveColor = inactiveColor
+        this.onChangeEnd = onChangeEnd
+    }
+    func toNode(context) {
+        return {type: "slider", value: this.value, min: this.min, max: this.max, divisions: this.divisions,
+                label: this.label, enabled: this.onChange != null, color: u_color(this.activeColor),
+                trackColor: u_color(this.inactiveColor),
+                onChanged: context.on(this.onChange, "num"), onChangeEnd: context.on(this.onChangeEnd, "void")}
+    }
+}
+
+class Option {
+    func init(value, child, enabled = True) {
+        this.value = value
+        this.child = child
+        this.enabled = enabled
+    }
+}
+
+class Dropdown extends RenderWidget {
+    func init(items, onChange, value = null, hint = null, isExpanded = False, key = null) {
+        super.init(key: key)
+        this.items = items == null ? [] : items
+        this.onChange = onChange
+        this.value = value
+        this.hint = hint
+        this.isExpanded = isExpanded
+    }
+    func toNode(context) {
+        nodes = []
+        selected = -1
+        idx = 0
+        for it in this.items {
+            nodes.push({label: context.build(it.child, idx), enabled: it.enabled})
+            if (selected < 0 and this.value != null and u_eq(it.value, this.value)) { selected = idx }
+            idx = idx + 1
+        }
+        its = this.items
+        cb = this.onChange
+        handler = func(i) { if (cb != null and i >= 0 and i < len(its)) { cb(its[i].value) } }
+        return {type: "dropdown", items: nodes, selected: selected, hint: context.build(this.hint, "hint"),
+                expanded: this.isExpanded, enabled: cb != null, onChanged: context.on(handler, "int")}
+    }
+}
+
+class MenuItem {
+    func init(child, value = null, enabled = True, onTap = null) {
+        this.child = child
+        this.value = value
+        this.enabled = enabled
+        this.onTap = onTap
+        this.divider = False
+    }
+}
+class MenuRule {
+    func init() {
+        this.child = null
+        this.value = null
+        this.enabled = False
+        this.divider = True
+    }
+}
+
+class Menu extends RenderWidget {
+    func init(itemBuilder, onSelected = null, icon = null, child = null, enabled = True, key = null) {
+        super.init(key: key)
+        this.itemBuilder = itemBuilder
+        this.onSelected = onSelected
+        this.icon = icon
+        this.child = child
+        this.enabled = enabled
+    }
+    func toNode(context) {
+        its = this.itemBuilder(context)
+        nodes = []
+        idx = 0
+        for it in its {
+            if (it.divider) {
+                nodes.push({divider: True})
+            } else {
+                nodes.push({label: context.build(it.child, idx), enabled: it.enabled})
+            }
+            idx = idx + 1
+        }
+        cb = this.onSelected
+        handler = func(i) {
+            if (i >= 0 and i < len(its)) {
+                if (its[i].onTap != null) { its[i].onTap() }
+                if (cb != null) { cb(its[i].value) }
+            }
+        }
+        anchor = this.child ?? this.icon ?? Icon(Icons.more_vert)
+        return {type: "popupMenu", items: nodes, enabled: this.enabled, onSelected: context.on(handler, "int"),
+                child: context.build(anchor, "anchor")}
+    }
+}
+
+class TextController extends Notifier {
+    func init(text = "") {
+        super.init()
+        this.text = text == null ? "" : text
+    }
+    func clear() {
+        this.text = ""
+        this.notifyListeners()
+    }
+    func setText(t) {
+        this.text = t
+        this.notifyListeners()
+    }
+}
+
+class FieldLook {
+    func init(labelText = null, hintText = null, helperText = null, errorText = null, prefixIcon = null,
+              suffixIcon = null, prefixText = null, suffixText = null, border = null, filled = null,
+              fillColor = null, contentPadding = null, counterText = null, isDense = False, label = null,
+              enabledBorder = null, focusedBorder = null, hintStyle = null) {
+        this.labelText = labelText
+        this.hintText = hintText
+        this.helperText = helperText
+        this.errorText = errorText
+        this.prefixIcon = prefixIcon
+        this.suffixIcon = suffixIcon
+        this.prefixText = prefixText
+        this.suffixText = suffixText
+        this.border = border
+        this.filled = filled
+        this.fillColor = fillColor
+        this.isDense = isDense
+    }
+}
+
+class Input extends LiveView {
+    func init(controller = null, decoration = null, obscureText = False, keyboardType = null, textInputAction = null,
+              maxLines = 1, minLines = null, maxLength = null, onChange = null, onSubmit = null, enabled = True,
+              readOnly = False, autofocus = False, style = null, textAlign = null, initialValue = null,
+              textCapitalization = null, onTap = null, focusNode = null, validator = null, onSaved = null,
+              autovalidate = False, key = null, hint = null, label = null, icon = null) {
+        super.init(key: key)
+        this.controller = controller
+        this.decoration = decoration == null ? FieldLook(hintText: hint, labelText: label, prefixIcon: typeof(icon) == "string" ? Icon(icon) : icon) : decoration
+        this.obscureText = obscureText
+        this.keyboardType = keyboardType
+        this.textInputAction = textInputAction
+        this.maxLines = maxLines
+        this.minLines = minLines
+        this.maxLength = maxLength
+        this.onChange = onChange
+        this.onSubmit = onSubmit
+        this.enabled = enabled
+        this.readOnly = readOnly
+        this.autofocus = autofocus
+        this.style = style
+        this.textAlign = textAlign
+        this.initialValue = initialValue
+        this.textCapitalization = textCapitalization
+        this.onTap = onTap
+        this.validator = validator
+        this.onSaved = onSaved
+        this.autovalidate = autovalidate
+    }
+    func createState() { return InputState() }
+}
+
+class FormInput extends Input {
+    func init(controller = null, decoration = null, obscureText = False, keyboardType = null, textInputAction = null,
+              maxLines = 1, minLines = null, maxLength = null, onChange = null, onSubmit = null,
+              enabled = True, readOnly = False, autofocus = False, style = null, textAlign = null,
+              initialValue = null, validator = null, onSaved = null, autovalidateMode = null, key = null) {
+        super.init(controller: controller, decoration: decoration, obscureText: obscureText,
+            keyboardType: keyboardType, textInputAction: textInputAction, maxLines: maxLines, minLines: minLines,
+            maxLength: maxLength, onChange: onChange, onSubmit: onSubmit, enabled: enabled,
+            readOnly: readOnly, autofocus: autofocus, style: style, textAlign: textAlign,
+            initialValue: initialValue, validator: validator, onSaved: onSaved,
+            autovalidate: autovalidateMode == "always", key: key)
+    }
+}
+
+class RawNode extends RenderWidget {
+    func init(node, key = null) {
+        super.init(key: key)
+        this.node = node
+    }
+    func toNode(context) { return this.node }
+}
+
+class InputState extends Live {
+    func onInit() {
+        w = this.widget
+        this.ctrl = w.controller == null ? TextController(text: w.initialValue) : w.controller
+        this.touched = False
+        this.registerWithForm()
+    }
+    func onWidgetChange(oldWidget) {
+        if (this.widget.controller != null) { this.ctrl = this.widget.controller }
+    }
+    func onExit() {
+        form = this.formState()
+        if (form != null) { form.unregister(this.context.path) }
+    }
+    func formState() {
+        scope = this.context.findInherited("FormScope")
+        if (scope == null) { return null }
+        return scope.state
+    }
+    func registerWithForm() {
+        form = this.formState()
+        if (form != null) { form.register(this.context.path, this) }
+    }
+    func currentError() {
+        w = this.widget
+        if (w.validator == null) { return null }
+        if (this.touched or w.autovalidate) { return w.validator(this.ctrl.text) }
+        return null
+    }
+    func validate() {
+        this.touched = True
+        if (this.widget.validator == null) { return True }
+        return this.widget.validator(this.ctrl.text) == null
+    }
+    func save() {
+        if (this.widget.onSaved != null) { this.widget.onSaved(this.ctrl.text) }
+    }
+    func reset() {
+        this.ctrl.text = this.widget.initialValue == null ? "" : this.widget.initialValue
+        this.touched = False
+    }
+    func build(context) {
+        w = this.widget
+        this.registerWithForm()
+        me = this
+        d = w.decoration
+        ctrl = this.ctrl
+        changed = func(v) {
+            ctrl.text = v
+            me.touched = True
+            if (w.onChange != null) { w.onChange(v) }
+            ctrl.notifyListeners()
+        }
+        submitted = func() {
+            if (w.onSubmit != null) { w.onSubmit(ctrl.text) }
+        }
+        err = d.errorText ?? this.currentError()
+        kb = w.keyboardType
+        if (w.maxLines != 1 and kb == null) { kb = "multiline" }
+        node = {
+            type: "textField", value: ctrl.text,
+            hint: d.hintText, label: d.labelText, helper: d.helperText, error: err,
+            prefix: context.build(d.prefixIcon, "pre"), suffix: context.build(d.suffixIcon, "suf"),
+            prefixText: d.prefixText, suffixText: d.suffixText,
+            obscure: w.obscureText ? True : null, keyboard: kb, action: w.textInputAction,
+            maxLines: w.maxLines, minLines: w.minLines, maxLength: w.maxLength,
+            enabled: w.enabled, readOnly: w.readOnly ? True : null, autofocus: w.autofocus ? True : null,
+            style: u_style(w.style), textAlign: w.textAlign, filled: d.filled, fillColor: u_color(d.fillColor),
+            counter: d.counterText, dense: d.isDense ? True : null,
+            capitalization: w.textCapitalization,
+            onChanged: context.on(changed, "str"), onSubmitted: context.on(submitted, "void"),
+            onTap: context.on(w.onTap, "void")
+        }
+        if (d.border != null) {
+            node.border = d.border.kind
+            if (d.border.borderRadius != null) { node.radius = u_radius(d.border.borderRadius) }
+        }
+        return RawNode(node)
+    }
+}
+
+class FormScope extends Provider {
+    func init(state, child = null, key = null) {
+        super.init(child: child, key: key)
+        this.state = state
+    }
+}
+
+class Form extends LiveView {
+    func init(child = null, key = null, autovalidateMode = null) {
+        super.init(key: key)
+        this.child = child
+        this.formKey = key
+    }
+    func createState() { return FormState() }
+    func of(context) {
+        s = context.findInherited("FormScope")
+        return s == null ? null : s.state
+    }
+}
+
+class FormState extends Live {
+    func onInit() {
+        this.fields = {}
+        this.attach()
+    }
+    func attach() {
+        k = this.widget.formKey
+        if (k != null and typeof(k) == "instance" and class_name(k) == "GlobalKey") {
+            k.currentState = this
+            k.currentContext = this.context
+        }
+    }
+    func register(path, field) { this.fields[path] = field }
+    func unregister(path) { this.fields.remove(path) }
+    func validate() {
+        ok = True
+        for p in this.fields.keys() {
+            if (not this.fields[p].validate()) { ok = False }
+        }
+        RT.dirty = True
+        return ok
+    }
+    func save() {
+        for p in this.fields.keys() { this.fields[p].save() }
+    }
+    func reset() {
+        for p in this.fields.keys() { this.fields[p].reset() }
+        RT.dirty = True
+    }
+    func build(context) {
+        this.attach()
+        return FormScope(state: this, child: this.widget.child)
+    }
+}
+
+class ScreenState {
+    func openDrawer() { RT.command({cmd: "drawer", op: "open", side: "start"}) }
+    func closeDrawer() { RT.command({cmd: "drawer", op: "close", side: "start"}) }
+    func openEndDrawer() { RT.command({cmd: "drawer", op: "open", side: "end"}) }
+    func closeEndDrawer() { RT.command({cmd: "drawer", op: "close", side: "end"}) }
+    func hasDrawer() { return RT.scaffold_info.drawer }
+}
+
+class Screen extends RenderWidget {
+    func init(body = null, topBar = null, sideMenu = null, endMenu = null, bottomBar = null,
+              actionButton = null, floatingActionButtonLocation = null, backgroundColor = null,
+              bottomSheet = null, resizeToAvoidBottomInset = True, extendBody = False,
+              extendBodyBehindAppBar = False, key = null) {
+        super.init(key: key)
+        this.body = body
+        this.topBar = topBar
+        this.sideMenu = sideMenu
+        this.endMenu = endMenu
+        this.bottomBar = bottomBar
+        this.actionButton = actionButton
+        this.floatingActionButtonLocation = floatingActionButtonLocation
+        this.backgroundColor = backgroundColor
+        this.bottomSheet = bottomSheet
+        this.resizeToAvoidBottomInset = resizeToAvoidBottomInset
+        this.extendBody = extendBody
+        this.extendBodyBehindAppBar = extendBodyBehindAppBar
+    }
+    func of(context) { return ScreenState() }
+    func toNode(context) {
+        th = Theme.of(context)
+        RT.scaffold_info = {drawer: this.sideMenu != null, endDrawer: this.endMenu != null}
+        node = {
+            type: "scaffold",
+            bg: u_color(this.backgroundColor ?? th.scaffoldBackgroundColor),
+            fabLocation: this.floatingActionButtonLocation,
+            resizeInset: this.resizeToAvoidBottomInset,
+            extendBody: this.extendBody ? True : null,
+            extendBehindAppBar: this.extendBodyBehindAppBar ? True : null
+        }
+        node.appBar = context.build(this.topBar, "appbar")
+        node.body = context.build(this.body, "body")
+        node.drawer = context.build(this.sideMenu, "drawer")
+        node.endDrawer = context.build(this.endMenu, "enddrawer")
+        node.bottomNav = context.build(this.bottomBar, "bottomnav")
+        node.fab = context.build(this.actionButton, "fab")
+        node.bottomSheet = context.build(this.bottomSheet, "sheet")
+        return node
+    }
+}
+RT.scaffold_info = {drawer: False, endDrawer: False}
+
+class TopBar extends RenderWidget {
+    func init(title = null, leading = null, actions = null, backgroundColor = null, foregroundColor = null,
+              elevation = null, centerTitle = null, bottom = null, automaticallyImplyLeading = True,
+              toolbarHeight = null, titleTextStyle = null, flexibleSpace = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.leading = leading
+        this.actions = actions
+        this.backgroundColor = backgroundColor
+        this.foregroundColor = foregroundColor
+        this.elevation = elevation
+        this.centerTitle = centerTitle
+        this.bottom = bottom
+        this.automaticallyImplyLeading = automaticallyImplyLeading
+        this.toolbarHeight = toolbarHeight
+        this.titleTextStyle = titleTextStyle
+    }
+    func toNode(context) {
+        th = Theme.of(context)
+        at = th.appBarTheme
+        node = {
+            type: "appBar",
+            bg: u_color(this.backgroundColor ?? at.backgroundColor),
+            fg: u_color(this.foregroundColor ?? at.foregroundColor),
+            elevation: this.elevation ?? at.elevation,
+            centerTitle: this.centerTitle ?? at.centerTitle,
+            height: this.toolbarHeight
+        }
+        titleW = this.title
+        if (titleW != null and (this.titleTextStyle != null or at.titleTextStyle != null)) {
+            titleW = TextDefaults(style: this.titleTextStyle ?? at.titleTextStyle, child: titleW)
+        }
+        node.title = context.build(titleW, "title")
+        if (this.leading != null) {
+            node.leading = context.build(this.leading, "leading")
+        } elif (this.automaticallyImplyLeading) {
+            if (RT.scaffold_info.drawer) {
+                node.autoLeading = "menu"
+            } elif (len(RT.routes) > 1) {
+                node.autoLeading = "back"
+                node.onBack = context.on(func() { RT.nav.pop(null) }, "void")
+            }
+        }
+        node.actions = context.buildAll(this.actions)
+        node.bottom = context.build(this.bottom, "bottom")
+        return node
+    }
+}
+
+class SideMenu extends RenderWidget {
+    func init(child = null, backgroundColor = null, width = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.backgroundColor = backgroundColor
+        this.width = width
+    }
+    func toNode(context) {
+        return {type: "drawer", bg: u_color(this.backgroundColor), width: this.width, child: context.build(this.child, 0)}
+    }
+}
+
+class SideMenuHeader extends View {
+    func init(child = null, decoration = null, padding = null, margin = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.decoration = decoration
+        this.padding = padding
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Box(
+            width: INFINITY, height: 160, alignment: Alignment.bottomLeft,
+            padding: this.padding == null ? Insets.all(16) : this.padding,
+            decoration: this.decoration == null ? Look(color: cs.primaryContainer) : this.decoration,
+            child: TextDefaults(style: Font(fontSize: 22, color: cs.onPrimaryContainer), child: this.child))
+    }
+}
+
+class AccountHeader extends View {
+    func init(accountName = null, accountEmail = null, currentAccountPicture = null, decoration = null, key = null) {
+        super.init(key: key)
+        this.accountName = accountName
+        this.accountEmail = accountEmail
+        this.currentAccountPicture = currentAccountPicture
+        this.decoration = decoration
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Box(
+            width: INFINITY, padding: Insets.all(16), alignment: Alignment.bottomLeft,
+            decoration: this.decoration == null ? Look(color: cs.primaryContainer) : this.decoration,
+            child: Col(cross: "start", mainSize: "min", gap: 8, children: [
+                this.currentAccountPicture,
+                TextDefaults(style: Font(fontSize: 16, fontWeight: 500, color: cs.onPrimaryContainer), child: this.accountName),
+                TextDefaults(style: Font(fontSize: 13, color: cs.onPrimaryContainer), child: this.accountEmail)
+            ]))
+    }
+}
+
+class BottomItem {
+    func init(icon, label = null, activeIcon = null, backgroundColor = null) {
+        this.icon = icon
+        this.label = label
+        this.activeIcon = activeIcon
+    }
+}
+
+func u_icon_name(w) {
+    if (w == null) { return null }
+    if (typeof(w) == "string") { return w }
+    if (typeof(w) == "instance" and class_name(w) == "Icon") { return w.icon }
+    return null
+}
+
+class BottomBar extends RenderWidget {
+    func init(items, currentIndex = 0, onTap = null, type = null, selectedItemColor = null,
+              unselectedItemColor = null, backgroundColor = null, key = null) {
+        super.init(key: key)
+        this.items = items
+        this.currentIndex = currentIndex
+        this.onTap = onTap
+        this.selectedItemColor = selectedItemColor
+        this.backgroundColor = backgroundColor
+    }
+    func toNode(context) {
+        its = []
+        for it in this.items {
+            its.push({icon: u_icon_name(it.icon), activeIcon: u_icon_name(it.activeIcon), label: it.label})
+        }
+        return {type: "navBar", items: its, selected: this.currentIndex, bg: u_color(this.backgroundColor),
+                color: u_color(this.selectedItemColor), onChanged: context.on(this.onTap, "int")}
+    }
+}
+
+class NavItem {
+    func init(icon, label, selectedIcon = null) {
+        this.icon = icon
+        this.label = label
+        this.selectedIcon = selectedIcon
+    }
+}
+
+class NavBar extends RenderWidget {
+    func init(destinations, selectedIndex = 0, onDestinationSelected = null, backgroundColor = null, key = null) {
+        super.init(key: key)
+        this.destinations = destinations
+        this.selectedIndex = selectedIndex
+        this.onDestinationSelected = onDestinationSelected
+        this.backgroundColor = backgroundColor
+    }
+    func toNode(context) {
+        its = []
+        for it in this.destinations {
+            its.push({icon: u_icon_name(it.icon), activeIcon: u_icon_name(it.selectedIcon), label: it.label})
+        }
+        return {type: "navBar", items: its, selected: this.selectedIndex, bg: u_color(this.backgroundColor),
+                onChanged: context.on(this.onDestinationSelected, "int")}
+    }
+}
+
+class TabLabel {
+    func init(text = null, icon = null, child = null) {
+        this.text = text
+        this.icon = icon
+        this.child = child
+    }
+}
+
+class TabController extends Notifier {
+    func init(length, vsync = null, initialIndex = 0) {
+        super.init()
+        this.length = length
+        this.index = initialIndex
+    }
+    func animateTo(i, duration = null, curve = null) {
+        this.index = u_clamp(i, 0, this.length - 1)
+        this.notifyListeners()
+    }
+}
+
+class TabScope extends Provider {
+    func init(controller, child = null, key = null) {
+        super.init(child: child, key: key)
+        this.controller = controller
+    }
+}
+
+class TabHost extends LiveView {
+    func init(length, child = null, initialIndex = 0, key = null) {
+        super.init(key: key)
+        this.length = length
+        this.child = child
+        this.initialIndex = initialIndex
+    }
+    func createState() { return TabHostState() }
+    func of(context) {
+        s = context.findInherited("TabScope")
+        return s == null ? null : s.controller
+    }
+}
+class TabHostState extends Live {
+    func onInit() {
+        this.ctl = TabController(this.widget.length, initialIndex: this.widget.initialIndex)
+    }
+    func build(context) {
+        return TabScope(controller: this.ctl, child: this.widget.child)
+    }
+}
+
+class Tabs extends RenderWidget {
+    func init(tabs, controller = null, isScrollable = False, onTap = null, labelColor = null,
+              indicatorColor = null, key = null) {
+        super.init(key: key)
+        this.tabs = tabs
+        this.controller = controller
+        this.isScrollable = isScrollable
+        this.onTap = onTap
+        this.labelColor = labelColor
+        this.indicatorColor = indicatorColor
+    }
+    func toNode(context) {
+        ctl = this.controller ?? TabHost.of(context)
+        labels = []
+        for t in this.tabs {
+            labels.push({text: t.text, icon: u_icon_name(t.icon), child: context.build(t.child, "t" + str(len(labels)))})
+        }
+        cb = this.onTap
+        handler = func(i) {
+            if (ctl != null) { ctl.animateTo(i) }
+            if (cb != null) { cb(i) }
+        }
+        return {type: "tabBar", labels: labels, selected: ctl == null ? 0 : ctl.index, scrollable: this.isScrollable,
+                color: u_color(this.labelColor), indicator: u_color(this.indicatorColor),
+                onChanged: context.on(handler, "int")}
+    }
+}
+
+class TabPages extends RenderWidget {
+    func init(children, controller = null, physics = null, key = null) {
+        super.init(key: key)
+        this.children = children
+        this.controller = controller
+        this.physics = physics
+    }
+    func toNode(context) {
+        ctl = this.controller ?? TabHost.of(context)
+        handler = func(i) { if (ctl != null) { ctl.animateTo(i) } }
+        return {type: "pageView", dir: "horizontal", index: ctl == null ? 0 : ctl.index,
+                onChanged: context.on(handler, "int"), children: context.buildAll(this.children)}
+    }
+}
+
+class Alert extends View {
+    func init(title = null, content = null, actions = null, backgroundColor = null, icon = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.content = content
+        this.actions = actions
+        this.backgroundColor = backgroundColor
+        this.icon = icon
+    }
+    func build(context) {
+        th = Theme.of(context)
+        cs = th.colorScheme
+        parts = []
+        if (this.icon != null) { parts.push(Pad(padding: Insets.only(bottom: 16), child: this.icon)) }
+        if (this.title != null) {
+            parts.push(Pad(padding: Insets.only(bottom: 16),
+                child: TextDefaults(style: th.textTheme.headlineSmall.copyWith(color: cs.onSurface), child: this.title)))
+        }
+        if (this.content != null) {
+            parts.push(Weighted(child: Scroll(
+                child: TextDefaults(style: th.textTheme.bodyMedium.copyWith(color: cs.onSurfaceVariant), child: this.content))))
+        }
+        if (this.actions != null and len(this.actions) > 0) {
+            parts.push(Pad(padding: Insets.only(top: 24), child: Row(main: "end", gap: 8, children: this.actions)))
+        }
+        return Box(
+            padding: Insets.all(24), constraints: Limits(minWidth: 280, maxWidth: 560),
+            decoration: Look(color: this.backgroundColor ?? cs.surface.lighten(0.04), borderRadius: Corners.circular(28)),
+            child: Col(mainSize: "min", cross: "stretch", children: parts))
+    }
+}
+
+class ChoiceDialog extends View {
+    func init(title = null, children = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.children = children
+    }
+    func build(context) {
+        return Alert(title: this.title, content: Col(mainSize: "min", cross: "stretch", children: this.children == null ? [] : this.children))
+    }
+}
+
+class ChoiceOption extends View {
+    func init(onTap = null, child = null, key = null) {
+        super.init(key: key)
+        this.onTap = onTap
+        this.child = child
+    }
+    func build(context) {
+        return Tap(onTap: this.onTap, child: Pad(padding: Insets.symmetric(horizontal: 0, vertical: 12), child: this.child))
+    }
+}
+
+class Dialog extends View {
+    func init(child = null, backgroundColor = null, key = null) {
+        super.init(key: key)
+        this.child = child
+        this.backgroundColor = backgroundColor
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Box(
+            constraints: Limits(maxWidth: 560), clipBehavior: "antiAlias",
+            decoration: Look(color: this.backgroundColor ?? cs.surface.lighten(0.04), borderRadius: Corners.circular(28)),
+            child: this.child)
+    }
+}
+
+func showDialog(context = null, builder = null, barrierDismissible = True, barrierColor = null, onResult = null) {
+    return RT.open_overlay("dialog", builder, {dismissible: barrierDismissible, barrierColor: barrierColor, onResult: onResult})
+}
+
+func showSheet(context = null, builder = null, isScrollControlled = False, backgroundColor = null,
+                          showDragHandle = False, isDismissible = True, onResult = null) {
+    return RT.open_overlay("bottomSheet", builder, {dismissible: isDismissible, isScrollControlled: isScrollControlled,
+                           backgroundColor: backgroundColor, showDragHandle: showDragHandle, onResult: onResult})
+}
+
+class NoticeAction {
+    func init(label, onTap = null, textColor = null) {
+        this.label = label
+        this.onTap = onTap
+        this.textColor = textColor
+    }
+}
+
+class Notice extends View {
+    func init(content, action = null, duration = null, backgroundColor = null, key = null) {
+        super.init(key: key)
+        this.content = content
+        this.action = action
+        this.duration = duration
+        this.backgroundColor = backgroundColor
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        fg = cs.onInverseSurface
+        row = [Grow(child: TextDefaults(style: Font(fontSize: 14, color: fg), child: this.content))]
+        if (this.action != null) {
+            act = this.action
+            row.push(FlatButton(onTap: func() {
+                if (act.onTap != null) { act.onTap() }
+                RT.close_overlays_of_kind("snackbar")
+            }, child: Text(act.label, style: Font(color: act.textColor ?? cs.primaryContainer))))
+        }
+        return Box(
+            margin: Insets.all(12), padding: Insets.symmetric(horizontal: 16, vertical: 6),
+            constraints: Limits(minHeight: 48),
+            decoration: Look(color: this.backgroundColor ?? cs.inverseSurface, borderRadius: Corners.circular(4),
+                                      boxShadow: [Shadow(color: Colors.black26, blurRadius: 6, offset: Offset(dx: 0, dy: 2))]),
+            child: Row(gap: 8, children: row))
+    }
+}
+
+class NoticesState {
+    func notify(snackBar) {
+        sb = snackBar
+        return RT.open_overlay("snackbar", func(ctx) { return sb }, {duration: sb.duration, dismissible: False,
+                                                                       backgroundColor: null, onResult: null})
+    }
+    func hideCurrentSnackBar() { RT.close_overlays_of_kind("snackbar") }
+    func clearSnackBars() { RT.close_overlays_of_kind("snackbar") }
+}
+class Notices {
+    func of(context) { return NoticesState() }
+}
+
+func showAboutDialog(context = null, applicationName = "", applicationVersion = "") {
+    return showDialog(context: context, builder: func(ctx) {
+        return Alert(title: Text(applicationName), content: Text(applicationVersion),
+            actions: [FlatButton("OK", onTap: func() { RT.nav.pop(null) })])
+    })
+}

@@ -1,0 +1,211 @@
+import "dragon/ui" as *
+import "package:dragon_web" as *
+import "util" as *
+import "store" as *
+
+class SiteIcon extends View {
+    func init(host, size = 16, path = null, icon = null, key = null) {
+        super.init(key: key)
+        this.host = host == null ? "" : host
+        this.size = size
+        this.path = path
+        this.icon = icon
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        if (this.icon != null) {
+            return Box(width: this.size, height: this.size, alignment: Alignment.center,
+                child: Icon(this.icon, size: this.size, color: cs.onSurfaceVariant))
+        }
+        h = hueOf(this.host)
+        p = this.path
+        if (p == null and this.host != "") { p = RT.docs_dir + "/favicons/" + this.host + ".png" }
+        if (p != null and file.exists(p)) {
+            return Round(borderRadius: Corners.circular(this.size * 0.2),
+                child: Picture.file(p, width: this.size, height: this.size, fit: Fit.cover))
+        }
+        return Box(width: this.size, height: this.size, alignment: Alignment.center,
+            decoration: Look(color: u_hsl(h, 0.5, 0.42), borderRadius: Corners.circular(this.size * 0.3)),
+            child: Text(letterOf(this.host), style: Font(color: Colors.white, fontWeight: Weight.w700, fontSize: this.size * 0.58)))
+    }
+}
+
+class Glyph extends View {
+    func init(icon, onTap, enabled = True, tip = null, size = 20, key = null) {
+        super.init(key: key)
+        this.icon = icon
+        this.onTap = onTap
+        this.enabled = enabled
+        this.size = size
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        col = this.enabled ? cs.onSurface : cs.onSurface.withOpacity(0.32)
+        return Tap(onTap: this.enabled ? this.onTap : null, borderRadius: Corners.circular(18),
+            child: Box(width: 36, height: 36, alignment: Alignment.center, child: Icon(this.icon, size: this.size, color: col)))
+    }
+}
+
+class TabStrip extends View {
+    func init(key = null) { super.init(key: key) }
+
+    func tabItem(context, cs, idx, t, w) {
+        selected = idx == B.cur
+        i = B.info(t)
+        host = t.page != "web" ? "" : (i == null ? "" : hostOf(i.url))
+        pg = t.page == "web" ? null : PAGES["dragon://" + t.page].icon
+        loading = t.page == "web" and i != null and i.loading
+        lead = SiteIcon(host, size: 16, path: i == null ? null : i.favicon, icon: pg)
+        if (t.private and t.page == "newtab") { lead = SiteIcon("", size: 16, icon: "vpn_lock") }
+        if (loading) { lead = Box(width: 16, height: 16, child: Spinner(strokeWidth: 2, color: cs.primary)) }
+        title = B.titleOf(t)
+        shape = Corners.only(topLeft: Radius.circular(10), topRight: Radius.circular(10))
+        closer = Tap(onTap: act(func(n) { B.close(n) }, idx), borderRadius: Corners.circular(10),
+            child: Box(width: 20, height: 20, alignment: Alignment.center, child: Icon(Icons.close, size: 14, color: cs.onSurfaceVariant)))
+        body = Box(width: w, height: 36, padding: Insets.fromLTRB(10, 0, 6, 0), alignment: Alignment.centerLeft,
+            decoration: Look(color: selected ? cs.surface : null, borderRadius: shape),
+            child: Row(children: [
+                lead,
+                Space(width: 8),
+                Grow(child: Text(title, maxLines: 1, overflow: "ellipsis",
+                    style: Font(fontSize: 12, fontWeight: selected ? Weight.w600 : Weight.w400,
+                        color: selected ? cs.onSurface : cs.onSurfaceVariant))),
+                closer
+            ]))
+        sep = Box(width: 1, height: 16, color: selected or idx + 1 == B.cur ? null : cs.outlineVariant)
+        return Row(mainSize: "min", cross: "end", children: [
+            Tap(onTap: act(func(n) { B.select(n) }, idx), onLongPress: act(func(n) { B.duplicate(n) }, idx), borderRadius: shape, child: body),
+            sep
+        ])
+    }
+
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        n = B.tabs.length
+        avail = RT.media.width - 120
+        w = clampNum(floor_int(avail / (n < 1 ? 1 : n)), 110, 240)
+        items = []
+        idx = 0
+        for t in B.tabs {
+            items.push(this.tabItem(context, cs, idx, t, w))
+            idx = idx + 1
+        }
+        bg = cs.surfaceVariant
+        newBtn = Tap(onTap: func() { B.newTab(False, "") }, borderRadius: Corners.circular(14),
+            child: Box(width: 28, height: 28, alignment: Alignment.center, child: Icon(Icons.add, size: 18, color: cs.onSurfaceVariant)))
+        return Box(color: bg, height: 42, padding: Insets.fromLTRB(8, 6, 8, 0), child: Row(cross: "end", children: [
+            Grow(child: Scroll(scrollDirection: "horizontal", child: Row(mainSize: "min", cross: "end", children: items))),
+            Pad(padding: Insets.only(left: 4, bottom: 4), child: newBtn)
+        ]))
+    }
+}
+
+class BookmarksBar extends View {
+    func init(key = null) { super.init(key: key) }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        items = []
+        for b in B.bookmarks {
+            items.push(Tap(onTap: act(func(u) { B.go(u) }, b.url), onLongPress: act(func(u) { B.goNewTab(u) }, b.url), borderRadius: Corners.circular(14),
+                child: Box(height: 28, padding: Insets.symmetric(horizontal: 8), alignment: Alignment.centerLeft,
+                    constraints: Limits(maxWidth: 180), child: Row(mainSize: "min", children: [
+                        SiteIcon(hostOf(b.url), size: 14),
+                        Space(width: 6),
+                        Text(b.title, maxLines: 1, overflow: "ellipsis", style: Font(fontSize: 12))
+                    ]))))
+        }
+        if (items.length == 0) {
+            items.push(Pad(padding: Insets.symmetric(horizontal: 10), child: Text("Bookmarks you add appear here", style: Font(fontSize: 12, color: cs.onSurfaceVariant))))
+        }
+        return Box(height: 34, color: cs.surface, padding: Insets.symmetric(horizontal: 6),
+            decoration: Look(color: cs.surface, border: Border(bottom: Stroke(color: cs.outlineVariant, width: 0.5))),
+            child: Scroll(scrollDirection: "horizontal", child: Row(mainSize: "min", children: items)))
+    }
+}
+
+class Suggestions extends View {
+    func init(local, remote, onPick, query = "", engineName = "", key = null) {
+        super.init(key: key)
+        this.query = query
+        this.engineName = engineName
+        this.local = local
+        this.remote = remote
+        this.onPick = onPick
+    }
+    func row(cs, icon, title, sub, value) {
+        return Tap(onTap: act(this.onPick, value), child: Box(height: sub == "" ? 40 : 48, padding: Insets.symmetric(horizontal: 14),
+            alignment: Alignment.centerLeft, child: Row(children: [
+                Icon(icon, size: 18, color: cs.onSurfaceVariant),
+                Space(width: 12),
+                Grow(child: Col(cross: "start", mainSize: "min", children: [
+                    Text(title, maxLines: 1, overflow: "ellipsis", style: Font(fontSize: 13)),
+                    sub == "" ? Space(height: 0) : Text(sub, maxLines: 1, overflow: "ellipsis", style: Font(fontSize: 11, color: cs.onSurfaceVariant))
+                ]))
+            ])))
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        rows = []
+        if (this.query != "") {
+            direct = looksLikeUrl(this.query)
+            rows.push(this.row(cs, direct ? Icons.language : Icons.search, this.query,
+                direct ? "Go to address" : "Search " + this.engineName, this.query))
+        }
+        for l in this.local {
+            rows.push(this.row(cs, l.kind == "bookmark" ? Icons.star : Icons.history, l.title == "" ? hostOf(l.url) : l.title, l.url, l.url))
+        }
+        for s in this.remote { rows.push(this.row(cs, Icons.search, s, "", s)) }
+        if (rows.length == 0) { return Space(height: 0) }
+        w = clampNum(RT.media.width - 400, 420, 720)
+        return Box(width: w, padding: Insets.symmetric(vertical: 6),
+            decoration: Look(color: cs.surface, borderRadius: Corners.circular(14), border: Border.all(color: cs.outlineVariant, width: 1)),
+            child: Col(mainSize: "min", cross: "stretch", children: rows))
+    }
+}
+
+class FindBar extends View {
+    func init(ctl, onChange, onNext, onPrev, onClose, count, index, key = null) {
+        super.init(key: key)
+        this.ctl = ctl
+        this.onChange = onChange
+        this.onNext = onNext
+        this.onPrev = onPrev
+        this.onClose = onClose
+        this.count = count
+        this.index = index
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        label = this.ctl.text == "" ? "" : (this.count == 0 ? "No results" : plural(this.count, "match", "matches"))
+        return Box(width: 380, height: 46, padding: Insets.symmetric(horizontal: 10),
+            decoration: Look(color: cs.surface, borderRadius: Corners.circular(12), border: Border.all(color: cs.outlineVariant, width: 1)),
+            child: Row(children: [
+                Grow(child: Input(controller: this.ctl, autofocus: True, onChange: this.onChange, onSubmit: this.onNext,
+                    decoration: FieldLook(hintText: "Find in page", isDense: True, border: FieldBorder.none))),
+                Text(label, style: Font(fontSize: 12, color: cs.onSurfaceVariant)),
+                Glyph(Icons.keyboard_arrow_up, this.onPrev, size: 20),
+                Glyph(Icons.keyboard_arrow_down, this.onNext, size: 20),
+                Glyph(Icons.close, this.onClose, size: 18)
+            ]))
+    }
+}
+
+class MenuRow extends View {
+    func init(icon, label, hint = "", key = null) {
+        super.init(key: key)
+        this.icon = icon
+        this.label = label
+        this.hint = hint
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Row(children: [
+            Icon(this.icon, size: 18, color: cs.onSurfaceVariant),
+            Space(width: 12),
+            Text(this.label, style: Font(fontSize: 13)),
+            Space(width: 28),
+            Spring(),
+            Text(this.hint, style: Font(fontSize: 11, color: cs.onSurfaceVariant))
+        ])
+    }
+}

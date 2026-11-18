@@ -1,0 +1,11 @@
+import "dragon/ui" as *
+import "pages/home" as *
+
+
+func main() {
+    runApp(App(
+        title: "__DRAGON_APP_NAME__",
+        theme: ThemeSpec(colorScheme: Palette.fromSeed(Colors.indigo)),
+        home: HomePage()
+    ))
+}

@@ -51,4 +51,3 @@ pub enum EvalResult {
     Continue,
     None,
 }
-

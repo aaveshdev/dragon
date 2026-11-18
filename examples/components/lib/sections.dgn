@@ -1,0 +1,99 @@
+import "dragon/ui" as *
+import "dragon/extras" as *
+
+func _title(text) {
+    return Text(text, size: 13, bold: True, color: Colors.grey).pad(Insets.only(top: 20, bottom: 8))
+}
+
+class SegmentsDemo extends Component {
+    func state() { return {view: "Week", tags: ["b"]} }
+    func build(ctx, s) {
+        return Col([
+            _title("Segments"),
+            Segments(["Day", "Week", "Month"], selected: s.view, onChange: func(v) { ctx.set({view: v}) }),
+            Space(height: 8),
+            Segments([{value: "a", label: "Grid", icon: Icons.apps}, {value: "b", label: "List", icon: Icons.list}, {value: "c", label: "Map", icon: Icons.map}],
+                selected: s.tags, multi: True, onChange: func(v) { ctx.set({tags: v}) })
+        ], cross: "start")
+    }
+}
+
+class StepsDemo extends Component {
+    func state() { return {step: 1} }
+    func build(ctx, s) {
+        return Col([
+            _title("Steps"),
+            Steps([
+                {title: "Account", subtitle: "Create your login"},
+                {title: "Profile", content: Text("Tell us a little about yourself."), subtitle: "Name and photo"},
+                {title: "Done"}
+            ], current: s.step, onTap: func(i) { ctx.set({step: i}) })
+        ], cross: "stretch")
+    }
+}
+
+class TableDemo extends View {
+    func build(ctx) {
+        return Col([
+            _title("TableView"),
+            TableView(["Item", {label: "Qty", flex: 1, align: "right"}, {label: "Price", flex: 1, align: "right"}],
+                [["Apples", 3, "2.40"], ["Pears", 12, "9.10"], ["Plums", 7, "5.25"]])
+        ], cross: "stretch")
+    }
+}
+
+class SearchDemo extends Component {
+    func state() { return {picked: "nothing yet"} }
+    func build(ctx, s) {
+        return Col([
+            _title("SearchField and Suggest"),
+            SearchField(hint: "Search anything"),
+            Space(height: 12),
+            Suggest(["Paris", "Parma", "Rome", "Oslo", "Osaka", "Lisbon"], hint: "City", onPick: func(v) { ctx.set({picked: v}) }),
+            Text("Picked: " + s.picked, size: 13, color: Colors.grey).pad(Insets.only(top: 6))
+        ], cross: "stretch")
+    }
+}
+
+class MiscDemo extends Component {
+    func state() { return {stars: 3.5, order: ["One", "Two", "Three"]} }
+    func build(ctx, s) {
+        return Col([
+            _title("Rating, Banner, EmptyState"),
+            Rating(s.stars, onChange: func(v) { ctx.set({stars: v}) }),
+            Space(height: 12),
+            Banner("A new version is ready", icon: Icons.info, actions: [FlatButton("Later"), FlatButton("Update")]).round(12),
+            _title("ReorderList"),
+            ReorderList(s.order, itemBuilder: func(item, i) { return Text(item).pad(12) },
+                onReorder: func(from, to) {
+                    items = []
+                    for x in s.order { items.push(x) }
+                    moved = items.remove_at(from)
+                    items.insert(to, moved)
+                    ctx.set({order: items})
+                }),
+            EmptyState(icon: Icons.inbox, title: "Nothing here yet", message: "Items you add will show up in this list.",
+                action: Button("Add one", icon: Icons.add, onTap: func() { }))
+        ], cross: "stretch")
+    }
+}
+
+class CalendarDemo extends Component {
+    func state() { return {day: DateTime(2025, 3, 14)} }
+    func build(ctx, s) {
+        return Col([
+            _title("Calendar"),
+            Calendar(selected: s.day, onPick: func(d) { ctx.set({day: d}) }),
+            Text("Selected: " + s.day.format(), size: 13, color: Colors.grey).pad(Insets.only(top: 6))
+        ], cross: "stretch")
+    }
+}
+
+class CarouselDemo extends View {
+    func build(ctx) {
+        colors = [Colors.indigo, Colors.teal, Colors.orange]
+        pages = []
+        for c in colors { pages.push(Box(height: 120, color: c, alignment: Alignment.center, child: Text("Page", size: 20, bold: True, color: Colors.white)).round(12).inset(Insets.symmetric(horizontal: 4))) }
+        return Col([_title("Carousel"), Carousel(pages, height: 120)], cross: "stretch")
+    }
+}

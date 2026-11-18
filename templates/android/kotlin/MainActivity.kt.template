@@ -15,9 +15,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            DragonTheme {
-                DragonScreen()
-            }
+            DragonScreen()
         }
     }
 }
@@ -49,9 +47,6 @@ private fun copyAssetsToInternalStorage(context: Context): String {
                     }
                 }
             } catch (e: java.io.IOException) {
-                // Most likely `name` is actually a subdirectory (list()
-                // returns those too, and open() on a directory throws) --
-                // skipped 
             }
         }
     }

@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
 pub(crate) const RUNTIME_HEADER: &str = r#"
-/* ============================================================
-   Dragon Native Runtime (with Conservative GC)
-   ============================================================ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,7 +36,7 @@ pub(crate) const RUNTIME_HEADER: &str = r#"
 #endif
 
 typedef enum {
-    DGN_NULL = 0, DGN_BOOL, DGN_INT, DGN_FLOAT, DGN_STR, 
+    DGN_NULL = 0, DGN_BOOL, DGN_INT, DGN_FLOAT, DGN_STR,
     DGN_LIST, DGN_MAP, DGN_FUNC, DGN_CLASS, DGN_INSTANCE,
 } DgnTag;
 
@@ -63,20 +60,20 @@ struct DgnVal {
 
 struct DgnList { DgnVal* data; int len; int cap; };
 typedef struct { char* key; DgnVal val; int used; } DgnMapEntry;
-struct DgnMap  { DgnMapEntry* entries; int cap; int len; };
-struct DgnFunc { DgnFuncPtr fn; int arity; DgnMap* env; };
+/* Maps keep their entries in insertion order (removing leaves a hole that compaction closes later); lookups use a
+ * hash index once the map has more than 8 slots, and a plain scan below that.  `n` = slots used so far (live + holes). */
+struct DgnMap  { DgnMapEntry* entries; int cap; int len; int n; int icap; int* idx; };
+struct DgnFunc { DgnFuncPtr fn; int arity; DgnMap* env; const char* pnames; int skip; };
 typedef struct { jmp_buf buf; DgnVal thrown; } DgnTryFrame;
 struct DgnEnv { DgnMap* map; };
 
-
-/* ── Async / Promise ─────────────────────────────────────── */
 typedef enum { DGN_PROMISE_PENDING, DGN_PROMISE_RESOLVED } DgnPromiseStatus;
 
 typedef struct DgnPromise DgnPromise;
 struct DgnPromise {
     DgnPromiseStatus status;
     DgnVal           result;
-    int              done;      /* set to 1 by worker thread when finished */
+    int              done;
 #ifdef _WIN32
     HANDLE           thread;
     CRITICAL_SECTION lock;
@@ -86,39 +83,47 @@ struct DgnPromise {
 #endif
 };
 
-/* A socket handle stored inside a DgnVal (tag = DGN_SOCKET) */
 #ifdef _WIN32
 typedef SOCKET DgnSocket;
 #else
 typedef int    DgnSocket;
 #endif
 
-/* Extend DgnTag */
-/* We reuse DGN_MAP tag for Promise (stored in map ptr as a DgnPromise*) */
-/* Instead, add two new tags at the end: */
-#undef  DGN_INSTANCE   /* temporarily undefine to re-declare enum cleanly */
+#undef  DGN_INSTANCE
 
-/* ── Garbage Collector ───────────────────────────────────── */
 typedef struct GcHeader GcHeader;
 struct GcHeader { int marked; DgnTag tag; GcHeader* next; GcHeader* hnext; };
 
 static GcHeader* _dgn_gc_head = NULL;
 static void* _dgn_stack_bottom = NULL;
+#if defined(DGN_BAREMETAL) && !defined(DGN_USER)
+#define DGN_PERCPU 1
+#include "dgn_pcpu.h"
+#endif
+#ifdef DGN_BAREMETAL
+extern void  dgn_bm_crit_enter(void);
+extern void  dgn_bm_crit_exit(void);
+extern void* dgn_bm_stack_bottom(void* main_bottom);
+extern void  dgn_bm_scan_stacks(void (*mark)(void*));
+extern void  dgn_bm_safepoint(void);
+#ifdef DGN_PERCPU
+extern int   dgn_bm_stw_begin(void);
+extern void  dgn_bm_stw_end(void);
+#define DGN_SAFEPOINT() do { if (PC(resched)) dgn_bm_safepoint(); } while (0)
+#else
+extern volatile int dgn_bm_resched;
+#define DGN_SAFEPOINT() do { if (dgn_bm_resched) dgn_bm_safepoint(); } while (0)
+#endif
+#else
+#define DGN_SAFEPOINT() ((void)0)
+#endif
 
-/* Hash table indexing live objects by their payload pointer (the address
-   returned to callers, i.e. (GcHeader*)+1), so dgn_gc_mark_ptr can check
-   "is this candidate stack word a live payload pointer?" in O(1) average
-   instead of walking the full _dgn_gc_head list per candidate word. That
-   walk is what made automatic collection impractically slow on programs
-   with large live sets and/or big stack frames (e.g. DJVM's own giant
-   bytecode-dispatch function): every collection was
-   O(stack_words_scanned * live_object_count). */
 #define DGN_GC_HTAB_BITS 16
 #define DGN_GC_HTAB_SIZE (1u << DGN_GC_HTAB_BITS)
 static GcHeader* _dgn_gc_htab[DGN_GC_HTAB_SIZE];
 
 static unsigned _dgn_gc_hash(void* p) {
-    uintptr_t x = (uintptr_t)p >> 4; /* malloc'd payloads are at least 8/16-byte aligned */
+    uintptr_t x = (uintptr_t)p >> 4;
     x ^= x >> 15; x *= 0x2545F4914F6CDD1DULL; x ^= x >> 13;
     return (unsigned)(x & (DGN_GC_HTAB_SIZE - 1));
 }
@@ -185,17 +190,10 @@ static void dgn_gc_mark_ptr(void* ptr) {
 extern DgnVal _dgn_aug_str;
 extern DgnVal _dgn_aug_list;
 extern int _dgn_aug_init;
-/* Forward-declare the FFI signature registry so dgn_gc_collect can root it.
-   The actual definition is further down in the FFI module section. */
 extern DgnVal _dgn_ffi_sigs;
 
-/* Generic registry of all top-level DgnVal globals.
-   The transpiler fills _dgn_global_roots[] after emitting the globals,
-   terminated by a DGN_NULL sentinel. dgn_gc_collect walks this list so
-   static globals in BSS/data (invisible to the stack scanner) are rooted. */
 extern DgnVal* _dgn_global_roots[];
 
-/* Helper: mark any DgnVal regardless of tag */
 static void dgn_gc_mark_val(DgnVal v) {
     if(v.tag==DGN_MAP||v.tag==DGN_CLASS||v.tag==DGN_INSTANCE) dgn_gc_mark_ptr(v.map);
     else if(v.tag==DGN_LIST) dgn_gc_mark_ptr(v.list);
@@ -208,45 +206,48 @@ static __declspec(noinline) void dgn_gc_collect(void);
 #else
 static void dgn_gc_collect(void) __attribute__((noinline));
 #endif
+static long _dgn_gc_threshold = 0;
+#ifdef DGN_PERCPU
+#define _dgn_sl_p PC(sl_p)
+#define _dgn_sl_n PC(sl_n)
+#else
+static const char* _dgn_sl_p = NULL;   /* one-entry cache for the length of a long string (see dgn_strlen_fast) */
+static size_t _dgn_sl_n = 0;
+#endif
 static void dgn_gc_collect(void) {
+#ifdef DGN_PERCPU
+    if(!dgn_bm_stw_begin()) return;
+    for(int _ci = 0; _ci < DGN_MAXCPU; _ci++) dgn_pcpu[_ci].sl_p = NULL;
+#elif defined(DGN_BAREMETAL)
+    dgn_bm_crit_enter();
+#endif
+    long _survivors = 0;
+    _dgn_sl_p = NULL;
     if(_dgn_aug_init) {
         dgn_gc_mark_ptr(_dgn_aug_str.map);
         dgn_gc_mark_ptr(_dgn_aug_list.map);
     }
-    /* Root the FFI signature registry */
     if(_dgn_ffi_sigs.tag == DGN_MAP) dgn_gc_mark_ptr(_dgn_ffi_sigs.map);
-    /* Root all top-level Dragon globals — they live in BSS/data, not the stack */
     for(int _gi = 0; _dgn_global_roots[_gi] != NULL; _gi++)
         dgn_gc_mark_val(*_dgn_global_roots[_gi]);
 
-    /* Force every register the compiler is holding a live pointer in to be
-       spilled to this (non-inlined) function's own stack frame before we
-       scan. setjmp is documented to save the full callee-saved register
-       set into the jmp_buf (itself a stack-resident local, so it falls
-       inside the scanned range below); combined with the noinline
-       attribute above — which guarantees a real call boundary exists, so
-       any callee-saved register the *caller* was using to hold a
-       live-across-calls pointer gets pushed onto this frame by the
-       standard ABI prologue the moment this function's body touches that
-       register — this makes the conservative scan sound even under -O2,
-       where the earlier conservative-but-unsound version of this scan
-       could otherwise miss a register-only pointer. */
     jmp_buf _dgn_gc_regspill;
     setjmp(_dgn_gc_regspill);
 
     void* top;
     void** curr = (void**)&top;
+#ifdef DGN_BAREMETAL
+    void** bottom = (void**)dgn_bm_stack_bottom(_dgn_stack_bottom);
+#else
     void** bottom = (void**)_dgn_stack_bottom;
+#endif
     if(curr > bottom) { void** tmp = curr; curr = bottom; bottom = tmp; }
     while(curr < bottom) { dgn_gc_mark_ptr(*curr); curr++; }
-    /* Also scan the jmp_buf's own bytes explicitly: on some ABIs/libc
-       implementations part of it may be padded/aligned in ways that don't
-       line up on pointer-sized boundaries relative to the stack scan
-       above, so treat it as an extra (harmless, since scanning is just a
-       conservative "does this look like a live payload pointer" check)
-       root source in its own right. */
     { void** jb = (void**)&_dgn_gc_regspill; size_t jn = sizeof(_dgn_gc_regspill)/sizeof(void*);
       for(size_t _ji=0; _ji<jn; _ji++) dgn_gc_mark_ptr(jb[_ji]); }
+#ifdef DGN_BAREMETAL
+    dgn_bm_scan_stacks(dgn_gc_mark_ptr);
+#endif
 
     GcHeader** node = &_dgn_gc_head;
     while(*node) {
@@ -263,48 +264,92 @@ static void dgn_gc_collect(void) {
                     for(int i=0; i<m->cap; i++) if(m->entries[i].used && m->entries[i].key) free(m->entries[i].key);
                     free(m->entries);
                 }
+                free(m->idx);
             }
             free(unreached);
         } else {
             (*node)->marked = 0;
+            _survivors++;
             node = &(*node)->next;
         }
     }
+    _dgn_gc_threshold = _survivors * 2;
+#ifdef DGN_PERCPU
+    dgn_bm_stw_end();
+#elif defined(DGN_BAREMETAL)
+    dgn_bm_crit_exit();
+#endif
 }
 
 static long _dgn_gc_alloc_count = 0;
+#ifdef DGN_USER
+#define DGN_GC_THRESHOLD 4000   /* user programs have a small fixed heap: collect often */
+#else
 #define DGN_GC_THRESHOLD 50000
+#endif
 
+/* malloc/realloc that collect garbage and retry when memory runs out (a fixed-size heap on bare metal) */
+static void* dgn_heap_alloc(void* old, size_t size) {
+    void* p = old ? realloc(old, size) : malloc(size);
+#ifdef DGN_BAREMETAL
+    if(!p) {
+        dgn_gc_collect();
+        _dgn_gc_alloc_count = 0;
+        p = old ? realloc(old, size) : malloc(size);
+        if(!p) { fputs("[dragon] out of memory\n", stderr); exit(137); }
+    }
+#endif
+    return p;
+}
+
+static volatile int _dgn_gc_lock;
 static void* dgn_gc_alloc(size_t size, DgnTag tag) {
-    /* dgn_gc_collect() is now a noinline function that forces a register
-       spill (via setjmp) before conservatively scanning the C stack, so
-       it's sound to call it automatically at -O2 — see dgn_gc_collect()
-       above for why. Trigger it every DGN_GC_THRESHOLD allocations so
-       long-running programs (e.g. a bytecode interpreter looping millions
-       of times) don't grow memory without bound, while short CLI scripts
-       that never cross the threshold pay nothing extra. */
-    _dgn_gc_alloc_count++;
-    if(_dgn_gc_alloc_count >= DGN_GC_THRESHOLD) {
+#ifdef DGN_PERCPU
+    if(__sync_add_and_fetch(&_dgn_gc_alloc_count, 1) >= (_dgn_gc_threshold > DGN_GC_THRESHOLD ? _dgn_gc_threshold : DGN_GC_THRESHOLD)) {
         dgn_gc_collect();
         _dgn_gc_alloc_count = 0;
     }
-    GcHeader* hdr = (GcHeader*)malloc(sizeof(GcHeader) + size);
+    GcHeader* hdr = (GcHeader*)dgn_heap_alloc(NULL, sizeof(GcHeader) + size);
+    memset((void*)(hdr + 1), 0, size);
+    hdr->marked = 0;
+    hdr->tag = tag;
+    dgn_spin_lock(&_dgn_gc_lock);
+    hdr->next = _dgn_gc_head;
+    _dgn_gc_head = hdr;
+    dgn_gc_htab_insert(hdr);
+    dgn_spin_unlock(&_dgn_gc_lock);
+    return (void*)(hdr + 1);
+#else
+#ifdef DGN_BAREMETAL
+    dgn_bm_crit_enter();
+#endif
+    _dgn_gc_alloc_count++;
+    if(_dgn_gc_alloc_count >= (_dgn_gc_threshold > DGN_GC_THRESHOLD ? _dgn_gc_threshold : DGN_GC_THRESHOLD)) {
+        dgn_gc_collect();
+        _dgn_gc_alloc_count = 0;
+    }
+    GcHeader* hdr = (GcHeader*)dgn_heap_alloc(NULL, sizeof(GcHeader) + size);
+    memset((void*)(hdr + 1), 0, size);
     hdr->marked = 0;
     hdr->tag = tag;
     hdr->next = _dgn_gc_head;
     _dgn_gc_head = hdr;
     dgn_gc_htab_insert(hdr);
+#ifdef DGN_BAREMETAL
+    dgn_bm_crit_exit();
+#endif
     return (void*)(hdr + 1);
+#endif
 }
 
-/* ════════════════════════════════════════════════════════════
-   Constructors
-   ════════════════════════════════════════════════════════════ */
 static DgnVal dgn_null(void)      { DgnVal v; v.tag=DGN_NULL;  v.i=0;    return v; }
 static DgnVal dgn_bool(int b)     { DgnVal v; v.tag=DGN_BOOL;  v.i=b?1:0;return v; }
 static DgnVal dgn_int(int64_t n)  { DgnVal v; v.tag=DGN_INT;   v.i=n;    return v; }
 static DgnVal dgn_float(double d) { DgnVal v; v.tag=DGN_FLOAT; v.f=d;    return v; }
 
+/* a string literal: points at the constant in the program, nothing is allocated (strings are never changed in place; the garbage
+   collector ignores pointers it does not own) */
+static inline DgnVal dgn_lit(const char* s) { DgnVal v; v.tag=DGN_STR; v.s=(char*)s; return v; }
 
 static DgnVal dgn_str(const char* s) {
     DgnVal v; v.tag=DGN_STR;
@@ -315,17 +360,20 @@ static DgnVal dgn_list_new(int hint) {
     DgnVal v; v.tag=DGN_LIST;
     v.list=(DgnList*)dgn_gc_alloc(sizeof(DgnList), DGN_LIST);
     int cap=hint>4?hint:4;
-    v.list->data=(DgnVal*)malloc((size_t)cap*sizeof(DgnVal));
+    v.list->data=(DgnVal*)dgn_heap_alloc(NULL, (size_t)cap*sizeof(DgnVal));
     v.list->cap=cap; v.list->len=0;
     return v;
 }
 
 static void dgn_list_push(DgnVal* lv, DgnVal item) {
     DgnList* l=lv->list;
-    if(l->len>=l->cap){ l->cap*=2; l->data=(DgnVal*)realloc(l->data,(size_t)l->cap*sizeof(DgnVal)); }
+    if(l->len>=l->cap){ l->cap*=2; l->data=(DgnVal*)dgn_heap_alloc(l->data, (size_t)l->cap*sizeof(DgnVal)); }
     l->data[l->len++]=item;
 }
 
+static DgnVal dgn_box_new(DgnVal v) { DgnVal b = dgn_list_new(1); dgn_list_push(&b, v); return b; }
+static DgnVal dgn_box_get(DgnVal b) { return (b.tag == DGN_LIST && b.list && b.list->len > 0) ? b.list->data[0] : b; }
+static void dgn_box_set(DgnVal b, DgnVal v) { if (b.tag == DGN_LIST && b.list && b.list->len > 0) b.list->data[0] = v; }
 
 static DgnVal dgn_bytes(DgnVal* args, int n) {
     DgnVal list = dgn_list_new(n > 0 ? 16 : 0);
@@ -341,7 +389,6 @@ static DgnVal dgn_bytes(DgnVal* args, int n) {
     return list;
 }
 
-
 static DgnVal dgn_list_slice(DgnVal v, int start) {
     if (v.tag != DGN_LIST) return dgn_null();
     int len = v.list->len;
@@ -354,25 +401,94 @@ static DgnVal dgn_list_slice(DgnVal v, int start) {
 static DgnVal dgn_map_new(void) {
     DgnVal v; v.tag=DGN_MAP;
     v.map=(DgnMap*)dgn_gc_alloc(sizeof(DgnMap), DGN_MAP);
-    v.map->cap=8; v.map->len=0;
+    v.map->cap=8; v.map->len=0; v.map->n=0; v.map->icap=0; v.map->idx=NULL;
     v.map->entries=(DgnMapEntry*)calloc(8,sizeof(DgnMapEntry));
     return v;
 }
+static unsigned dgn_hash_str(const char* k) { unsigned h = 2166136261u; while (*k) { h ^= (unsigned char)*k++; h *= 16777619u; } return h; }
+static void dgn_map_reindex(DgnMap* m) {
+    free(m->idx); m->idx = NULL; m->icap = 0;
+    if (m->cap <= 8) return;
+    int ic = 16; while (ic < m->cap * 2) ic <<= 1;
+    m->idx = (int*)calloc((size_t)ic, sizeof(int)); m->icap = ic;
+    for (int i = 0; i < m->n; i++) if (m->entries[i].used) {
+        unsigned h = dgn_hash_str(m->entries[i].key) & (unsigned)(ic - 1);
+        while (m->idx[h]) h = (h + 1) & (unsigned)(ic - 1);
+        m->idx[h] = i + 1;
+    }
+}
+/* key comparison without a library call: keys are short and mostly differ early */
+static inline int dgn_keyeq(const char* a, const char* b) { while(*a && *a == *b) { a++; b++; } return *a == *b; }
+/* slot of `key`, or -1 */
+static int dgn_map_find(DgnMap* m, const char* key) {
+    if (!m->idx) {
+        char k0 = key[0];
+        for (int i = 0; i < m->n; i++) { const char* ek = m->entries[i].key; if (m->entries[i].used && ek[0] == k0 && dgn_keyeq(ek, key)) return i; }
+        return -1;
+    }
+    unsigned mask = (unsigned)(m->icap - 1), h = dgn_hash_str(key) & mask;
+    while (m->idx[h]) {
+        int s = m->idx[h];
+        if (s > 0 && m->entries[s - 1].used && m->entries[s - 1].key[0] == key[0] && dgn_keyeq(m->entries[s - 1].key, key)) return s - 1;
+        h = (h + 1) & mask;
+    }
+    return -1;
+}
+static int dgn_map_remove_key(DgnMap* m, const char* key) {
+    int i = dgn_map_find(m, key);
+    if (i < 0) return 0;
+    m->entries[i].used = 0; m->len--;
+    if (m->idx) {                       /* leave a tombstone (-1) so probe chains stay intact */
+        unsigned mask = (unsigned)(m->icap - 1), h = dgn_hash_str(m->entries[i].key) & mask;
+        while (m->idx[h] != i + 1) h = (h + 1) & mask;
+        m->idx[h] = -1;
+    }
+    return 1;
+}
+static void dgn_map_clear_all(DgnMap* m) {
+    for (int i = 0; i < m->n; i++) m->entries[i].used = 0;
+    m->len = 0; m->n = 0;
+    if (m->idx) memset(m->idx, 0, (size_t)m->icap * sizeof(int));
+}
 static void dgn_map_set(DgnVal* mv, const char* key, DgnVal val) {
     DgnMap* m=mv->map;
-    for(int i=0;i<m->cap;i++) if(m->entries[i].used && strcmp(m->entries[i].key,key)==0){ m->entries[i].val=val; return; }
-    if(m->len>=m->cap*3/4){
-        int nc=m->cap*2;
-        m->entries=(DgnMapEntry*)realloc(m->entries,(size_t)nc*sizeof(DgnMapEntry));
-        memset(m->entries+m->cap,0,(size_t)(nc-m->cap)*sizeof(DgnMapEntry));
-        m->cap=nc;
+    int f = dgn_map_find(m, key);
+    if (f >= 0) { m->entries[f].val = val; return; }
+    if (m->n >= m->cap) {
+        if (m->len < m->n - m->n / 4 && m->n > 0) {               /* many holes: close them up instead of growing */
+            int w = 0;
+            for (int i = 0; i < m->n; i++) if (m->entries[i].used) { if (w != i) m->entries[w] = m->entries[i]; w++; }
+            for (int i = w; i < m->n; i++) memset(&m->entries[i], 0, sizeof(DgnMapEntry));
+            m->n = w;
+        } else {
+            int nc = m->cap * 2;
+            m->entries = (DgnMapEntry*)realloc(m->entries, (size_t)nc * sizeof(DgnMapEntry));
+            memset(m->entries + m->cap, 0, (size_t)(nc - m->cap) * sizeof(DgnMapEntry));
+            m->cap = nc;
+        }
+        dgn_map_reindex(m);
     }
-    for(int i=0;i<m->cap;i++) if(!m->entries[i].used){ m->entries[i].key=strdup(key); m->entries[i].val=val; m->entries[i].used=1; m->len++; return; }
+    int i = m->n++;
+    m->entries[i].key = strdup(key); m->entries[i].val = val; m->entries[i].used = 1; m->len++;
+    if (m->idx) {
+        unsigned mask = (unsigned)(m->icap - 1), h = dgn_hash_str(key) & mask;
+        while (m->idx[h] > 0) h = (h + 1) & mask;
+        m->idx[h] = i + 1;
+    }
 }
 static DgnVal dgn_map_get(DgnVal mv, const char* key) {
     DgnMap* m=mv.map;
-    for(int i=0;i<m->cap;i++) if(m->entries[i].used && strcmp(m->entries[i].key,key)==0) return m->entries[i].val;
-    return dgn_null();
+    int i = dgn_map_find(m, key);
+    return i >= 0 ? m->entries[i].val : dgn_null();
+}
+
+static void dgn_fmt_float(double d, char* buf, size_t n) {
+    if(isnan(d)) { snprintf(buf,n,"NaN"); return; }
+    if(isinf(d)) { snprintf(buf,n,d<0?"-inf":"inf"); return; }
+    for(int prec=1; prec<=17; prec++) {
+        snprintf(buf,n,"%.*g",prec,d);
+        if(strtod(buf,NULL)==d) return;
+    }
 }
 
 static char* _dgn_val_to_cstr(DgnVal v, int depth) {
@@ -382,7 +498,7 @@ static char* _dgn_val_to_cstr(DgnVal v, int depth) {
         case DGN_NULL:  return strdup("null");
         case DGN_BOOL:  return strdup(v.i?"True":"False");
         case DGN_INT:   snprintf(buf,sizeof(buf),"%lld",(long long)v.i); return strdup(buf);
-        case DGN_FLOAT: snprintf(buf,sizeof(buf),"%.10g",v.f); return strdup(buf);
+        case DGN_FLOAT: dgn_fmt_float(v.f,buf,sizeof(buf)); return strdup(buf);
         case DGN_STR:   if(depth==0) return strdup(v.s); snprintf(buf,sizeof(buf),"\"%s\"", v.s); return strdup(buf);
         case DGN_LIST: {
             strcpy(buf, "[");
@@ -437,6 +553,7 @@ static DgnVal dgn_readln(DgnVal prompt) {
 }
 
 static int dgn_truthy(DgnVal v) {
+    DGN_SAFEPOINT();
     switch(v.tag){
         case DGN_NULL:  return 0;
         case DGN_BOOL:  return (int)v.i;
@@ -472,11 +589,11 @@ static DgnVal dgn_sub(DgnVal a, DgnVal b) {
 }
 static DgnVal dgn_mul(DgnVal a, DgnVal b) {
     if(a.tag==DGN_FLOAT||b.tag==DGN_FLOAT) return dgn_float((a.tag==DGN_FLOAT?a.f:(double)a.i)*(b.tag==DGN_FLOAT?b.f:(double)b.i));
-    if(a.tag==DGN_STR&&b.tag==DGN_INT){ 
-        int n=(int)b.i; if(n<=0) return dgn_str(""); 
-        char* r=(char*)dgn_gc_alloc((size_t)(strlen(a.s)*n+1), DGN_STR); 
-        r[0]=0; for(int i=0;i<n;i++) strcat(r,a.s); 
-        DgnVal v; v.tag=DGN_STR; v.s=r; return v; 
+    if(a.tag==DGN_STR&&b.tag==DGN_INT){
+        int n=(int)b.i; if(n<=0) return dgn_str("");
+        char* r=(char*)dgn_gc_alloc((size_t)(strlen(a.s)*n+1), DGN_STR);
+        r[0]=0; for(int i=0;i<n;i++) strcat(r,a.s);
+        DgnVal v; v.tag=DGN_STR; v.s=r; return v;
     }
     return dgn_int(a.i*b.i);
 }
@@ -508,7 +625,9 @@ static DgnVal dgn_eq(DgnVal a, DgnVal b) {
     if(a.tag==DGN_NULL&&b.tag==DGN_NULL) return dgn_bool(1);
     if(a.tag==DGN_BOOL&&b.tag==DGN_BOOL) return dgn_bool(a.i==b.i);
     if((a.tag==DGN_INT||a.tag==DGN_FLOAT)&&(b.tag==DGN_INT||b.tag==DGN_FLOAT)) return dgn_bool(_dgn_num_cmp(a,b)==0);
-    if(a.tag==DGN_STR&&b.tag==DGN_STR) return dgn_bool(strcmp(a.s,b.s)==0);
+    if(a.tag==DGN_STR&&b.tag==DGN_STR) return dgn_bool(a.s==b.s || (a.s[0]==b.s[0] && strcmp(a.s,b.s)==0));
+    if(a.tag==DGN_LIST&&b.tag==DGN_LIST) return dgn_bool(a.list==b.list);
+    if((a.tag==DGN_MAP||a.tag==DGN_INSTANCE||a.tag==DGN_CLASS)&&a.tag==b.tag) return dgn_bool(a.map==b.map);
     return dgn_bool(0);
 }
 static DgnVal dgn_neq(DgnVal a, DgnVal b) { return dgn_bool(!dgn_truthy(dgn_eq(a,b))); }
@@ -525,8 +644,16 @@ static DgnVal dgn_in(DgnVal needle, DgnVal haystack) {
     return dgn_bool(0);
 }
 
+/* strings are C strings, so len(s) and s[i] would scan the whole string every time: remember the length of the last long string
+   (strings are never changed in place; the memory of a collected string may be reused, so the garbage collector clears this) */
+static size_t dgn_strlen_fast(const char* s) {
+    if(s == _dgn_sl_p) return _dgn_sl_n;
+    size_t n = strlen(s);
+    if(n >= 256) { _dgn_sl_p = s; _dgn_sl_n = n; }
+    return n;
+}
 static int64_t dgn_len_raw(DgnVal v) {
-    if(v.tag==DGN_STR)  return (int64_t)strlen(v.s);
+    if(v.tag==DGN_STR)  return (int64_t)dgn_strlen_fast(v.s);
     if(v.tag==DGN_LIST) return (int64_t)v.list->len;
     if(v.tag==DGN_MAP||v.tag==DGN_INSTANCE) return (int64_t)v.map->len;
     if(v.tag==DGN_INT)  return v.i;
@@ -551,7 +678,7 @@ static DgnVal dgn_typeof(DgnVal v) {
     }
 }
 
-static DgnVal dgn_to_str(DgnVal v) { 
+static DgnVal dgn_to_str(DgnVal v) {
     char* sa = dgn_val_to_cstr(v);
     char* r = (char*)dgn_gc_alloc(strlen(sa)+1, DGN_STR);
     strcpy(r, sa); free(sa);
@@ -629,14 +756,24 @@ static DgnVal dgn_list_join(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 1 || args[0].tag != DGN_LIST) return dgn_str("");
     const char* sep = (n > 1 && args[1].tag == DGN_STR) ? args[1].s : "";
-    char buf[8192]; buf[0] = 0; DgnList* l = args[0].list;
+    size_t seplen = strlen(sep);
+    DgnList* l = args[0].list;
+    size_t cap = 256, len = 0;
+    char* buf = (char*)malloc(cap);
+    buf[0] = 0;
     for(int i = 0; i < l->len; i++) {
-        if(i > 0 && strlen(buf) + strlen(sep) < sizeof(buf) - 1) strcat(buf, sep);
         char* s = dgn_val_to_cstr(l->data[i]);
-        if(strlen(buf) + strlen(s) < sizeof(buf) - 1) strcat(buf, s);
+        size_t sl = strlen(s);
+        size_t need = len + sl + (i > 0 ? seplen : 0) + 1;
+        if(need > cap) { while(cap < need) cap *= 2; buf = (char*)realloc(buf, cap); }
+        if(i > 0) { memcpy(buf + len, sep, seplen); len += seplen; }
+        memcpy(buf + len, s, sl); len += sl;
+        buf[len] = 0;
         free(s);
     }
-    return dgn_str(buf);
+    DgnVal r = dgn_str(buf);
+    free(buf);
+    return r;
 }
 
 static DgnVal dgn_list_slice_method(DgnVal* args, int n, DgnEnv* env) {
@@ -744,7 +881,9 @@ static DgnVal dgn_str_contains(DgnVal* args, int n, DgnEnv* env) {
 
 static DgnVal dgn_str_starts_with(DgnVal* args, int n, DgnEnv* env) {
     (void)env; if(n < 2 || args[0].tag != DGN_STR || args[1].tag != DGN_STR) return dgn_bool(0);
-    return dgn_bool(strncmp(args[0].s, args[1].s, strlen(args[1].s)) == 0);
+    size_t off = 0;
+    if(n > 2 && args[2].tag == DGN_INT && args[2].i > 0) { off = (size_t)args[2].i; if(off > strlen(args[0].s)) return dgn_bool(0); }
+    return dgn_bool(strncmp(args[0].s + off, args[1].s, strlen(args[1].s)) == 0);
 }
 
 static DgnVal dgn_str_ends_with(DgnVal* args, int n, DgnEnv* env) {
@@ -756,7 +895,9 @@ static DgnVal dgn_str_ends_with(DgnVal* args, int n, DgnEnv* env) {
 
 static DgnVal dgn_str_index_of(DgnVal* args, int n, DgnEnv* env) {
     (void)env; if(n < 2 || args[0].tag != DGN_STR || args[1].tag != DGN_STR) return dgn_int(-1);
-    const char* match = strstr(args[0].s, args[1].s);
+    size_t off = 0;
+    if(n > 2 && args[2].tag == DGN_INT && args[2].i > 0) { off = (size_t)args[2].i; if(off > strlen(args[0].s)) return dgn_int(-1); }
+    const char* match = strstr(args[0].s + off, args[1].s);
     if(match) return dgn_int((int64_t)(match - args[0].s));
     return dgn_int(-1);
 }
@@ -778,17 +919,14 @@ static DgnVal dgn_str_substring(DgnVal* args, int n, DgnEnv* env) {
     return dgn_str(r);
 }
 
-
-/* ── Map Methods ────────────────────────────────────────── */
 static DgnVal dgn_map_set_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<3 || args[0].tag!=DGN_MAP || args[1].tag!=DGN_STR) return dgn_null(); dgn_map_set(&args[0], args[1].s, args[2]); return dgn_null(); }
 static DgnVal dgn_map_get_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<2 || args[0].tag!=DGN_MAP || args[1].tag!=DGN_STR) return dgn_null(); return dgn_map_get(args[0], args[1].s); }
-static DgnVal dgn_map_remove_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<2 || args[0].tag!=DGN_MAP || args[1].tag!=DGN_STR) return dgn_bool(0); DgnMap* m = args[0].map; for(int i=0; i<m->cap; i++) { if(m->entries[i].used && strcmp(m->entries[i].key, args[1].s)==0) { m->entries[i].used = 0; m->len--; return dgn_bool(1); } } return dgn_bool(0); }
+static DgnVal dgn_map_remove_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<2 || args[0].tag!=DGN_MAP || args[1].tag!=DGN_STR) return dgn_bool(0); return dgn_bool(dgn_map_remove_key(args[0].map, args[1].s)); }
 static DgnVal dgn_map_contains_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<2 || args[0].tag!=DGN_MAP || args[1].tag!=DGN_STR) return dgn_bool(0); return dgn_bool(dgn_map_get(args[0], args[1].s).tag != DGN_NULL); }
-static DgnVal dgn_map_clear_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<1 || args[0].tag!=DGN_MAP) return dgn_null(); DgnMap* m = args[0].map; for(int i=0; i<m->cap; i++) m->entries[i].used = 0; m->len = 0; return dgn_null(); }
+static DgnVal dgn_map_clear_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<1 || args[0].tag!=DGN_MAP) return dgn_null(); dgn_map_clear_all(args[0].map); return dgn_null(); }
 static DgnVal dgn_map_keys_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<1 || args[0].tag!=DGN_MAP) return dgn_list_new(0); DgnMap* m = args[0].map; DgnVal l = dgn_list_new(m->len); for(int i=0; i<m->cap; i++) if(m->entries[i].used) dgn_list_push(&l, dgn_str(m->entries[i].key)); return l; }
 static DgnVal dgn_map_values_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<1 || args[0].tag!=DGN_MAP) return dgn_list_new(0); DgnMap* m = args[0].map; DgnVal l = dgn_list_new(m->len); for(int i=0; i<m->cap; i++) if(m->entries[i].used) dgn_list_push(&l, m->entries[i].val); return l; }
 
-/* ── List & ByteArray Methods ────────────────────────────── */
 static DgnVal dgn_list_pop_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<1 || args[0].tag!=DGN_LIST || args[0].list->len==0) return dgn_null(); return args[0].list->data[--args[0].list->len]; }
 static DgnVal dgn_list_insert_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<3 || args[0].tag!=DGN_LIST) return dgn_null(); DgnList* l = args[0].list; int idx = (int)(args[1].tag==DGN_INT?args[1].i:0); if(idx<0||idx>l->len) return dgn_null(); dgn_list_push(&args[0], dgn_null()); for(int i=l->len-1; i>idx; i--) l->data[i] = l->data[i-1]; l->data[idx] = args[2]; return dgn_null(); }
 static DgnVal dgn_list_remove_at_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<2 || args[0].tag!=DGN_LIST) return dgn_null(); DgnList* l = args[0].list; int idx = (int)(args[1].tag==DGN_INT?args[1].i:0); if(idx<0||idx>=l->len) return dgn_null(); DgnVal v = l->data[idx]; for(int i=idx; i<l->len-1; i++) l->data[i] = l->data[i+1]; l->len--; return v; }
@@ -798,7 +936,6 @@ static DgnVal dgn_list_last_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if
 static DgnVal dgn_list_contains_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<2 || args[0].tag!=DGN_LIST) return dgn_bool(0); for(int i=0; i<args[0].list->len; i++) if(dgn_truthy(dgn_eq(args[0].list->data[i], args[1]))) return dgn_bool(1); return dgn_bool(0); }
 static DgnVal dgn_list_sum_method(DgnVal* args, int n, DgnEnv* e) { (void)e; if(n<1 || args[0].tag!=DGN_LIST) return dgn_int(0); double sum=0; int is_float=0; for(int i=0; i<args[0].list->len; i++) { if(args[0].list->data[i].tag==DGN_FLOAT) { is_float=1; sum+=args[0].list->data[i].f; } else if(args[0].list->data[i].tag==DGN_INT) sum+=(double)args[0].list->data[i].i; } return is_float ? dgn_float(sum) : dgn_int((int64_t)sum); }
 
-/* Bytes specific */
 static DgnVal dgn_list_to_string_method(DgnVal* args, int n, DgnEnv* e) {
     (void)e; if(n<1 || args[0].tag!=DGN_LIST) return dgn_str("");
     DgnList* l = args[0].list;
@@ -808,7 +945,6 @@ static DgnVal dgn_list_to_string_method(DgnVal* args, int n, DgnEnv* e) {
     DgnVal v; v.tag = DGN_STR; v.s = buf; return v;
 }
 
-/* Functional Operators */
 static DgnVal dgn_list_find_method(DgnVal* args, int n, DgnEnv* env) {
     (void)env; if(n < 2 || args[0].tag != DGN_LIST || args[1].tag != DGN_FUNC) return dgn_null();
     DgnList* l = args[0].list; DgnVal cb = args[1];
@@ -845,16 +981,39 @@ static DgnVal dgn_list_zip_method(DgnVal* args, int n, DgnEnv* e) {
     DgnVal res = dgn_list_new(min_len);
     for(int i=0; i<min_len; i++) { DgnVal pair = dgn_list_new(2); dgn_list_push(&pair, l1->data[i]); dgn_list_push(&pair, l2->data[i]); dgn_list_push(&res, pair); } return res;
 }
+static void dgn_msort_rec(DgnVal* k, DgnVal* v, DgnVal* tk, DgnVal* tv, int lo, int hi) {
+    if (hi - lo < 2) return;
+    int mid = lo + (hi - lo) / 2;
+    dgn_msort_rec(k, v, tk, tv, lo, mid);
+    dgn_msort_rec(k, v, tk, tv, mid, hi);
+    int a = lo, b = mid, o = lo;
+    while (a < mid && b < hi) {
+        if (dgn_truthy(dgn_gt(k[a], k[b]))) { tk[o] = k[b]; if (v) tv[o] = v[b]; b++; }
+        else { tk[o] = k[a]; if (v) tv[o] = v[a]; a++; }
+        o++;
+    }
+    while (a < mid) { tk[o] = k[a]; if (v) tv[o] = v[a]; a++; o++; }
+    while (b < hi) { tk[o] = k[b]; if (v) tv[o] = v[b]; b++; o++; }
+    for (int i = lo; i < hi; i++) { k[i] = tk[i]; if (v) v[i] = tv[i]; }
+}
+static void dgn_msort(DgnVal* k, DgnVal* v, int n) {
+    if (n < 2) return;
+    DgnVal* tk = (DgnVal*)malloc(n * sizeof(DgnVal));
+    DgnVal* tv = v ? (DgnVal*)malloc(n * sizeof(DgnVal)) : NULL;
+    dgn_msort_rec(k, v, tk, tv, 0, n);
+    free(tk); if (tv) free(tv);
+}
 static DgnVal dgn_list_sort_method(DgnVal* args, int n, DgnEnv* e) {
     (void)e; if(n<1 || args[0].tag!=DGN_LIST) return dgn_null(); DgnList* l = args[0].list;
-    for(int i=0; i<l->len-1; i++) { for(int j=0; j<l->len-i-1; j++) { if(dgn_truthy(dgn_gt(l->data[j], l->data[j+1]))) { DgnVal tmp = l->data[j]; l->data[j] = l->data[j+1]; l->data[j+1] = tmp; } } } return args[0];
+    dgn_msort(l->data, NULL, l->len);
+    return args[0];
 }
 static DgnVal dgn_list_sort_by_method(DgnVal* args, int n, DgnEnv* e) {
     (void)e; if(n<2 || args[0].tag!=DGN_LIST || args[1].tag!=DGN_FUNC) return dgn_null(); DgnList* l = args[0].list; DgnVal cb = args[1];
-    DgnVal* keys = (DgnVal*)malloc(l->len * sizeof(DgnVal));
-    for(int i=0; i<l->len; i++) { DgnVal call_args[1] = { l->data[i] }; keys[i] = dgn_call_val(cb, call_args, 1); }
-    for(int i=0; i<l->len-1; i++) { for(int j=0; j<l->len-i-1; j++) { if(dgn_truthy(dgn_gt(keys[j], keys[j+1]))) { DgnVal tK = keys[j]; keys[j] = keys[j+1]; keys[j+1] = tK; DgnVal tV = l->data[j]; l->data[j] = l->data[j+1]; l->data[j+1] = tV; } } }
-    free(keys); return args[0];
+    DgnVal keyl = dgn_list_new(l->len);
+    for(int i=0; i<l->len; i++) { DgnVal call_args[1] = { l->data[i] }; DgnVal kv = dgn_call_val(cb, call_args, 1); dgn_list_push(&keyl, kv); }
+    dgn_msort(keyl.list->data, l->data, l->len);
+    return args[0];
 }
 
 DgnVal _dgn_aug_str;
@@ -864,15 +1023,19 @@ static void _init_augments(void);
 
 static DgnVal dgn_get_attr(DgnVal obj, const char* key) {
     _init_augments();
-    
-
 
     if(obj.tag==DGN_MAP || obj.tag==DGN_CLASS || obj.tag==DGN_INSTANCE) {
-        /* 1. Check the map itself FIRST to prevent shadowing user/module keys */
         DgnVal v = dgn_map_get(obj, key);
         if (v.tag != DGN_NULL) return v;
+        if (obj.tag==DGN_INSTANCE || obj.tag==DGN_CLASS) {
+            DgnVal par = dgn_map_get(obj, "__parent__"); int g = 0;
+            while ((par.tag==DGN_CLASS||par.tag==DGN_MAP) && g++ < 64) {
+                DgnVal pv = dgn_map_get(par, key);
+                if (pv.tag != DGN_NULL) return pv;
+                par = dgn_map_get(par, "__parent__");
+            }
+        }
 
-        /* 2. Map built-in methods fallback */
         if(strcmp(key,"set")==0) return dgn_func(dgn_map_set_method, 3);
         if(strcmp(key,"get")==0) return dgn_func(dgn_map_get_method, 2);
         if(strcmp(key,"remove")==0) return dgn_func(dgn_map_remove_method, 2);
@@ -880,37 +1043,36 @@ static DgnVal dgn_get_attr(DgnVal obj, const char* key) {
         if(strcmp(key,"clear")==0) return dgn_func(dgn_map_clear_method, 1);
         if(strcmp(key,"keys")==0) return dgn_func(dgn_map_keys_method, 1);
         if(strcmp(key,"values")==0) return dgn_func(dgn_map_values_method, 1);
-        
+
         return dgn_null();
     }
-    
-    if(obj.tag==DGN_STR){ 
-        if(strcmp(key,"length")==0) return dgn_int((int64_t)strlen(obj.s)); 
+
+    if(obj.tag==DGN_STR){
+        if(strcmp(key,"length")==0) return dgn_int((int64_t)strlen(obj.s));
         if(strcmp(key,"upper")==0) return dgn_func(dgn_str_upper, 1);
         if(strcmp(key,"lower")==0) return dgn_func(dgn_str_lower, 1);
         if(strcmp(key,"trim")==0) return dgn_func(dgn_str_trim, 1);
         if(strcmp(key,"split")==0) return dgn_func(dgn_str_split, -1);
         if(strcmp(key,"replace")==0) return dgn_func(dgn_str_replace, 3);
         if(strcmp(key,"contains")==0) return dgn_func(dgn_str_contains, 2);
-        if(strcmp(key,"starts_with")==0) return dgn_func(dgn_str_starts_with, 2);
+        if(strcmp(key,"starts_with")==0) return dgn_func(dgn_str_starts_with, -1);
         if(strcmp(key,"ends_with")==0) return dgn_func(dgn_str_ends_with, 2);
-        if(strcmp(key,"index_of")==0) return dgn_func(dgn_str_index_of, 2);
+        if(strcmp(key,"index_of")==0) return dgn_func(dgn_str_index_of, -1);
         if(strcmp(key,"substring")==0) return dgn_func(dgn_str_substring, 3);
 
         DgnVal aug = dgn_map_get(_dgn_aug_str, key);
         if(aug.tag != DGN_NULL) return aug;
     }
-    
-    if(obj.tag==DGN_LIST){ 
-        if(strcmp(key,"length")==0||strcmp(key,"len")==0) return dgn_int((int64_t)obj.list->len); 
-        if(strcmp(key,"join")==0) return dgn_func(dgn_list_join, 1); 
+
+    if(obj.tag==DGN_LIST){
+        if(strcmp(key,"length")==0||strcmp(key,"len")==0) return dgn_int((int64_t)obj.list->len);
+        if(strcmp(key,"join")==0) return dgn_func(dgn_list_join, 1);
         if(strcmp(key,"slice")==0) return dgn_func(dgn_list_slice_method, -1);
         if(strcmp(key,"push")==0) return dgn_func(dgn_list_push_method, 1);
         if(strcmp(key,"map")==0) return dgn_func(dgn_list_map_method, 1);
         if(strcmp(key,"filter")==0) return dgn_func(dgn_list_filter_method, 1);
         if(strcmp(key,"reduce")==0) return dgn_func(dgn_list_reduce_method, 2);
-        
-        /* New List / Bytes Methods */
+
         if(strcmp(key,"pop")==0) return dgn_func(dgn_list_pop_method, 1);
         if(strcmp(key,"insert")==0) return dgn_func(dgn_list_insert_method, 3);
         if(strcmp(key,"remove_at")==0) return dgn_func(dgn_list_remove_at_method, 2);
@@ -923,8 +1085,7 @@ static DgnVal dgn_get_attr(DgnVal obj, const char* key) {
         if(strcmp(key,"find")==0) return dgn_func(dgn_list_find_method, 2);
         if(strcmp(key,"any")==0) return dgn_func(dgn_list_any_method, 2);
         if(strcmp(key,"all")==0) return dgn_func(dgn_list_all_method, 2);
-        
-        /* Advanced operators */
+
         if(strcmp(key,"unique")==0) return dgn_func(dgn_list_unique_method, 1);
         if(strcmp(key,"flat")==0) return dgn_func(dgn_list_flat_method, 1);
         if(strcmp(key,"zip")==0) return dgn_func(dgn_list_zip_method, 2);
@@ -942,7 +1103,7 @@ static void dgn_set_attr(DgnVal* obj, const char* key, DgnVal val) {
 }
 static DgnVal dgn_get_index(DgnVal obj, DgnVal idx) {
     if(obj.tag==DGN_LIST){ int64_t i=(idx.tag==DGN_INT)?idx.i:(int64_t)idx.f; if(i<0)i+=obj.list->len; if(i>=0&&i<obj.list->len) return obj.list->data[i]; return dgn_null(); }
-    if(obj.tag==DGN_STR&&(idx.tag==DGN_INT||idx.tag==DGN_FLOAT)){ int64_t i=(idx.tag==DGN_INT)?idx.i:(int64_t)idx.f; if(i<0)i+=(int64_t)strlen(obj.s); if(i>=0&&(size_t)i<strlen(obj.s)){ char buf[2]; buf[0]=obj.s[i]; buf[1]=0; return dgn_str(buf); } return dgn_null(); }
+    if(obj.tag==DGN_STR&&(idx.tag==DGN_INT||idx.tag==DGN_FLOAT)){ int64_t i=(idx.tag==DGN_INT)?idx.i:(int64_t)idx.f; size_t sl_=dgn_strlen_fast(obj.s); if(i<0)i+=(int64_t)sl_; if(i>=0&&(size_t)i<sl_){ char buf[2]; buf[0]=obj.s[i]; buf[1]=0; return dgn_str(buf); } return dgn_null(); }
     if((obj.tag==DGN_MAP||obj.tag==DGN_INSTANCE)&&idx.tag==DGN_STR) return dgn_map_get(obj,idx.s);
     return dgn_null();
 }
@@ -953,21 +1114,21 @@ static void dgn_set_index(DgnVal* obj, DgnVal idx, DgnVal val) {
 
 static DgnVal dgn_iter_get(DgnVal obj, int i) {
     if(obj.tag==DGN_LIST){ if(i>=0&&i<obj.list->len) return obj.list->data[i]; return dgn_null(); }
-    if(obj.tag==DGN_STR){ int l=(int)strlen(obj.s); if(i>=0&&i<l){ char buf[2]; buf[0]=obj.s[i]; buf[1]=0; return dgn_str(buf); } return dgn_null(); }
+    if(obj.tag==DGN_STR){ int l=(int)dgn_strlen_fast(obj.s); if(i>=0&&i<l){ char buf[2]; buf[0]=obj.s[i]; buf[1]=0; return dgn_str(buf); } return dgn_null(); }
     if(obj.tag==DGN_MAP||obj.tag==DGN_INSTANCE){ int seen=0,k; for(k=0;k<obj.map->cap;k++) if(obj.map->entries[k].used){ if(seen==i) return dgn_str(obj.map->entries[k].key); seen++; } return dgn_null(); }
     if(obj.tag==DGN_INT||obj.tag==DGN_FLOAT){ int64_t max=(obj.tag==DGN_INT)?obj.i:(int64_t)obj.f; if(i>=0&&i<max) return dgn_int(i); return dgn_null(); }
     return dgn_null();
 }
 static DgnVal dgn_iter_pair(DgnVal obj, int i) {
     DgnVal pair=dgn_list_new(2);
-    if(obj.tag==DGN_MAP||obj.tag==DGN_INSTANCE){ 
-        int seen=0,k; 
+    if(obj.tag==DGN_MAP||obj.tag==DGN_INSTANCE){
+        int seen=0,k;
         for(k=0;k<obj.map->cap;k++) {
-            if(obj.map->entries[k].used){ 
-                if(seen==i){ dgn_list_push(&pair,dgn_str(obj.map->entries[k].key)); dgn_list_push(&pair,obj.map->entries[k].val); return pair; } 
-                seen++; 
-            } 
-        } 
+            if(obj.map->entries[k].used){
+                if(seen==i){ dgn_list_push(&pair,dgn_str(obj.map->entries[k].key)); dgn_list_push(&pair,obj.map->entries[k].val); return pair; }
+                seen++;
+            }
+        }
     }
     else if(obj.tag==DGN_LIST){
         dgn_list_push(&pair, dgn_int(i));
@@ -993,17 +1154,15 @@ static DgnVal dgn_iter_pair(DgnVal obj, int i) {
 static DgnVal dgn_func(DgnFuncPtr fn, int arity) {
     DgnVal v; v.tag=DGN_FUNC;
     v.func=(DgnFunc*)dgn_gc_alloc(sizeof(DgnFunc), DGN_FUNC);
-    v.func->fn=fn; v.func->arity=arity; v.func->env=NULL;
+    v.func->fn=fn; v.func->arity=arity; v.func->env=NULL; v.func->pnames=NULL; v.func->skip=0;
     return v;
 }
 static DgnVal dgn_closure(DgnFuncPtr fn, int arity, DgnMap* env) {
     DgnVal v; v.tag=DGN_FUNC;
     v.func=(DgnFunc*)dgn_gc_alloc(sizeof(DgnFunc), DGN_FUNC);
-    v.func->fn=fn; v.func->arity=arity; v.func->env=env;
+    v.func->fn=fn; v.func->arity=arity; v.func->env=env; v.func->pnames=NULL; v.func->skip=0;
     return v;
 }
-/* Raw map accessors that bypass DgnVal wrapping — used by closure env */
-/* Raw map accessors that bypass DgnVal wrapping — used by closure env */
 static DgnVal dgn_map_get_raw(DgnMap* m, const char* key) {
     if(!m || !key) return dgn_null();
     DgnVal v; v.tag = DGN_MAP; v.map = m;
@@ -1015,8 +1174,43 @@ static void dgn_map_set_raw(DgnMap* m, const char* key, DgnVal val) {
     DgnVal v; v.tag = DGN_MAP; v.map = m;
     dgn_map_set(&v, key, val);
 }
+static DgnVal dgn_func_n(DgnFuncPtr fn, int arity, const char* pn){ DgnVal v=dgn_func(fn,arity); v.func->pnames=pn; v.func->skip=-1; return v; }
+static DgnVal dgn_closure_n(DgnFuncPtr fn, int arity, DgnMap* env, const char* pn){ DgnVal v=dgn_closure(fn,arity,env); v.func->pnames=pn; v.func->skip=-1; return v; }
+static DgnVal dgn_new_instance(DgnVal cls, DgnVal* args, int n);
+static int dgn_is_named_pack(DgnVal v){
+    if(v.tag!=DGN_MAP) return 0;
+    for(int i=0;i<v.map->cap;i++) if(v.map->entries[i].used && strcmp(v.map->entries[i].key,"__named__")==0) return 1;
+    return 0;
+}
+static DgnVal dgn_call_fn_bound(DgnVal fv, DgnVal* args, int n){
+    DgnFunc* f=fv.func;
+    if(n>0 && f->pnames && dgn_is_named_pack(args[n-1])){
+        DgnVal pack=args[n-1];
+        int cnt=1; for(const char* c=f->pnames;*c;c++) if(*c==',') cnt++;
+        if(!*f->pnames) cnt=0;
+        int skip=f->skip>0?f->skip:0;
+        int total=skip+cnt; int pos=n-1; if(pos>total) total=pos;
+        DgnVal* na=(DgnVal*)malloc((size_t)(total>0?total:1)*sizeof(DgnVal));
+        for(int i=0;i<total;i++) na[i]=dgn_null();
+        for(int i=0;i<pos;i++) na[i]=args[i];
+        for(int e=0;e<pack.map->cap;e++){
+            if(!pack.map->entries[e].used) continue;
+            const char* k=pack.map->entries[e].key; if(strcmp(k,"__named__")==0) continue;
+            int idx=-1, j=0; const char* p=f->pnames; size_t kl=strlen(k);
+            while(*p){ const char* q=strchr(p,','); size_t L=q?(size_t)(q-p):strlen(p); if(L==kl && strncmp(p,k,L)==0){ idx=j; break; } j++; if(!q) break; p=q+1; }
+            if(idx<0){ fprintf(stderr,"Dragon: function has no parameter named '%s' (parameters: %s)\n",k,f->pnames); continue; }
+            na[skip+idx]=pack.map->entries[e].val;
+        }
+        DgnEnv env_s; env_s.map=f->env;
+        DgnVal r=f->fn(na,total,f->env?&env_s:NULL); free(na); return r;
+    }
+    DgnEnv env_s; env_s.map=f->env;
+    return f->fn(args,n,f->env?&env_s:NULL);
+}
 static DgnVal dgn_call_val(DgnVal fv, DgnVal* args, int n) {
-    if(fv.tag==DGN_FUNC&&fv.func&&fv.func->fn) {
+    if(fv.tag==DGN_CLASS) return dgn_new_instance(fv,args,n);
+    if(fv.tag==DGN_FUNC&&fv.func&&fv.func->fn) { return dgn_call_fn_bound(fv,args,n); }
+    if(0) {
         DgnEnv env_s; env_s.map=fv.func->env;
         return fv.func->fn(args, n, fv.func->env ? &env_s : NULL);
     }
@@ -1027,6 +1221,7 @@ static DgnVal dgn_call_method(DgnVal obj, const char* method, DgnVal* args, int 
     DgnVal fn=dgn_get_attr(obj,method);
     if(fn.tag==DGN_NULL){ DgnVal parent=dgn_get_attr(obj,"__parent__"); while(parent.tag==DGN_MAP||parent.tag==DGN_CLASS||parent.tag==DGN_INSTANCE){ fn=dgn_get_attr(parent,method); if(fn.tag!=DGN_NULL) break; parent=dgn_get_attr(parent,"__parent__"); } }
     if(fn.tag!=DGN_FUNC) return dgn_null();
+    if(fn.func->skip<0) return dgn_call_val(fn,args,n);
     DgnVal* nargs=(DgnVal*)malloc((size_t)(n+1)*sizeof(DgnVal)); nargs[0]=obj; memcpy(nargs+1,args,(size_t)n*sizeof(DgnVal));
     DgnVal result=dgn_call_val(fn,nargs,n+1); free(nargs); return result;
 }
@@ -1037,21 +1232,26 @@ static DgnVal dgn_class_new(const char* name, const char* parent_name) {
     (void)parent_name; return v;
 }
 static void dgn_class_add_method(DgnVal* cls, const char* name, DgnFuncPtr fn, int arity) { dgn_map_set(cls,name,dgn_func(fn,arity)); }
+static void dgn_class_add_method_n(DgnVal* cls, const char* name, DgnFuncPtr fn, int arity, const char* pn) { DgnVal f=dgn_func(fn,arity); f.func->pnames=pn; f.func->skip=1; dgn_map_set(cls,name,f); }
 static void dgn_class_set_parent(DgnVal* cls, DgnVal parent) { dgn_map_set(cls,"__parent__",parent); }
+static void dgn_class_init_statics(DgnVal* cls) {
+    DgnVal fi = dgn_map_get(*cls, "__field_init__");
+    if(fi.tag == DGN_FUNC) { DgnVal a[1]; a[0] = *cls; dgn_call_val(fi, a, 1); }
+}
 static DgnVal dgn_new_instance(DgnVal cls, DgnVal* args, int n) {
     DgnVal inst; inst.tag=DGN_INSTANCE;
-    inst.map=(DgnMap*)dgn_gc_alloc(sizeof(DgnMap), DGN_INSTANCE); inst.map->cap=8; inst.map->entries=(DgnMapEntry*)calloc(8,sizeof(DgnMapEntry));
+    inst.map=(DgnMap*)dgn_gc_alloc(sizeof(DgnMap), DGN_INSTANCE); inst.map->cap=8; inst.map->n=0; inst.map->idx=NULL; inst.map->icap=0; inst.map->entries=(DgnMapEntry*)calloc(8,sizeof(DgnMapEntry));
     if(cls.tag==DGN_CLASS||cls.tag==DGN_MAP){ for(int i=0;i<cls.map->cap;i++) if(cls.map->entries[i].used) dgn_map_set(&inst,cls.map->entries[i].key,cls.map->entries[i].val); }
-    /* Run the synthesized field-default initializer (from bare `name = expr;`
-       declarations in the class body) fresh for this instance, BEFORE init()
-       so an explicit init() can still override any of them. This must be a
-       real per-instance call (not a value copied from the class map) so that
-       mutable defaults like `threads = list();` don't get shared across
-       every instance of the class. */
-    DgnVal field_init_fn=dgn_map_get(inst,"__field_init__");
-    if(field_init_fn.tag==DGN_FUNC){ DgnVal fi_args[1]; fi_args[0]=inst; dgn_call_val(field_init_fn,fi_args,1); }
-    DgnVal init_fn=dgn_map_get(inst,"init");
-    if(init_fn.tag==DGN_FUNC){ DgnVal* nargs=(DgnVal*)malloc((size_t)(n+1)*sizeof(DgnVal)); nargs[0]=inst; memcpy(nargs+1,args,(size_t)n*sizeof(DgnVal)); dgn_call_val(init_fn,nargs,n+1); free(nargs); }
+    { DgnVal chain[64]; int cn=0; DgnVal cur=cls;
+      while((cur.tag==DGN_CLASS||cur.tag==DGN_MAP) && cn<64){ chain[cn++]=cur; cur=dgn_map_get(cur,"__parent__"); }
+      for(int ci=cn-1; ci>=0; ci--){
+          DgnVal fi=dgn_map_get(chain[ci],"__field_init__");
+          if(fi.tag==DGN_FUNC){ DgnVal fi_args[1]; fi_args[0]=inst; dgn_call_val(fi,fi_args,1); }
+      }
+      DgnVal init_fn=dgn_null();
+      for(int ci=0; ci<cn; ci++){ init_fn=dgn_map_get(chain[ci],"init"); if(init_fn.tag==DGN_FUNC) break; }
+      if(init_fn.tag==DGN_FUNC){ DgnVal* nargs=(DgnVal*)malloc((size_t)(n+1)*sizeof(DgnVal)); nargs[0]=inst; if(n>0) memcpy(nargs+1,args,(size_t)n*sizeof(DgnVal)); dgn_call_val(init_fn,nargs,n+1); free(nargs); }
+    }
     return inst;
 }
 static DgnVal dgn_super_call(DgnVal inst, const char* method, DgnVal* args, int n) {
@@ -1067,10 +1267,34 @@ static DgnVal dgn_super_call(DgnVal inst, const char* method, DgnVal* args, int 
     DgnVal result = dgn_call_val(fn, nargs, n+1); free(nargs); return result;
 }
 
+static DgnVal dgn_super_call_from(DgnVal inst, DgnVal defcls, const char* method, DgnVal* args, int n) {
+    DgnVal parent = dgn_map_get(defcls, "__parent__"); DgnVal fn = dgn_null(); int g = 0;
+    while((parent.tag == DGN_MAP || parent.tag == DGN_CLASS) && g++ < 64) {
+        fn = dgn_map_get(parent, method);
+        if(fn.tag == DGN_FUNC) break;
+        parent = dgn_map_get(parent, "__parent__");
+    }
+    if(fn.tag != DGN_FUNC) return dgn_null();
+    DgnVal* nargs = (DgnVal*)malloc((size_t)(n+1)*sizeof(DgnVal));
+    nargs[0] = inst; if(n > 0) memcpy(nargs+1, args, (size_t)n*sizeof(DgnVal));
+    DgnVal result = dgn_call_val(fn, nargs, n+1); free(nargs); return result;
+}
+
 #define MAX_TRY_DEPTH 256
+#ifdef DGN_PERCPU
+#define _dgn_try_stack PC(try_stack)
+#define _dgn_try_top PC(try_top)
+#else
 static DgnTryFrame* _dgn_try_stack[MAX_TRY_DEPTH];
 static int _dgn_try_top = 0;
+#endif
 static void dgn_try_push(DgnTryFrame* f) { if (_dgn_try_top >= MAX_TRY_DEPTH) { fprintf(stderr, "Dragon Error: Try/Catch overflow\n"); exit(1); } _dgn_try_stack[_dgn_try_top++] = f; }
+#ifdef DGN_BAREMETAL
+int  dgn_bm_try_cap(void) { return MAX_TRY_DEPTH; }
+void dgn_bm_try_save(void** dst, int* top) { int n = _dgn_try_top; for (int i = 0; i < n; i++) dst[i] = (void*)_dgn_try_stack[i]; *top = n; }
+void dgn_bm_try_load(void** src, int top) { for (int i = 0; i < top; i++) _dgn_try_stack[i] = (DgnTryFrame*)src[i]; _dgn_try_top = top; }
+void* dgn_bm_boot_stack_bottom(void) { return _dgn_stack_bottom; }
+#endif
 static void dgn_try_pop(DgnTryFrame* f) { if (_dgn_try_top > 0 && _dgn_try_stack[_dgn_try_top - 1] == f) _dgn_try_top--; }
 static void dgn_raise(DgnVal v) {
     if (_dgn_try_top > 0) { DgnTryFrame* f = _dgn_try_stack[--_dgn_try_top]; f->thrown = v; longjmp(f->buf, 1); }
@@ -1103,29 +1327,25 @@ MATH_WRAP1(sin, sin)   MATH_WRAP1(cos, cos)     MATH_WRAP1(tan, tan)   MATH_WRAP
 MATH_WRAP1(exp, exp)   MATH_WRAP1(round, round)
 MATH_WRAP2(pow, pow)   MATH_WRAP2(atan2, atan2)
 
-/* ════════════════════════════════════════════════════════════
-   File I/O Module
-   ════════════════════════════════════════════════════════════ */
 static DgnVal dgn_file_read_text(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if(n - off < 1 || args[off].tag != DGN_STR) return dgn_null();
-    
+
     FILE* f = fopen(args[off].s, "rb");
     if(!f) return dgn_null();
-    
+
     fseek(f, 0, SEEK_END);
     long length = ftell(f);
     fseek(f, 0, SEEK_SET);
-    
+
     if(length < 0) { fclose(f); return dgn_null(); }
-    
-    // Allocate the string using our new Garbage Collector!
+
     char* buffer = (char*)dgn_gc_alloc(length + 1, DGN_STR);
     size_t read_bytes = fread(buffer, 1, length, f);
     buffer[read_bytes] = '\0';
     fclose(f);
-    
+
     DgnVal v; v.tag = DGN_STR; v.s = buffer;
     return v;
 }
@@ -1162,15 +1382,15 @@ static DgnVal dgn_file_write_text(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if(n - off < 2 || args[off].tag != DGN_STR) return dgn_bool(0);
-    
+
     FILE* f = fopen(args[off].s, "w");
     if(!f) return dgn_bool(0);
-    
+
     char* content = dgn_val_to_cstr(args[off+1]);
     fputs(content, f);
-    free(content); // dgn_val_to_cstr uses raw malloc, so we free it safely
+    free(content);
     fclose(f);
-    
+
     return dgn_bool(1);
 }
 
@@ -1178,15 +1398,15 @@ static DgnVal dgn_file_append_text(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if(n - off < 2 || args[off].tag != DGN_STR) return dgn_bool(0);
-    
+
     FILE* f = fopen(args[off].s, "a");
     if(!f) return dgn_bool(0);
-    
+
     char* content = dgn_val_to_cstr(args[off+1]);
     fputs(content, f);
     free(content);
     fclose(f);
-    
+
     return dgn_bool(1);
 }
 
@@ -1194,7 +1414,7 @@ static DgnVal dgn_file_exists(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if(n - off < 1 || args[off].tag != DGN_STR) return dgn_bool(0);
-    
+
     FILE* f = fopen(args[off].s, "r");
     if(f) { fclose(f); return dgn_bool(1); }
     return dgn_bool(0);
@@ -1204,7 +1424,7 @@ static DgnVal dgn_file_delete(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if(n - off < 1 || args[off].tag != DGN_STR) return dgn_bool(0);
-    
+
     return dgn_bool(remove(args[off].s) == 0);
 }
 
@@ -1223,7 +1443,11 @@ static DgnVal dgn_file_rmdir(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if(n - off < 1 || args[off].tag != DGN_STR) return dgn_bool(0);
+#ifdef _WIN32
+    return dgn_bool(RemoveDirectoryA(args[off].s) != 0);
+#else
     return dgn_bool(rmdir(args[off].s) == 0);
+#endif
 }
 
 static DgnVal dgn_file_rename(DgnVal* args, int n, DgnEnv* env) {
@@ -1258,10 +1482,6 @@ static DgnVal dgn_file_is_dir(DgnVal* args, int n, DgnEnv* env) {
 #endif
 }
 
-/* ════════════════════════════════════════════════════════════
-   Net Module
-   ════════════════════════════════════════════════════════════ */
-
    typedef struct { char url[4096]; char method[8]; char body[65536]; char headers[4096]; } DgnHttpCtx;
 typedef struct { char host[256]; int port; } DgnConnectCtx;
 typedef struct { int64_t fd; char msg[65536]; } DgnSocketCtx;
@@ -1273,7 +1493,6 @@ static DgnVal dgn_net_http_server_task(void* arg);
 static DgnVal dgn_socket_make(int64_t fd);
 static int64_t dgn_socket_fd(DgnVal v);
 
-/* http_get(url) → Promise<{status, body}> */
 static DgnVal dgn_net_http_get_task(void* arg) {
     DgnHttpCtx* ctx = (DgnHttpCtx*)arg;
     strcpy(ctx->method, "GET"); ctx->body[0] = 0;
@@ -1289,7 +1508,6 @@ static DgnVal dgn_net_http_get(DgnVal* args, int n, DgnEnv* env) {
     return dgn_make_promise(dgn_net_http_get_task, ctx);
 }
 
-/* http_post(url, body, headers?) → Promise<{status, body}> */
 static DgnVal dgn_net_http_post_task(void* arg) { return dgn_net_do_http(arg); }
 static DgnVal dgn_net_http_post(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
@@ -1300,7 +1518,6 @@ static DgnVal dgn_net_http_post(DgnVal* args, int n, DgnEnv* env) {
     strcpy(ctx->method, "POST");
     if(n - off >= 2) { char* b = dgn_val_to_cstr(args[off+1]); strncpy(ctx->body, b, sizeof(ctx->body)-1); free(b); }
     else ctx->body[0]=0;
-    /* headers map → "Key: Value\r\n" string */
     ctx->headers[0]=0;
     if(n - off >= 3 && args[off+2].tag == DGN_MAP) {
         for(int i=0; i<args[off+2].map->cap; i++) {
@@ -1315,7 +1532,6 @@ static DgnVal dgn_net_http_post(DgnVal* args, int n, DgnEnv* env) {
     return dgn_make_promise(dgn_net_http_post_task, ctx);
 }
 
-/* http_put(url, body, headers?) → Promise */
 static DgnVal dgn_net_http_put(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
@@ -1328,7 +1544,6 @@ static DgnVal dgn_net_http_put(DgnVal* args, int n, DgnEnv* env) {
     return dgn_make_promise(dgn_net_http_post_task, ctx);
 }
 
-/* http_delete(url) → Promise */
 static DgnVal dgn_net_http_delete(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
@@ -1339,7 +1554,6 @@ static DgnVal dgn_net_http_delete(DgnVal* args, int n, DgnEnv* env) {
     return dgn_make_promise(dgn_net_http_get_task, ctx);
 }
 
-/* socket_connect(host, port) → Promise<socket_map> */
 static DgnVal dgn_net_socket_connect_task(void* arg) {
     DgnConnectCtx* ctx = (DgnConnectCtx*)arg;
     struct addrinfo hints, *ai;
@@ -1366,7 +1580,6 @@ static DgnVal dgn_net_socket_connect(DgnVal* args, int n, DgnEnv* env) {
     return dgn_make_promise(dgn_net_socket_connect_task, ctx);
 }
 
-/* socket_send(sock, msg) → bool */
 static DgnVal dgn_net_socket_send(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP && dgn_socket_fd(args[0]) >= 0) ? 0 : 0;
@@ -1379,7 +1592,6 @@ static DgnVal dgn_net_socket_send(DgnVal* args, int n, DgnEnv* env) {
     return dgn_bool(sent >= 0);
 }
 
-/* socket_read(sock) → string */
 static DgnVal dgn_net_socket_read(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 1) return dgn_null();
@@ -1392,7 +1604,6 @@ static DgnVal dgn_net_socket_read(DgnVal* args, int n, DgnEnv* env) {
     return dgn_str(buf);
 }
 
-/* socket_close(sock) → bool */
 static DgnVal dgn_net_socket_close(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 1) return dgn_bool(0);
@@ -1406,7 +1617,6 @@ static DgnVal dgn_net_socket_close(DgnVal* args, int n, DgnEnv* env) {
     return dgn_bool(1);
 }
 
-/* start_http_server(port, handler) → bool (non-blocking — spawns thread) */
 static DgnVal dgn_net_start_server(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
@@ -1414,14 +1624,10 @@ static DgnVal dgn_net_start_server(DgnVal* args, int n, DgnEnv* env) {
     DgnServerCtx* ctx = (DgnServerCtx*)malloc(sizeof(DgnServerCtx));
     ctx->port    = (int)((args[off].tag==DGN_INT)?args[off].i:(int64_t)args[off].f);
     ctx->handler = args[off+1];
-    /* Spawn detached thread — server runs forever in background */
     dgn_make_promise(dgn_net_http_server_task, ctx);
     return dgn_bool(1);
 }
 
-/* ════════════════════════════════════════════════════════════
-   OS Module
-   ════════════════════════════════════════════════════════════ */
 #if defined(_WIN32)
 #  define DGN_OS_NAME "windows"
 #  define DGN_ARCH_STR "x86_64"
@@ -1517,9 +1723,6 @@ static DgnVal dgn_os_listdir(DgnVal* args, int n, DgnEnv* env) {
     return list;
 }
 
-/* ════════════════════════════════════════════════════════════
-   Path Module
-   ════════════════════════════════════════════════════════════ */
 #ifdef _WIN32
 #  define DGN_PATH_SEP '\\'
 #else
@@ -1581,9 +1784,6 @@ static DgnVal dgn_path_is_absolute(DgnVal* args, int n, DgnEnv* env) {
 #endif
 }
 
-/* ════════════════════════════════════════════════════════════
-   Time Module
-   ════════════════════════════════════════════════════════════ */
 static DgnVal dgn_time_now(DgnVal* args, int n, DgnEnv* env) {
     (void)args; (void)n; (void)env;
     return dgn_float((double)time(NULL));
@@ -1613,9 +1813,6 @@ static DgnVal dgn_time_date_now(DgnVal* args, int n, DgnEnv* env) {
     return m;
 }
 
-/* ════════════════════════════════════════════════════════════
-   JSON Module  (minimal — no external dependency)
-   ════════════════════════════════════════════════════════════ */
 static char* dgn_json_encode_val(DgnVal v, int depth);
 static char* dgn_json_encode_val(DgnVal v, int depth) {
     if(depth > 20) return strdup("null");
@@ -1626,7 +1823,6 @@ static char* dgn_json_encode_val(DgnVal v, int depth) {
         case DGN_INT:   snprintf(buf, sizeof(buf), "%lld", (long long)v.i); return strdup(buf);
         case DGN_FLOAT: snprintf(buf, sizeof(buf), "%.17g", v.f); return strdup(buf);
         case DGN_STR: {
-            /* escape string */
             size_t len = strlen(v.s) * 6 + 3;
             char* out = (char*)malloc(len); out[0] = '"'; int oi = 1;
             for(const char* p = v.s; *p; p++) {
@@ -1640,25 +1836,34 @@ static char* dgn_json_encode_val(DgnVal v, int depth) {
             out[oi++] = '"'; out[oi] = 0; return out;
         }
         case DGN_LIST: {
-            char* out = (char*)malloc(65536); strcpy(out, "["); int first = 1;
+            size_t cap = 1024, len = 0; char* out = (char*)malloc(cap); out[len++] = '['; int first = 1;
             for(int i = 0; i < v.list->len; i++) {
-                if(!first) strcat(out, ","); first = 0;
+                if(!first) { if(len + 2 > cap) { cap *= 2; out = (char*)realloc(out, cap); } out[len++] = ','; } first = 0;
                 char* s = dgn_json_encode_val(v.list->data[i], depth+1);
-                if(strlen(out)+strlen(s) < 65530) strcat(out, s); free(s);
+                size_t sl = strlen(s);
+                while(len + sl + 2 > cap) cap *= 2;
+                out = (char*)realloc(out, cap);
+                memcpy(out + len, s, sl); len += sl; free(s);
             }
-            strcat(out, "]"); return out;
+            out[len++] = ']'; out[len] = 0; return out;
         }
         case DGN_MAP: case DGN_INSTANCE: {
-            char* out = (char*)malloc(65536); strcpy(out, "{"); int first = 1;
+            size_t cap = 1024, len = 0; char* out = (char*)malloc(cap); out[len++] = '{'; int first = 1;
             for(int i = 0; i < v.map->cap; i++) {
                 if(!v.map->entries[i].used) continue;
-                if(!first) strcat(out, ","); first = 0;
-                char kbuf[256]; snprintf(kbuf, sizeof(kbuf), "\"%s\":", v.map->entries[i].key);
-                if(strlen(out)+strlen(kbuf) < 65520) strcat(out, kbuf);
+                if(!first) { if(len + 2 > cap) { cap *= 2; out = (char*)realloc(out, cap); } out[len++] = ','; } first = 0;
+                const char* key = v.map->entries[i].key;
+                size_t kl = strlen(key);
+                while(len + kl + 8 > cap) cap *= 2;
+                out = (char*)realloc(out, cap);
+                out[len++] = '"'; memcpy(out + len, key, kl); len += kl; out[len++] = '"'; out[len++] = ':';
                 char* s = dgn_json_encode_val(v.map->entries[i].val, depth+1);
-                if(strlen(out)+strlen(s) < 65530) strcat(out, s); free(s);
+                size_t sl = strlen(s);
+                while(len + sl + 2 > cap) cap *= 2;
+                out = (char*)realloc(out, cap);
+                memcpy(out + len, s, sl); len += sl; free(s);
             }
-            strcat(out, "}"); return out;
+            out[len++] = '}'; out[len] = 0; return out;
         }
         default: return strdup("null");
     }
@@ -1672,14 +1877,12 @@ static DgnVal dgn_json_encode(DgnVal* args, int n, DgnEnv* env) {
     DgnVal r = dgn_str(s); free(s); return r;
 }
 
-/* Minimal recursive-descent JSON parser */
 static DgnVal dgn_json_parse_val(const char** p);
 static void dgn_json_skip_ws(const char** p) { while(**p && **p <= ' ') (*p)++; }
 static DgnVal dgn_json_parse_val(const char** p) {
     dgn_json_skip_ws(p);
     char c = **p;
 
-    /* string */
     if(c == '"') {
         (*p)++;
         int cap = 256; char* buf = (char*)malloc(cap); int bi = 0;
@@ -1690,7 +1893,37 @@ static DgnVal dgn_json_parse_val(const char** p) {
                 switch(**p) {
                     case 'n': buf[bi++]='\n'; break; case 't': buf[bi++]='\t'; break;
                     case 'r': buf[bi++]='\r'; break; case '"': buf[bi++]='"';  break;
-                    case '\\':buf[bi++]='\\'; break; default:  buf[bi++]=**p; break;
+                    case '\\':buf[bi++]='\\'; break;
+                    case 'b': buf[bi++]='\b'; break; case 'f': buf[bi++]='\f'; break;
+                    case 'u': {
+                        unsigned cp = 0; int ok = 1;
+                        for(int k = 1; k <= 4; k++) {
+                            char h = (*p)[k];
+                            if(h >= '0' && h <= '9') cp = cp*16 + (h-'0');
+                            else if(h >= 'a' && h <= 'f') cp = cp*16 + (h-'a'+10);
+                            else if(h >= 'A' && h <= 'F') cp = cp*16 + (h-'A'+10);
+                            else { ok = 0; break; }
+                        }
+                        if(!ok) { buf[bi++]='u'; break; }
+                        *p += 4;
+                        if(cp >= 0xD800 && cp <= 0xDBFF && (*p)[1] == '\\' && (*p)[2] == 'u') {
+                            unsigned lo = 0; int ok2 = 1;
+                            for(int k = 3; k <= 6; k++) {
+                                char h = (*p)[k];
+                                if(h >= '0' && h <= '9') lo = lo*16 + (h-'0');
+                                else if(h >= 'a' && h <= 'f') lo = lo*16 + (h-'a'+10);
+                                else if(h >= 'A' && h <= 'F') lo = lo*16 + (h-'A'+10);
+                                else { ok2 = 0; break; }
+                            }
+                            if(ok2 && lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); *p += 6; }
+                        }
+                        if(cp < 0x80) buf[bi++] = (char)cp;
+                        else if(cp < 0x800) { buf[bi++] = (char)(0xC0 | (cp >> 6)); buf[bi++] = (char)(0x80 | (cp & 0x3F)); }
+                        else if(cp < 0x10000) { buf[bi++] = (char)(0xE0 | (cp >> 12)); buf[bi++] = (char)(0x80 | ((cp >> 6) & 0x3F)); buf[bi++] = (char)(0x80 | (cp & 0x3F)); }
+                        else { buf[bi++] = (char)(0xF0 | (cp >> 18)); buf[bi++] = (char)(0x80 | ((cp >> 12) & 0x3F)); buf[bi++] = (char)(0x80 | ((cp >> 6) & 0x3F)); buf[bi++] = (char)(0x80 | (cp & 0x3F)); }
+                        break;
+                    }
+                    default:  buf[bi++]=**p; break;
                 }
             } else { buf[bi++] = **p; }
             (*p)++;
@@ -1700,7 +1933,6 @@ static DgnVal dgn_json_parse_val(const char** p) {
         DgnVal r = dgn_str(buf); free(buf); return r;
     }
 
-    /* object */
     if(c == '{') {
         (*p)++; DgnVal m = dgn_map_new();
         dgn_json_skip_ws(p);
@@ -1719,7 +1951,6 @@ static DgnVal dgn_json_parse_val(const char** p) {
         return m;
     }
 
-    /* array */
     if(c == '[') {
         (*p)++; DgnVal list = dgn_list_new(4);
         dgn_json_skip_ws(p);
@@ -1733,12 +1964,10 @@ static DgnVal dgn_json_parse_val(const char** p) {
         return list;
     }
 
-    /* literals — MUST come before number fallback */
     if(strncmp(*p, "true",  4)==0) { (*p)+=4; return dgn_bool(1); }
     if(strncmp(*p, "false", 5)==0) { (*p)+=5; return dgn_bool(0); }
     if(strncmp(*p, "null",  4)==0) { (*p)+=4; return dgn_null(); }
 
-    /* number */
     char nbuf[64]; int ni = 0; int is_float = 0;
     if(**p == '-') { nbuf[ni++] = **p; (*p)++; }
     while(**p && (isdigit((unsigned char)**p) || **p=='.' || **p=='e' || **p=='E' || **p=='+' || **p=='-')) {
@@ -1746,7 +1975,7 @@ static DgnVal dgn_json_parse_val(const char** p) {
         if(ni < 62) nbuf[ni++] = **p; (*p)++;
     }
     nbuf[ni] = 0;
-    if(ni == 0) { (*p)++; return dgn_null(); } /* unknown char — skip */
+    if(ni == 0) { (*p)++; return dgn_null(); }
     return is_float ? dgn_float(atof(nbuf)) : dgn_int(atoll(nbuf));
 }
 
@@ -1758,9 +1987,6 @@ static DgnVal dgn_json_decode(DgnVal* args, int n, DgnEnv* env) {
     return dgn_json_parse_val(&p);
 }
 
-/* ════════════════════════════════════════════════════════════
-   Base64 Module
-   ════════════════════════════════════════════════════════════ */
 static const char _b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static DgnVal dgn_b64_encode(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
@@ -1806,9 +2032,6 @@ static DgnVal dgn_b64_decode(DgnVal* args, int n, DgnEnv* env) {
     DgnVal r = dgn_str(out); free(out); return r;
 }
 
-/* ════════════════════════════════════════════════════════════
-   UUID Module
-   ════════════════════════════════════════════════════════════ */
 static DgnVal dgn_uuid_v4(DgnVal* args, int n, DgnEnv* env) {
     (void)args; (void)n; (void)env;
     unsigned int u1 = (unsigned int)rand() ^ ((unsigned int)rand() << 15);
@@ -1820,7 +2043,6 @@ static DgnVal dgn_uuid_v4(DgnVal* args, int n, DgnEnv* env) {
         u1, (u2>>16)&0xFFFF, u2&0xFFF,
         ((u3>>16)&0x3FFF)|0x8000,
         u3&0xFFFF, u4&0xFFFF);
-    /* pad last group to 12 hex chars */
     snprintf(buf, sizeof(buf), "%08x-%04x-4%03x-%04x-%04x%08x",
         u1, (u2>>16)&0xFFFF, u2&0xFFF,
         ((u3>>16)&0x3FFF)|0x8000,
@@ -1828,22 +2050,11 @@ static DgnVal dgn_uuid_v4(DgnVal* args, int n, DgnEnv* env) {
     return dgn_str(buf);
 }
 
-/* ════════════════════════════════════════════════════════════
-   Promise  (lightweight thread-based async)
-   A Promise is a DgnMap with:
-     __promise__ = 1   (sentinel)
-     __done__    = 0/1
-     __result__  = the resolved DgnVal
-   The worker thread writes __done__ and __result__ when finished.
-   await in Dragon calls dgn_promise_await() which busy-waits with
-   a short sleep — sufficient for I/O tasks.
-   ════════════════════════════════════════════════════════════ */
-
 typedef struct {
     DgnVal (*fn)(void* ctx);
     void*  ctx;
     DgnVal result;
-    int    done;   /* 1 = finished */
+    int    done;
 #ifdef _WIN32
     HANDLE thread;
 #else
@@ -1867,7 +2078,6 @@ static void* dgn_task_run(void* arg) {
 }
 #endif
 
-/* Spawn a task and return a Promise map */
 static DgnVal dgn_make_promise(DgnVal (*fn)(void*), void* ctx) {
     DgnTask* task = (DgnTask*)malloc(sizeof(DgnTask));
     task->fn     = fn;
@@ -1882,22 +2092,19 @@ static DgnVal dgn_make_promise(DgnVal (*fn)(void*), void* ctx) {
     pthread_detach(task->thread);
 #endif
 
-    /* Store task pointer in a map — we encode the pointer as an int */
     DgnVal promise = dgn_map_new();
     dgn_map_set(&promise, "__promise__", dgn_int(1));
     dgn_map_set(&promise, "__task_ptr__", dgn_int((int64_t)(uintptr_t)task));
     return promise;
 }
 
-/* Called by ExprNode::Await — resolves the promise synchronously */
 static DgnVal dgn_promise_await(DgnVal v) {
     if(v.tag != DGN_MAP) return v;
     DgnVal sentinel = dgn_map_get(v, "__promise__");
-    if(sentinel.tag != DGN_INT || sentinel.i != 1) return v; /* not a promise */
+    if(sentinel.tag != DGN_INT || sentinel.i != 1) return v;
     DgnVal ptr_val = dgn_map_get(v, "__task_ptr__");
     if(ptr_val.tag != DGN_INT) return dgn_null();
     DgnTask* task = (DgnTask*)(uintptr_t)(uint64_t)ptr_val.i;
-    /* Spin-wait (tasks are I/O — typically <1s) */
     while(!task->done) { DGN_SLEEP(1); }
 #ifdef _WIN32
     if(task->thread) { WaitForSingleObject(task->thread, INFINITE); CloseHandle(task->thread); }
@@ -1907,10 +2114,6 @@ static DgnVal dgn_promise_await(DgnVal v) {
     return result;
 }
 
-/* ════════════════════════════════════════════════════════════
-   Socket handle stored in a map
-   __socket__ = fd (int64)
-   ════════════════════════════════════════════════════════════ */
 static DgnVal dgn_socket_make(int64_t fd) {
     DgnVal m = dgn_map_new();
     dgn_map_set(&m, "__socket__", dgn_int(fd));
@@ -1922,27 +2125,22 @@ static int64_t dgn_socket_fd(DgnVal v) {
     return (s.tag == DGN_INT) ? s.i : -1;
 }
 
-/* ── net task contexts ───────────────────────────────────── */
-
 static DgnVal dgn_net_do_http(void* arg) {
     DgnHttpCtx* ctx = (DgnHttpCtx*)arg;
     DgnVal res = dgn_map_new();
 
-    /* Parse host and path from URL */
     const char* url = ctx->url;
     int use_port = 80;
     char host[256] = {0}; char path[2048] = "/";
     const char* p = url;
     if(strncmp(p, "http://",  7)==0) p += 7;
-    else if(strncmp(p, "https://", 8)==0) { p += 8; use_port = 443; } /* HTTPS: fallback to plain for now */
-    /* copy host */
+    else if(strncmp(p, "https://", 8)==0) { p += 8; use_port = 443; }
     int hi = 0;
     while(*p && *p != '/' && *p != ':' && hi < 255) host[hi++] = *p++;
     host[hi] = 0;
     if(*p == ':') { p++; use_port = atoi(p); while(*p && *p != '/') p++; }
     if(*p == '/') { strncpy(path, p, sizeof(path)-1); }
 
-    /* Connect */
     struct addrinfo hints, *ai;
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = SOCK_STREAM;
@@ -1965,12 +2163,10 @@ static DgnVal dgn_net_do_http(void* arg) {
     }
     freeaddrinfo(ai);
 
-    /* Build HTTP request */
     char req[8192];
     int rlen = snprintf(req, sizeof(req),
         "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n",
         ctx->method, path, host);
-    /* add custom headers */
     if(ctx->headers[0]) {
         strncat(req, ctx->headers, sizeof(req)-rlen-1);
         rlen = (int)strlen(req);
@@ -1985,7 +2181,6 @@ static DgnVal dgn_net_do_http(void* arg) {
     }
     send(fd, req, (int)strlen(req), 0);
 
-    /* Read response */
     char resp_buf[65536]; int resp_len = 0; int n;
     while((n = (int)recv(fd, resp_buf+resp_len, sizeof(resp_buf)-resp_len-1, 0)) > 0) resp_len += n;
     resp_buf[resp_len] = 0;
@@ -1995,13 +2190,11 @@ static DgnVal dgn_net_do_http(void* arg) {
     close(fd);
 #endif
 
-    /* Parse status line */
     int status_code = 0;
     if(strncmp(resp_buf, "HTTP/", 5)==0) {
         const char* sp = strchr(resp_buf, ' ');
         if(sp) status_code = atoi(sp+1);
     }
-    /* Find body after \r\n\r\n */
     const char* body_start = strstr(resp_buf, "\r\n\r\n");
     const char* body = body_start ? body_start + 4 : resp_buf;
 
@@ -2011,24 +2204,12 @@ static DgnVal dgn_net_do_http(void* arg) {
     return res;
 }
 
-/* ── Regex module (POSIX ERE via regcomp/regexec) ─────────── */
-/*
-   We store a compiled regex as a DgnMap with:
-     __regex__   = 1  (sentinel)
-     __pattern__ = the pattern string (for display)
-   The actual compiled regex is embedded in a malloc'd block
-   pointed to by __regex_ptr__ (int64 storing the pointer).
-*/
 #ifndef _WIN32
 #  include <regex.h>
 #  define DGN_HAS_POSIX_REGEX 1
 #endif
 
 #ifdef _WIN32
-/* On Windows we implement a very small subset via a state machine
-   rather than pulling in a third-party lib.  Full POSIX ERE is
-   available if you link against a regex library; for now we provide
-   the API surface with a basic implementation. */
 typedef struct { char pattern[1024]; int flags; } DgnRegexImpl;
 #else
 typedef struct { regex_t re; char pattern[1024]; } DgnRegexImpl;
@@ -2049,7 +2230,7 @@ static DgnVal dgn_regex_new(DgnVal* args, int n, DgnEnv* env) {
 #ifdef DGN_HAS_POSIX_REGEX
     if(regcomp(&impl->re, pat, REG_EXTENDED) != 0) {
         free(impl);
-        return dgn_null(); /* invalid pattern */
+        return dgn_null();
     }
 #endif
 
@@ -2057,8 +2238,7 @@ static DgnVal dgn_regex_new(DgnVal* args, int n, DgnEnv* env) {
     dgn_map_set(&m, "__regex__",   dgn_int(1));
     dgn_map_set(&m, "__pattern__", dgn_str(pat));
     dgn_map_set(&m, "__ptr__",     dgn_int((int64_t)(uintptr_t)impl));
-    
-    /* Attach native methods so it behaves like a Rust DgnValue::Regex object */
+
     dgn_map_set(&m, "test",     dgn_func(dgn_regex_test,     2));
     dgn_map_set(&m, "match",    dgn_func(dgn_regex_match_fn, 2));
     dgn_map_set(&m, "find_all", dgn_func(dgn_regex_find_all, 2));
@@ -2077,7 +2257,6 @@ static DgnRegexImpl* dgn_regex_get(DgnVal v) {
     return (DgnRegexImpl*)(uintptr_t)(uint64_t)ptr.i;
 }
 
-/* regex.test(re, str) → bool */
 static DgnVal dgn_regex_test(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP && dgn_map_get(args[0],"__regex__").i==1) ? 0 : 0;
@@ -2090,13 +2269,11 @@ static DgnVal dgn_regex_test(DgnVal* args, int n, DgnEnv* env) {
     free(s);
     return dgn_bool(r == 0);
 #else
-    /* fallback: simple substring via strstr on pattern (no regex engine) */
     int r = strstr(s, impl->pattern) != NULL;
     free(s); return dgn_bool(r);
 #endif
 }
 
-/* regex.match(re, str) → string of first match or null */
 static DgnVal dgn_regex_match_fn(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 2) return dgn_null();
@@ -2118,7 +2295,6 @@ static DgnVal dgn_regex_match_fn(DgnVal* args, int n, DgnEnv* env) {
 #endif
 }
 
-/* regex.find_all(re, str) → list of all matches */
 static DgnVal dgn_regex_find_all(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 2) return dgn_list_new(0);
@@ -2130,7 +2306,7 @@ static DgnVal dgn_regex_find_all(DgnVal* args, int n, DgnEnv* env) {
     const char* cursor = s;
     regmatch_t m;
     while(*cursor && regexec(&impl->re, cursor, 1, &m, 0) == 0) {
-        if(m.rm_eo == m.rm_so) { cursor++; continue; } /* zero-length guard */
+        if(m.rm_eo == m.rm_so) { cursor++; continue; }
         int len = m.rm_eo - m.rm_so;
         char* buf = (char*)malloc(len+1); memcpy(buf, cursor+m.rm_so, len); buf[len]=0;
         dgn_list_push(&list, dgn_str(buf)); free(buf);
@@ -2140,7 +2316,6 @@ static DgnVal dgn_regex_find_all(DgnVal* args, int n, DgnEnv* env) {
     free(s); return list;
 }
 
-/* regex.replace(re, str, replacement) → new string */
 static DgnVal dgn_regex_replace(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 3) return (n >= 2) ? dgn_str(args[1].tag==DGN_STR ? args[1].s : "") : dgn_null();
@@ -2154,15 +2329,12 @@ static DgnVal dgn_regex_replace(DgnVal* args, int n, DgnEnv* env) {
     regmatch_t m;
     while(*cursor && regexec(&impl->re, cursor, 1, &m, 0) == 0) {
         if(m.rm_eo == m.rm_so) { if(oi < 65534) out[oi++]=*cursor++; continue; }
-        /* copy prefix */
         int plen = m.rm_so;
         if(oi+plen < 65530) { memcpy(out+oi, cursor, plen); oi+=plen; }
-        /* copy replacement */
         int rlen = (int)strlen(repl);
         if(oi+rlen < 65530) { memcpy(out+oi, repl, rlen); oi+=rlen; }
         cursor += m.rm_eo;
     }
-    /* copy remainder */
     int rem = (int)strlen(cursor);
     if(oi+rem < 65530) { memcpy(out+oi, cursor, rem); oi+=rem; }
     out[oi]=0;
@@ -2172,7 +2344,6 @@ static DgnVal dgn_regex_replace(DgnVal* args, int n, DgnEnv* env) {
 #endif
 }
 
-/* regex.groups(re, str) → list of capture groups or null */
 static DgnVal dgn_regex_groups(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
     if(n < 2) return dgn_null();
@@ -2194,11 +2365,8 @@ static DgnVal dgn_regex_groups(DgnVal* args, int n, DgnEnv* env) {
     free(s); return dgn_null();
 }
 
-/* ── HTTP Server (blocking, single-threaded, good for scripts) */
-
 static DgnVal dgn_net_res_send_fn(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
-    /* args[0] = res map, args[1] = body, args[2] = status (opt), args[3] = headers map (opt) */
     if(n < 2) return dgn_null();
     DgnVal res_map = args[0];
     char* body   = dgn_val_to_cstr(args[1]);
@@ -2207,7 +2375,6 @@ static DgnVal dgn_net_res_send_fn(DgnVal* args, int n, DgnEnv* env) {
                               (status == 404) ? "Not Found" :
                               (status == 500) ? "Internal Server Error" : "OK";
 
-    /* Build custom headers string */
     char hdrs[2048] = {0};
     if(n >= 4 && args[3].tag == DGN_MAP) {
         for(int i = 0; i < args[3].map->cap; i++) {
@@ -2257,22 +2424,16 @@ static DgnVal dgn_net_http_server_task(void* arg) {
         SOCKET client = accept(srv,NULL,NULL);
         if(client==INVALID_SOCKET) continue;
         char buf[8192]={0}; recv(client,buf,sizeof(buf)-1,0);
-        /* parse method + path */
         char method[16]={0},path[1024]={0};
         sscanf(buf,"%15s %1023s",method,path);
-        /* find body */
         const char* body = strstr(buf,"\r\n\r\n"); body = body ? body+4 : "";
-        /* build req object */
         DgnVal req = dgn_map_new();
         dgn_map_set(&req,"method",dgn_str(method));
         dgn_map_set(&req,"path",  dgn_str(path));
         dgn_map_set(&req,"body",  dgn_str(body));
-        /* build res object */
         DgnVal res = dgn_map_new();
-        /* We store the client fd in res so send() can use it */
         dgn_map_set(&res,"__client__",dgn_int((int64_t)(uintptr_t)(void*)(intptr_t)client));
         dgn_map_set(&res, "send", dgn_func(dgn_net_res_send_fn, -1));
-        /* Call handler synchronously */
         DgnVal call_args[2] = {req, res};
         dgn_call_val(ctx->handler, call_args, 2);
         closesocket(client);
@@ -2303,7 +2464,6 @@ static DgnVal dgn_net_http_server_task(void* arg) {
     return dgn_null();
 }
 
-/* ── Global Built-ins ────────────────────────────────────── */
 static DgnVal dgn_builtin_typeof(DgnVal* args, int n, DgnEnv* e) {
     (void)e; if(n<1) return dgn_str("null");
     switch(args[0].tag) {
@@ -2370,28 +2530,23 @@ static DgnVal dgn_builtin_format(DgnVal* args, int n, DgnEnv* e) {
                 int len = strlen(s_val.s);
                 if(out_idx + len < 8190) { strcpy(out + out_idx, s_val.s); out_idx += len; }
             }
-            i++; /* skip '}' */
+            i++;
         } else { if(out_idx < 8190) out[out_idx++] = fmt[i]; }
     }
     out[out_idx] = 0; return dgn_str(out);
 }
 
-/* ── Mem Module (Raw Pointer & Memory Access) ────────────── */
 #define DGN_MEM_OFF(a) ((intptr_t)((a).tag == DGN_FLOAT ? (int64_t)(a).f : (a).i))
-
 
 static DgnVal dgn_mem_alloc(DgnVal* args, int n, DgnEnv* e) {
     (void)e; int ao = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     int size = (n - ao > 0 && args[ao].tag == DGN_INT) ? (int)args[ao].i :
                (n - ao > 0 && args[ao].tag == DGN_FLOAT) ? (int)args[ao].f : 0;
     if (size <= 0) size = 1;
-    
-    /* Use plain malloc so this buffer is never freed by the GC.
-       Static globals (_v_argc_buf etc.) are invisible to the conservative
-       stack scanner, so dgn_gc_alloc would collect them mid-run. */
+
     char* buf = (char*)malloc(size + 1);
     memset(buf, 0, size + 1);
-    
+
     DgnVal v; v.tag = DGN_STR; v.s = buf;
     return v;
 }
@@ -2449,7 +2604,6 @@ static DgnVal dgn_mem_read_int(DgnVal* args, int n, DgnEnv* e) {
     int ao = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if (n - ao < 2) return dgn_null();
     int off = (int)DGN_MEM_OFF(args[ao + 1]);
-    /* DGN_STR: raw byte buffer returned by mem.alloc — read directly from char* */
     if (args[ao].tag == DGN_STR) {
         const unsigned char* buf = (const unsigned char*)args[ao].s;
         if (!buf || off < 0) return dgn_null();
@@ -2459,7 +2613,6 @@ static DgnVal dgn_mem_read_int(DgnVal* args, int n, DgnEnv* e) {
                      | ((uint32_t)buf[off+3] << 24);
         return dgn_float((double)val);
     }
-    /* DGN_LIST: legacy byte-array representation */
     if (args[ao].tag == DGN_LIST) {
         DgnList* l = args[ao].list;
         if (off >= 0 && off + 4 <= l->len) {
@@ -2479,7 +2632,6 @@ static DgnVal dgn_mem_write_int(DgnVal* args, int n, DgnEnv* e) {
     if (n - ao < 3) return dgn_null();
     int off = (int)DGN_MEM_OFF(args[ao + 1]);
     uint32_t val = (uint32_t)(args[ao + 2].tag == DGN_FLOAT ? (int64_t)args[ao + 2].f : args[ao + 2].i);
-    /* DGN_STR: raw byte buffer returned by mem.alloc */
     if (args[ao].tag == DGN_STR) {
         unsigned char* buf = (unsigned char*)args[ao].s;
         if (!buf || off < 0) return dgn_null();
@@ -2489,7 +2641,6 @@ static DgnVal dgn_mem_write_int(DgnVal* args, int n, DgnEnv* e) {
         buf[off+3] = (val >> 24) & 0xFF;
         return dgn_null();
     }
-    /* DGN_LIST: legacy byte-array representation */
     if (args[ao].tag == DGN_LIST) {
         DgnList* l = args[ao].list;
         if (off >= 0 && off + 4 <= l->len) {
@@ -2507,13 +2658,11 @@ static DgnVal dgn_mem_read_byte(DgnVal* args, int n, DgnEnv* e) {
     int ao = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if (n - ao < 2) return dgn_null();
     int off = (int)DGN_MEM_OFF(args[ao + 1]);
-    /* DGN_STR: raw byte buffer returned by mem.alloc */
     if (args[ao].tag == DGN_STR) {
         const unsigned char* buf = (const unsigned char*)args[ao].s;
         if (!buf || off < 0) return dgn_null();
         return dgn_int((int64_t)buf[off]);
     }
-    /* DGN_LIST: legacy byte-array representation */
     if (args[ao].tag == DGN_LIST) {
         if (off >= 0 && off < args[ao].list->len) return args[ao].list->data[off];
     }
@@ -2525,7 +2674,6 @@ static DgnVal dgn_mem_write_byte(DgnVal* args, int n, DgnEnv* e) {
     int ao = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
     if (n - ao < 3) return dgn_null();
     int off = (int)DGN_MEM_OFF(args[ao + 1]);
-    /* DGN_STR: raw byte buffer returned by mem.alloc */
     if (args[ao].tag == DGN_STR) {
         unsigned char* buf = (unsigned char*)args[ao].s;
         if (!buf || off < 0) return dgn_null();
@@ -2533,29 +2681,25 @@ static DgnVal dgn_mem_write_byte(DgnVal* args, int n, DgnEnv* e) {
         buf[off] = (unsigned char)(val & 0xFF);
         return dgn_null();
     }
-    /* DGN_LIST: legacy byte-array representation */
     if (args[ao].tag == DGN_LIST) {
         if (off >= 0 && off < args[ao].list->len) args[ao].list->data[off] = args[ao + 2];
     }
     return dgn_null();
 }
 
-/* ── FFI Module (Matches engine.rs API exactly) ──────────── */
 #ifdef _WIN32
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
 #endif
 
-/* Global signature registry for ffi.def() — not static so dgn_gc_collect can root it via extern */
-DgnVal _dgn_ffi_sigs; 
+DgnVal _dgn_ffi_sigs;
 
-/* ── Struct Module Globals ───────────────────────────────── */
 typedef struct {
     char* name;
     int offset;
-    int size;   /* byte size of the field */
-    int align;  /* alignment requirement */
+    int size;
+    int align;
 } DgnStructField;
 
 typedef struct {
@@ -2565,7 +2709,6 @@ typedef struct {
     int num_fields;
 } DgnStructDef;
 
-/* A simple dynamic array for struct definitions */
 static DgnStructDef* _dgn_ffi_structs = NULL;
 static int _dgn_ffi_structs_count = 0;
 static int _dgn_ffi_structs_cap = 0;
@@ -2685,7 +2828,7 @@ static DgnVal dgn_struct_set(DgnVal* args, int n, DgnEnv* env) {
         }
     }
 
-    DgnVal sync_val = (val.tag == DGN_FLOAT || val.tag == DGN_INT) ? 
+    DgnVal sync_val = (val.tag == DGN_FLOAT || val.tag == DGN_INT) ?
         dgn_float(val.tag == DGN_FLOAT ? val.f : (double)val.i) : val;
     dgn_map_set(&obj, field_name, sync_val);
 
@@ -2731,10 +2874,9 @@ static DgnVal dgn_struct_get(DgnVal* args, int n, DgnEnv* env) {
 }
 
 static DgnVal dgn_ffi_loadlib(DgnVal* args, int n, DgnEnv* env) {
-    (void)env; 
-    // Shift if args[0] is the ffi module
+    (void)env;
     int off = (n > 0 && args[0].tag == DGN_MAP) ? 1 : 0;
-    
+
     if(n - off < 1 || args[off].tag != DGN_STR) return dgn_null();
     void* handle = NULL;
 #ifdef _WIN32
@@ -2743,8 +2885,8 @@ static DgnVal dgn_ffi_loadlib(DgnVal* args, int n, DgnEnv* env) {
     handle = dlopen(args[off].s, RTLD_LAZY);
 #endif
     if(!handle) return dgn_null();
-    
-    DgnMap* raw = (DgnMap*)malloc(sizeof(DgnMap));
+
+    DgnMap* raw = (DgnMap*)calloc(1, sizeof(DgnMap));
     raw->cap = 8; raw->len = 0;
     raw->entries = (DgnMapEntry*)calloc(8, sizeof(DgnMapEntry));
     DgnVal m; m.tag = DGN_MAP; m.map = raw;
@@ -2755,12 +2897,11 @@ static DgnVal dgn_ffi_loadlib(DgnVal* args, int n, DgnEnv* env) {
 
 static DgnVal dgn_ffi_def(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
-    // Shift if args[0] is the ffi module (it lacks a "ptr" key)
     int off = (n > 0 && args[0].tag == DGN_MAP && dgn_map_get(args[0], "ptr").tag == DGN_NULL) ? 1 : 0;
-    
-    if(n - off < 4 || args[off].tag != DGN_MAP || args[off+1].tag != DGN_STR || args[off+2].tag != DGN_STR || args[off+3].tag != DGN_LIST) 
+
+    if(n - off < 4 || args[off].tag != DGN_MAP || args[off+1].tag != DGN_STR || args[off+2].tag != DGN_STR || args[off+3].tag != DGN_LIST)
         return dgn_null();
-    
+
     if(_dgn_ffi_sigs.tag == DGN_NULL) _dgn_ffi_sigs = dgn_map_new();
 
     DgnVal path_val = dgn_map_get(args[off], "path");
@@ -2770,7 +2911,7 @@ static DgnVal dgn_ffi_def(DgnVal* args, int n, DgnEnv* env) {
     DgnVal sig = dgn_map_new();
     dgn_map_set(&sig, "ret", args[off+2]);
     dgn_map_set(&sig, "args", args[off+3]);
-    
+
     dgn_map_set(&_dgn_ffi_sigs, key, sig);
     return dgn_null();
 }
@@ -2783,7 +2924,7 @@ static DgnVal dgn_ffi_symbol_addr(DgnVal* args, int n, DgnEnv* env) {
     if(n < 2 || args[0].tag != DGN_MAP || args[1].tag != DGN_STR) return dgn_null();
     void* handle = (void*)(uintptr_t)dgn_map_get(args[0], "ptr").i;
     if(!handle) return dgn_null();
-    
+
     void* fn_ptr = NULL;
 #ifdef _WIN32
     fn_ptr = (void*)GetProcAddress((HMODULE)handle, args[1].s);
@@ -2813,7 +2954,7 @@ static DgnVal dgn_ffi_loadlib_call(DgnVal* args, int n, DgnEnv* env) {
     const char* input = (args[2].tag == DGN_STR) ? args[2].s : "";
     typedef char* (*StrFunc)(const char*);
     char* res = ((StrFunc)fn_ptr)(input);
-    
+
     if(!res) return dgn_null();
     return dgn_str(res);
 }
@@ -2824,27 +2965,12 @@ static DgnVal dgn_ffi_loadlib_call(DgnVal* args, int n, DgnEnv* env) {
 #  define DGN_STDCALL
 #endif
 
-/* ── FFI argument type tags ───────────────────────────────── */
-/* Each argument slot is either a pointer/int (P) or a float (F) or double (D).
-   C's calling convention passes floats/doubles in XMM registers, not GP registers,
-   so we must use typed function-pointer signatures.  We enumerate all combinations
-   up to 6 args (3 bits per slot → impractical as a full table; instead we use a
-   runtime dispatch loop that re-encodes the signature as a small bitmask). */
-
-/* Argument union for the dispatch helpers */
 typedef union { void* p; float f; double d; } DgnFfiArg;
 
-/* Argument kind */
 #define DGN_FA_PTR  0
 #define DGN_FA_FLT  1
 #define DGN_FA_DBL  2
 
-/* We use libffi when available and fall back to a hand-rolled dispatcher
-   for the most common OpenGL-style signatures (all-float, up to 6 args).
-   The hand-rolled path covers every combination that matters in practice. */
-
-/* Typed void-returning callers for pure-float/double GL-style functions.
-   The compiler will emit the correct XMM-register ABI for each. */
 typedef void (DGN_STDCALL *DgnVoidFn_fff)(float,float,float);
 typedef void (DGN_STDCALL *DgnVoidFn_ff )(float,float);
 typedef void (DGN_STDCALL *DgnVoidFn_f  )(float);
@@ -2858,7 +2984,6 @@ typedef void (DGN_STDCALL *DgnVoidFn_pff)(void*,float,float);
 typedef void (DGN_STDCALL *DgnVoidFn_pfff)(void*,float,float,float);
 typedef void (DGN_STDCALL *DgnVoidFn_pffff)(void*,float,float,float,float);
 
-/* Generic integer/pointer returning callers (unchanged) */
 typedef void* (DGN_STDCALL *FfiFunc0)();
 typedef void* (DGN_STDCALL *FfiFunc1)(void*);
 typedef void* (DGN_STDCALL *FfiFunc2)(void*, void*);
@@ -2869,7 +2994,6 @@ typedef void* (DGN_STDCALL *FfiFunc6)(void*, void*, void*, void*, void*, void*);
 
 static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
     (void)env;
-    /* Skip `ffi` module map if called as a module method */
     int off = (n > 0 && args[0].tag == DGN_MAP && dgn_map_get(args[0], "ptr").tag == DGN_NULL) ? 1 : 0;
     args += off; n -= off;
 
@@ -2886,13 +3010,11 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
 #endif
     if(!fn_ptr) return dgn_null();
 
-   /* Build per-argument kind + value arrays */
     int limit = (n - 2 > 11) ? 11 : (n - 2);
-    int   kinds[11]   = {0};   /* DGN_FA_PTR / DGN_FA_FLT / DGN_FA_DBL */
+    int   kinds[11]   = {0};
     DgnFfiArg cargs[11];
     memset(cargs, 0, sizeof(cargs));
 
-    /* Scratch storage for defensive string copies */
     char* str_copies[11] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
 
     for(int i = 0; i < limit; i++) {
@@ -2903,11 +3025,6 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
                 cargs[i].p  = (void*)(uintptr_t)val.i;
                 break;
             case DGN_FLOAT:
-                /* Dragon stores all numbers as double internally.
-                   Default to float (single-precision) so that
-                   float(x) → glVertex2f / glColor3f etc. work.
-                   The caller can use double() in Dragon if a native
-                   double argument is actually needed. */
                 kinds[i]    = DGN_FA_FLT;
                 cargs[i].f  = (float)val.f;
                 break;
@@ -2916,7 +3033,6 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
                 cargs[i].p  = (void*)(uintptr_t)(val.i ? 1 : 0);
                 break;
             case DGN_STR: {
-                /* Defensive copy — Win32 output-buffer APIs write into this */
                 size_t len  = strlen(val.s) + 1;
                 char*  copy = (char*)malloc(len);
                 strcpy(copy, val.s);
@@ -2932,18 +3048,17 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
             case DGN_MAP: {
                 DgnVal ptr_val = dgn_map_get(val, "ptr");
                 if(ptr_val.tag == DGN_NULL) ptr_val = dgn_map_get(val, "__ptr__");
-                
+
                 if (ptr_val.tag != DGN_NULL) {
                     kinds[i]    = DGN_FA_PTR;
                     cargs[i].p  = (void*)(uintptr_t)ptr_val.i;
                 } else {
-                    /* Check if it's a struct and pack it into a temporary C buffer */
                     DgnVal bytes_val = dgn_map_get(val, "__bytes__");
                     if (bytes_val.tag == DGN_LIST) {
                         DgnList* b = bytes_val.list;
                         char* sbuf = (char*)malloc(b->len);
                         for(int _bi=0; _bi<b->len; _bi++) sbuf[_bi] = (char)b->data[_bi].i;
-                        str_copies[i] = sbuf; /* ensures it gets safely free()'d after the call */
+                        str_copies[i] = sbuf;
                         kinds[i]    = DGN_FA_PTR;
                         cargs[i].p  = (void*)sbuf;
                     } else {
@@ -2960,7 +3075,6 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         }
     }
 
-    /* Promote DGN_FA_FLT → DGN_FA_DBL for args declared "double" in ffi.def */
     {
         DgnVal _path = dgn_map_get(args[0], "path");
         char _key[1024];
@@ -2985,26 +3099,14 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         }
     }
 
-    /* ── Dispatch ──────────────────────────────────────────────
-       Check whether ALL arguments are floats/doubles so we can
-       use a properly-typed caller that puts values in XMM regs.
-       Mixed pointer+float cases are also handled for the most
-       common patterns (e.g. glVertexAttrib* style).
-       Fall through to the generic void*-only path otherwise.
-    ─────────────────────────────────────────────────────────── */
-
-    /* Count float vs pointer args */
     int n_flt = 0, n_dbl = 0, n_ptr = 0;
     for(int i = 0; i < limit; i++) {
         if(kinds[i] == DGN_FA_FLT)      n_flt++;
         else if(kinds[i] == DGN_FA_DBL) n_dbl++;
         else                             n_ptr++;
     }
-        
 
-    /* All-float signatures (most common for OpenGL) */
     if(limit > 0 && n_ptr == 0 && n_dbl == 0) {
-        /* Pure float call — void return (GL-style) */
         switch(limit) {
             case 1: ((DgnVoidFn_f  )fn_ptr)(cargs[0].f); break;
             case 2: ((DgnVoidFn_ff )fn_ptr)(cargs[0].f, cargs[1].f); break;
@@ -3018,8 +3120,6 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         return dgn_null();
     }
 
-    /* All-double signatures */
-    /* All-double signatures */
     if(limit > 0 && n_ptr == 0 && n_flt == 0) {
         typedef void (DGN_STDCALL *DgnVoidFn_dddd    )(double,double,double,double);
         typedef void (DGN_STDCALL *DgnVoidFn_ddddd   )(double,double,double,double,double);
@@ -3044,14 +3144,12 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         return dgn_null();
     }
 
-    /* Common mixed: first arg is pointer, rest are floats (e.g. glVertexAttrib) */
     if(n_ptr == 1 && kinds[0] == DGN_FA_PTR && n_flt > 0 && n_flt == limit - 1) {
         switch(limit) {
             case 3: ((DgnVoidFn_pff  )fn_ptr)(cargs[0].p, cargs[1].f, cargs[2].f); break;
             case 4: ((DgnVoidFn_pfff )fn_ptr)(cargs[0].p, cargs[1].f, cargs[2].f, cargs[3].f); break;
             case 5: ((DgnVoidFn_pffff)fn_ptr)(cargs[0].p, cargs[1].f, cargs[2].f, cargs[3].f, cargs[4].f); break;
             default: {
-                /* Fallback: generic pointer dispatch (loses float precision) */
                 void* pa[6] = { cargs[0].p, cargs[1].p, cargs[2].p, cargs[3].p, cargs[4].p, cargs[5].p };
                 if(limit == 2)      ((FfiFunc2)fn_ptr)(pa[0], pa[1]);
                 else if(limit >= 6) ((FfiFunc6)fn_ptr)(pa[0], pa[1], pa[2], pa[3], pa[4], pa[5]);
@@ -3061,7 +3159,6 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         for(int i = 0; i < limit; i++) if(str_copies[i]) free(str_copies[i]);
         return dgn_null();
     }
-/* Mixed ptr+double (e.g. gluCylinder, gluSphere) */
     if (n_dbl > 0 && n_flt == 0) {
         typedef void (DGN_STDCALL *Sig_pdddpp)(void*,double,double,double,void*,void*);
         typedef void (DGN_STDCALL *Sig_pdpp  )(void*,double,void*,void*);
@@ -3083,7 +3180,6 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         for(int i = 0; i < limit; i++) if(str_copies[i]) free(str_copies[i]);
         return dgn_null();
     }
-    /* ── Generic pointer/int-only path (original behaviour) ── */
     void* res = NULL;
     void* pa[11];
     for(int i = 0; i < limit; i++) pa[i] = cargs[i].p;
@@ -3102,7 +3198,7 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
     DgnVal path_val = dgn_map_get(args[0], "path");
     char key[1024];
     snprintf(key, sizeof(key), "%s::%s", path_val.tag == DGN_STR ? path_val.s : "", args[1].s);
-    
+
     if(_dgn_ffi_sigs.tag == DGN_MAP) {
         DgnVal sig = dgn_map_get(_dgn_ffi_sigs, key);
         if(sig.tag == DGN_MAP) {
@@ -3120,6 +3216,693 @@ static DgnVal dgn_ffi_call(DgnVal* args, int n, DgnEnv* env) {
         return dgn_int((int64_t)(uintptr_t)res);
     }
 }
+
+/* ---- raw memory, port I/O and block device access: used by system software written in Dragon (bare metal), and
+ * available in native host builds too (module "hw" with the memory subset, module "disk" backed by $DGN_DISK) ---- */
+static int64_t dgn_bm_num(DgnVal v) { return v.tag == DGN_FLOAT ? (int64_t)v.f : v.i; }
+#define DGN_BM_AO ((n > 0 && args[0].tag == DGN_MAP) ? 1 : 0)
+#define DGN_PEEK(NAME, T, SIGNED) static DgnVal dgn_hw_##NAME(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; \
+    if (n - ao < 1) return dgn_null(); return dgn_int((int64_t)(SIGNED)*(volatile T*)(uintptr_t)dgn_bm_num(args[ao])); }
+#define DGN_POKE(NAME, T) static DgnVal dgn_hw_##NAME(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; \
+    if (n - ao < 2) return dgn_null(); *(volatile T*)(uintptr_t)dgn_bm_num(args[ao]) = (T)dgn_bm_num(args[ao + 1]); return dgn_null(); }
+DGN_PEEK(peek8, uint8_t, uint8_t) DGN_PEEK(peek16, uint16_t, uint16_t) DGN_PEEK(peek32, uint32_t, uint32_t) DGN_PEEK(peek64, uint64_t, int64_t)
+DGN_POKE(poke8, uint8_t) DGN_POKE(poke16, uint16_t) DGN_POKE(poke32, uint32_t) DGN_POKE(poke64, uint64_t)
+#if defined(__x86_64__)
+static inline uint32_t dgn_port_in(int port, int size) { uint32_t v = 0; uint16_t p = (uint16_t)port;
+    if (size == 1) { uint8_t b; __asm__ volatile("inb %1, %0" : "=a"(b) : "Nd"(p)); v = b; }
+    else if (size == 2) { uint16_t w; __asm__ volatile("inw %1, %0" : "=a"(w) : "Nd"(p)); v = w; }
+    else { __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(p)); } return v; }
+static inline void dgn_port_out(int port, int size, uint32_t v) { uint16_t p = (uint16_t)port;
+    if (size == 1) __asm__ volatile("outb %0, %1" :: "a"((uint8_t)v), "Nd"(p));
+    else if (size == 2) __asm__ volatile("outw %0, %1" :: "a"((uint16_t)v), "Nd"(p));
+    else __asm__ volatile("outl %0, %1" :: "a"(v), "Nd"(p)); }
+static inline void dgn_port_ins16(int port, void* addr, size_t n) { __asm__ volatile("rep insw" : "+D"(addr), "+c"(n) : "d"((uint16_t)port) : "memory"); }
+static inline void dgn_port_outs16(int port, const void* addr, size_t n) { __asm__ volatile("rep outsw" : "+S"(addr), "+c"(n) : "d"((uint16_t)port) : "memory"); }
+#elif defined(__aarch64__) && defined(DGN_BAREMETAL)
+/* ARM has no port space. The PC-style accesses drivers make are mapped onto the QEMU virt PCIe host:
+ * 0xCF8/0xCFC (config mechanism 1) -> ECAM, 0x70/0x71 (CMOS clock, binary mode) -> the PL031 RTC,
+ * every other port -> the PCI I/O window. */
+extern uintptr_t dgn_ecam_base;
+#define DGN_ECAM dgn_ecam_base
+#define DGN_PIOWIN 0x3eff0000UL
+static uint32_t dgn_cfg_addr; static int dgn_cmos_idx;
+static inline uint32_t dgn_cmos_read(int idx) {
+    uint32_t t = *(volatile uint32_t*)0x09010000UL;
+    uint32_t days = t / 86400, sec = t % 86400;
+    uint32_t y = 1970, md[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    for (;;) { uint32_t yl = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365; if (days < yl) break; days -= yl; y++; }
+    if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) md[1] = 29;
+    uint32_t mo = 0; while (days >= md[mo]) { days -= md[mo]; mo++; }
+    switch (idx) {
+    case 0: return sec % 60;
+    case 2: return (sec / 60) % 60;
+    case 4: return sec / 3600;
+    case 7: return days + 1;
+    case 8: return mo + 1;
+    case 9: return y % 100;
+    case 0x0B: return 6;
+    default: return 0; } }
+static inline uintptr_t dgn_cfg_ptr(int port) {
+    uint32_t a = dgn_cfg_addr; uint32_t bus = (a >> 16) & 255;
+    if (!dgn_ecam_base || !(a & 0x80000000u) || bus > 15) return 0;
+    return DGN_ECAM + ((uintptr_t)bus << 20) + (((a >> 11) & 31) << 15) + (((a >> 8) & 7) << 12) + (a & 252) + (port - 0xCFC); }
+static inline uint32_t dgn_port_in(int port, int size) {
+    if (port == 0x71) return dgn_cmos_read(dgn_cmos_idx);
+    if (port == 0x70) return (uint32_t)dgn_cmos_idx;
+    if (port == 0xCF8) return dgn_cfg_addr;
+    if (port >= 0xCFC && port <= 0xCFF) { uintptr_t p = dgn_cfg_ptr(port);
+        if (!p) return 0xFFFFFFFFu >> (32 - 8 * size);
+        if (size == 1) return *(volatile uint8_t*)p; if (size == 2) return *(volatile uint16_t*)p; return *(volatile uint32_t*)p; }
+    uintptr_t p = DGN_PIOWIN + (uint16_t)port;
+    if (size == 1) return *(volatile uint8_t*)p; if (size == 2) return *(volatile uint16_t*)p; return *(volatile uint32_t*)p; }
+static inline void dgn_port_out(int port, int size, uint32_t v) {
+    if (port == 0x70) { dgn_cmos_idx = (int)(v & 0x7f); return; }
+    if (port == 0x71) return;
+    if (port == 0xCF8) { dgn_cfg_addr = v; return; }
+    if (port >= 0xCFC && port <= 0xCFF) { uintptr_t p = dgn_cfg_ptr(port); if (!p) return;
+        if (size == 1) *(volatile uint8_t*)p = (uint8_t)v; else if (size == 2) *(volatile uint16_t*)p = (uint16_t)v; else *(volatile uint32_t*)p = v; return; }
+    uintptr_t p = DGN_PIOWIN + (uint16_t)port;
+    if (size == 1) *(volatile uint8_t*)p = (uint8_t)v; else if (size == 2) *(volatile uint16_t*)p = (uint16_t)v; else *(volatile uint32_t*)p = v; }
+static inline void dgn_port_ins16(int port, void* addr, size_t n) { uint16_t* d = (uint16_t*)addr; while (n--) *d++ = (uint16_t)dgn_port_in(port, 2); }
+static inline void dgn_port_outs16(int port, const void* addr, size_t n) { const uint16_t* d = (const uint16_t*)addr; while (n--) dgn_port_out(port, 2, *d++); }
+#else
+static inline uint32_t dgn_port_in(int port, int size) { (void)port; (void)size; return 0; }
+static inline void dgn_port_out(int port, int size, uint32_t v) { (void)port; (void)size; (void)v; }
+static inline void dgn_port_ins16(int port, void* addr, size_t n) { (void)port; (void)addr; (void)n; }
+static inline void dgn_port_outs16(int port, const void* addr, size_t n) { (void)port; (void)addr; (void)n; }
+#endif
+/* highest physical address the kernel keeps mapped (device registers above it cannot be reached) */
+static DgnVal dgn_hw_maplimit_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e;
+#if defined(__aarch64__) && defined(DGN_BAREMETAL)
+    return dgn_int((int64_t)1 << 40);
+#else
+    return dgn_int((int64_t)1 << 39);
+#endif
+}
+static DgnVal dgn_hw_ports_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e;
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(DGN_BAREMETAL))
+    return dgn_bool(1);
+#else
+    return dgn_bool(0);
+#endif
+}
+/* insw(port, addr, count) / outsw(port, addr, count): move count 16-bit words between a port and memory (rep insw / rep outsw) */
+static DgnVal dgn_hw_insw(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null();
+    dgn_port_ins16((int)dgn_bm_num(args[ao]), (void*)(uintptr_t)dgn_bm_num(args[ao + 1]), (size_t)dgn_bm_num(args[ao + 2])); return dgn_null(); }
+static DgnVal dgn_hw_outsw(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null();
+    dgn_port_outs16((int)dgn_bm_num(args[ao]), (const void*)(uintptr_t)dgn_bm_num(args[ao + 1]), (size_t)dgn_bm_num(args[ao + 2])); return dgn_null(); }
+#define DGN_PORT_FN(NAME, SZ) \
+static DgnVal dgn_hw_in##NAME(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); return dgn_int((int64_t)dgn_port_in((int)dgn_bm_num(args[ao]), SZ)); } \
+static DgnVal dgn_hw_out##NAME(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_null(); dgn_port_out((int)dgn_bm_num(args[ao]), SZ, (uint32_t)dgn_bm_num(args[ao + 1])); return dgn_null(); }
+DGN_PORT_FN(b, 1) DGN_PORT_FN(w, 2) DGN_PORT_FN(l, 4)
+/* alloc(size[, align]) -> address of zeroed memory (never moved or collected; free(addr) gives it back) */
+static DgnVal dgn_hw_alloc(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null();
+    size_t sz = (size_t)dgn_bm_num(args[ao]), al = n - ao > 1 ? (size_t)dgn_bm_num(args[ao + 1]) : 16; if (al < 16) al = 16;
+    char* raw = (char*)malloc(sz + al + 16); if (!raw) return dgn_int(0);
+    uintptr_t a = ((uintptr_t)raw + 8 + al - 1) & ~(uintptr_t)(al - 1);
+    ((char**)a)[-1] = raw; memset((void*)a, 0, sz); return dgn_int((int64_t)a);
+}
+static DgnVal dgn_hw_free(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); uintptr_t a = (uintptr_t)dgn_bm_num(args[ao]); if (a) free(((char**)a)[-1]); return dgn_null(); }
+static DgnVal dgn_hw_memcpy(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null(); memmove((void*)(uintptr_t)dgn_bm_num(args[ao]), (void*)(uintptr_t)dgn_bm_num(args[ao + 1]), (size_t)dgn_bm_num(args[ao + 2])); return dgn_null(); }
+static DgnVal dgn_hw_memset(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null(); memset((void*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), (size_t)dgn_bm_num(args[ao + 2])); return dgn_null(); }
+typedef struct { const uint8_t* s; size_t n, p; uint32_t bb; int bc; uint8_t* o; size_t oc, op; int err; } DgnInf;
+typedef struct { uint16_t cnt[16]; uint16_t sym[288]; } DgnHuf;
+static int dgn_inf_bits(DgnInf* z, int need) {
+    while (z->bc < need) { if (z->p >= z->n) { z->err = 1; return 0; } z->bb |= (uint32_t)z->s[z->p++] << z->bc; z->bc += 8; }
+    int v = (int)(z->bb & ((1u << need) - 1)); z->bb >>= need; z->bc -= need; return v;
+}
+static void dgn_inf_build(DgnHuf* h, const uint8_t* len, int n) {
+    uint16_t offs[16]; int i;
+    for (i = 0; i < 16; i++) h->cnt[i] = 0;
+    for (i = 0; i < n; i++) h->cnt[len[i]]++;
+    offs[1] = 0; for (i = 1; i < 15; i++) offs[i + 1] = offs[i] + h->cnt[i];
+    for (i = 0; i < n; i++) if (len[i]) h->sym[offs[len[i]]++] = (uint16_t)i;
+}
+static int dgn_inf_sym(DgnInf* z, const DgnHuf* h) {
+    int code = 0, first = 0, index = 0, l;
+    for (l = 1; l <= 15; l++) {
+        code |= dgn_inf_bits(z, 1); if (z->err) return -1;
+        int c = h->cnt[l];
+        if (code - c < first) return h->sym[index + (code - first)];
+        index += c; first += c; first <<= 1; code <<= 1;
+    }
+    return -1;
+}
+static int dgn_inf_codes(DgnInf* z, const DgnHuf* lc, const DgnHuf* dc) {
+    static const uint16_t lb[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const uint8_t le[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static const uint16_t db[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static const uint8_t de[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    for (;;) {
+        int s = dgn_inf_sym(z, lc); if (s < 0 || z->err) return -1;
+        if (s < 256) { if (z->op >= z->oc) return -1; z->o[z->op++] = (uint8_t)s; }
+        else if (s == 256) return 0;
+        else {
+            s -= 257; if (s >= 29) return -1;
+            int len = lb[s] + dgn_inf_bits(z, le[s]); int ds = dgn_inf_sym(z, dc); if (ds < 0 || ds >= 30 || z->err) return -1;
+            size_t dist = db[ds] + dgn_inf_bits(z, de[ds]); if (z->err || dist > z->op || z->op + len > z->oc) return -1;
+            while (len--) { z->o[z->op] = z->o[z->op - dist]; z->op++; }
+        }
+    }
+}
+static int64_t dgn_inflate_raw(const uint8_t* src, size_t n, uint8_t* dst, size_t cap) {
+    DgnInf z; z.s = src; z.n = n; z.p = 0; z.bb = 0; z.bc = 0; z.o = dst; z.oc = cap; z.op = 0; z.err = 0;
+    DgnHuf lc, dc; int last;
+    do {
+        last = dgn_inf_bits(&z, 1); int type = dgn_inf_bits(&z, 2); if (z.err) return -1;
+        if (type == 0) {
+            z.bb = 0; z.bc = 0; if (z.p + 4 > z.n) return -1;
+            size_t len = z.s[z.p] | (z.s[z.p + 1] << 8); z.p += 4;
+            if (z.p + len > z.n || z.op + len > z.oc) return -1;
+            memcpy(z.o + z.op, z.s + z.p, len); z.p += len; z.op += len;
+        } else if (type == 1) {
+            uint8_t l[288]; int i; for (i = 0; i < 144; i++) l[i] = 8; for (; i < 256; i++) l[i] = 9; for (; i < 280; i++) l[i] = 7; for (; i < 288; i++) l[i] = 8;
+            dgn_inf_build(&lc, l, 288); for (i = 0; i < 30; i++) l[i] = 5; dgn_inf_build(&dc, l, 30);
+            if (dgn_inf_codes(&z, &lc, &dc)) return -1;
+        } else if (type == 2) {
+            static const uint8_t ord[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+            uint8_t l[320]; int nl = dgn_inf_bits(&z, 5) + 257, nd = dgn_inf_bits(&z, 5) + 1, nc = dgn_inf_bits(&z, 4) + 4, i;
+            if (z.err || nl > 286 || nd > 30) return -1;
+            for (i = 0; i < 19; i++) l[i] = 0;
+            for (i = 0; i < nc; i++) l[ord[i]] = (uint8_t)dgn_inf_bits(&z, 3);
+            if (z.err) return -1;
+            DgnHuf cc; dgn_inf_build(&cc, l, 19);
+            uint8_t ls[320]; int idx = 0;
+            while (idx < nl + nd) {
+                int s = dgn_inf_sym(&z, &cc); if (s < 0 || z.err) return -1;
+                if (s < 16) ls[idx++] = (uint8_t)s;
+                else {
+                    int rep, v = 0;
+                    if (s == 16) { if (idx == 0) return -1; v = ls[idx - 1]; rep = 3 + dgn_inf_bits(&z, 2); }
+                    else if (s == 17) rep = 3 + dgn_inf_bits(&z, 3); else rep = 11 + dgn_inf_bits(&z, 7);
+                    if (idx + rep > nl + nd) return -1;
+                    while (rep--) ls[idx++] = (uint8_t)v;
+                }
+            }
+            dgn_inf_build(&lc, ls, nl); dgn_inf_build(&dc, ls + nl, nd);
+            if (dgn_inf_codes(&z, &lc, &dc)) return -1;
+        } else return -1;
+    } while (!last);
+    return (int64_t)z.op;
+}
+
+static uint32_t dgn_s1_rol(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+static void dgn_sha1_block(uint32_t* h, const uint8_t* b) {
+    uint32_t w[80], a, bb, c, d, e, f, k, t; int i;
+    for (i = 0; i < 16; i++) w[i] = ((uint32_t)b[i*4] << 24) | ((uint32_t)b[i*4+1] << 16) | ((uint32_t)b[i*4+2] << 8) | b[i*4+3];
+    for (i = 16; i < 80; i++) w[i] = dgn_s1_rol(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    a = h[0]; bb = h[1]; c = h[2]; d = h[3]; e = h[4];
+    for (i = 0; i < 80; i++) {
+        if (i < 20) { f = (bb & c) | (~bb & d); k = 0x5A827999; } else if (i < 40) { f = bb ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (bb & c) | (bb & d) | (c & d); k = 0x8F1BBCDC; } else { f = bb ^ c ^ d; k = 0xCA62C1D6; }
+        t = dgn_s1_rol(a, 5) + f + e + k + w[i]; e = d; d = c; c = dgn_s1_rol(bb, 30); bb = a; a = t;
+    }
+    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e;
+}
+static void dgn_sha1(const uint8_t* m, size_t n, uint8_t* out) {
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0}; uint8_t blk[128]; size_t i, full = n / 64, rem = n % 64;
+    for (i = 0; i < full; i++) dgn_sha1_block(h, m + i * 64);
+    memset(blk, 0, sizeof blk); memcpy(blk, m + full * 64, rem); blk[rem] = 0x80;
+    size_t tl = rem < 56 ? 64 : 128; uint64_t bits = (uint64_t)n * 8;
+    for (i = 0; i < 8; i++) blk[tl - 1 - i] = (uint8_t)(bits >> (8 * i));
+    dgn_sha1_block(h, blk); if (tl == 128) dgn_sha1_block(h, blk + 64);
+    for (i = 0; i < 5; i++) { out[i*4] = h[i] >> 24; out[i*4+1] = h[i] >> 16; out[i*4+2] = h[i] >> 8; out[i*4+3] = h[i]; }
+}
+static void dgn_hmac_sha1(const uint8_t* key, size_t kn, const uint8_t* msg, size_t mn, uint8_t* out) {
+    uint8_t k[64], ib[64 + 128], ob[64 + 20], ih[20]; size_t i; memset(k, 0, 64);
+    if (kn > 64) dgn_sha1(key, kn, k); else memcpy(k, key, kn);
+    if (mn > 128) mn = 128;
+    for (i = 0; i < 64; i++) { ib[i] = k[i] ^ 0x36; ob[i] = k[i] ^ 0x5c; }
+    memcpy(ib + 64, msg, mn); dgn_sha1(ib, 64 + mn, ih); memcpy(ob + 64, ih, 20); dgn_sha1(ob, 84, out);
+}
+static DgnVal dgn_hw_pbkdf2_sha1(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_int(-1);
+    const uint8_t* pw = (const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]); int64_t pn = dgn_bm_num(args[ao + 1]);
+    const uint8_t* salt = (const uint8_t*)(uintptr_t)dgn_bm_num(args[ao + 2]); int64_t sn = dgn_bm_num(args[ao + 3]);
+    uint8_t* out = (uint8_t*)(uintptr_t)dgn_bm_num(args[ao + 4]);
+    if (sn > 64 || pn > 200) return dgn_int(-1);
+    uint8_t msg[68], u[20], acc[20]; int blk, it, i;
+    for (blk = 1; blk <= 2; blk++) {
+        memcpy(msg, salt, sn); msg[sn] = 0; msg[sn+1] = 0; msg[sn+2] = 0; msg[sn+3] = (uint8_t)blk;
+        dgn_hmac_sha1(pw, pn, msg, sn + 4, u); memcpy(acc, u, 20);
+        for (it = 1; it < 4096; it++) { dgn_hmac_sha1(pw, pn, u, 20, u); for (i = 0; i < 20; i++) acc[i] ^= u[i]; }
+        memcpy(out + (blk - 1) * 20, acc, blk == 1 ? 20 : 12);
+    }
+    return dgn_int(0); }
+static DgnVal dgn_hw_inflate(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_int(-1);
+    const uint8_t* s = (const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]); int64_t sn = dgn_bm_num(args[ao + 1]);
+    if (sn < 3) return dgn_int(-1);
+    return dgn_int(dgn_inflate_raw(s + 2, (size_t)sn - 2, (uint8_t*)(uintptr_t)dgn_bm_num(args[ao + 2]), (size_t)dgn_bm_num(args[ao + 3]))); }
+__attribute__((weak)) int dgn_imgdec_info(const uint8_t* src, int n, int* wh) { (void)src; (void)n; (void)wh; return 0; }
+__attribute__((weak)) int dgn_imgdec(const uint8_t* src, int n, uint32_t* out, int cap) { (void)src; (void)n; (void)out; (void)cap; return -1; }
+static DgnVal dgn_hw_img_info(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(-1);
+    int wh[2] = {0, 0};
+    if (!dgn_imgdec_info((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), wh)) return dgn_int(-1);
+    uint32_t* o = (uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 2]); o[0] = (uint32_t)wh[0]; o[1] = (uint32_t)wh[1];
+    return dgn_int(0); }
+static DgnVal dgn_hw_img_decode(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_int(-1);
+    return dgn_int(dgn_imgdec((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), (uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 2]), (int)dgn_bm_num(args[ao + 3]))); }
+__attribute__((weak)) int dgn_webp_info(const uint8_t* src, int n, int* wh) { (void)src; (void)n; (void)wh; return 0; }
+__attribute__((weak)) int dgn_webp_decode(const uint8_t* src, int n, uint32_t* out, int cap, int w) { (void)src; (void)n; (void)out; (void)cap; (void)w; return -1; }
+static DgnVal dgn_hw_webp_info(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(-1);
+    int wh[2] = {0, 0};
+    if (!dgn_webp_info((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), wh)) return dgn_int(-1);
+    uint32_t* o = (uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 2]); o[0] = (uint32_t)wh[0]; o[1] = (uint32_t)wh[1];
+    return dgn_int(0); }
+static DgnVal dgn_hw_webp_decode(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_int(-1);
+    return dgn_int(dgn_webp_decode((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), (uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 2]), (int)dgn_bm_num(args[ao + 3]), (int)dgn_bm_num(args[ao + 4]))); }
+__attribute__((weak)) void* dgn_aud_open(const uint8_t* d, int n, int* info) { (void)d; (void)n; (void)info; return 0; }
+__attribute__((weak)) int dgn_aud_read(void* h, int16_t* out, int frames) { (void)h; (void)out; (void)frames; return 0; }
+__attribute__((weak)) int dgn_aud_seek(void* h, int frame) { (void)h; (void)frame; return -1; }
+__attribute__((weak)) void dgn_aud_close(void* h) { (void)h; }
+static DgnVal dgn_hw_aud_open(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(0);
+    void* h = dgn_aud_open((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), (int*)(uintptr_t)dgn_bm_num(args[ao + 2]));
+    return dgn_int((int64_t)(uintptr_t)h); }
+static DgnVal dgn_hw_aud_read(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(0);
+    return dgn_int(dgn_aud_read((void*)(uintptr_t)dgn_bm_num(args[ao]), (int16_t*)(uintptr_t)dgn_bm_num(args[ao + 1]), (int)dgn_bm_num(args[ao + 2]))); }
+static DgnVal dgn_hw_aud_seek(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_int(-1);
+    return dgn_int(dgn_aud_seek((void*)(uintptr_t)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]))); }
+static DgnVal dgn_hw_aud_close(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_int(0);
+    dgn_aud_close((void*)(uintptr_t)dgn_bm_num(args[ao])); return dgn_int(0); }
+static DgnVal dgn_hw_png_unfilter(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_int(-1);
+    uint8_t* raw = (uint8_t*)(uintptr_t)dgn_bm_num(args[ao]); int64_t rb = dgn_bm_num(args[ao + 1]), h = dgn_bm_num(args[ao + 2]), bpp = dgn_bm_num(args[ao + 3]);
+    uint8_t* prev = 0; int64_t y, i;
+    for (y = 0; y < h; y++) {
+        uint8_t* row = raw + y * (rb + 1); int ft = row[0]; uint8_t* c = row + 1;
+        for (i = 0; i < rb; i++) {
+            int l = i >= bpp ? c[i - bpp] : 0, u = prev ? prev[i] : 0, ul = (prev && i >= bpp) ? prev[i - bpp] : 0, add = 0;
+            if (ft == 1) add = l; else if (ft == 2) add = u; else if (ft == 3) add = (l + u) >> 1;
+            else if (ft == 4) { int p = l + u - ul, pa = p > l ? p - l : l - p, pb = p > u ? p - u : u - p, pc = p > ul ? p - ul : ul - p; add = (pa <= pb && pa <= pc) ? l : (pb <= pc ? u : ul); }
+            c[i] = (uint8_t)(c[i] + add);
+        }
+        prev = c;
+    }
+    return dgn_null(); }
+/* peek_str(addr, n) -> string of the n bytes (stops at the first NUL); poke_str(addr, string) writes the bytes (no NUL) and returns the length */
+static DgnVal dgn_hw_peek_str(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_null();
+    size_t len = (size_t)dgn_bm_num(args[ao + 1]); const char* p = (const char*)(uintptr_t)dgn_bm_num(args[ao]);
+    char* b = (char*)malloc(len + 1); if (!b) return dgn_null(); memcpy(b, p, len); b[len] = 0; DgnVal v = dgn_str(b); free(b); return v;
+}
+static DgnVal dgn_hw_poke_str(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 2 || args[ao + 1].tag != DGN_STR) return dgn_null();
+    size_t len = strlen(args[ao + 1].s); memcpy((void*)(uintptr_t)dgn_bm_num(args[ao]), args[ao + 1].s, len); return dgn_int((int64_t)len);
+}
+#ifndef DGN_BAREMETAL
+/* host simulation of the block device: a file named by $DGN_DISK (so system software written in Dragon, e.g. the
+ * file system, can be developed and tested natively before it runs on hardware) */
+static FILE* dgn_host_disk; static uint64_t dgn_host_disk_sectors;
+uint64_t dgn_bm_disk_init(void) {
+    if (dgn_host_disk) return dgn_host_disk_sectors;
+    const char* path = getenv("DGN_DISK"); if (!path) return 0;
+    dgn_host_disk = fopen(path, "r+b"); if (!dgn_host_disk) return 0;
+    fseek(dgn_host_disk, 0, SEEK_END); dgn_host_disk_sectors = (uint64_t)ftell(dgn_host_disk) / 512; return dgn_host_disk_sectors;
+}
+int dgn_bm_disk_rw(uint64_t sector, void* buf, uint32_t count, int write) {
+    if (!dgn_host_disk || sector + count > dgn_host_disk_sectors) return -1;
+    fseek(dgn_host_disk, (long)(sector * 512), SEEK_SET);
+    size_t r = write ? fwrite(buf, 512, count, dgn_host_disk) : fread(buf, 512, count, dgn_host_disk);
+    if (write) fflush(dgn_host_disk);
+    return r == count ? 0 : -1;
+}
+#else
+extern uint64_t dgn_bm_disk_init(void);
+extern int dgn_bm_disk_rw(uint64_t sector, void* buf, uint32_t count, int write);
+#endif
+/* disk: size() -> sectors (0 = no disk); read(sector, count) -> string of count*512 chars (NUL shown as space);
+ * write(sector, string) -> bool (padded with spaces); read_to / write_from(sector, count, addr) move raw sectors */
+static DgnVal dgn_disk_size_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_disk_init()); }
+static DgnVal dgn_disk_read_f(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_null();
+    int64_t sec = dgn_bm_num(args[ao]), cnt = dgn_bm_num(args[ao + 1]);
+    if (sec < 0 || cnt <= 0 || cnt > 4096) return dgn_null();
+    char* buf = (char*)malloc((size_t)cnt * 512 + 1); if (!buf) return dgn_null();
+    if (dgn_bm_disk_rw((uint64_t)sec, buf, (uint32_t)cnt, 0) != 0) { free(buf); return dgn_null(); }
+    for (int64_t i = 0; i < cnt * 512; i++) if (buf[i] == 0) buf[i] = ' ';
+    buf[cnt * 512] = 0; DgnVal v = dgn_str(buf); free(buf); return v;
+}
+static DgnVal dgn_disk_read_to_f(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_bool(0);
+    return dgn_bool(dgn_bm_disk_rw((uint64_t)dgn_bm_num(args[ao]), (void*)(uintptr_t)dgn_bm_num(args[ao + 2]), (uint32_t)dgn_bm_num(args[ao + 1]), 0) == 0); }
+static DgnVal dgn_disk_write_from_f(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_bool(0);
+    return dgn_bool(dgn_bm_disk_rw((uint64_t)dgn_bm_num(args[ao]), (void*)(uintptr_t)dgn_bm_num(args[ao + 2]), (uint32_t)dgn_bm_num(args[ao + 1]), 1) == 0); }
+static DgnVal dgn_disk_write_f(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 2 || args[ao + 1].tag != DGN_STR) return dgn_bool(0);
+    int64_t sec = dgn_bm_num(args[ao]); size_t len = strlen(args[ao + 1].s); uint32_t cnt = (uint32_t)((len + 511) / 512);
+    if (sec < 0) return dgn_bool(0);
+    if (cnt == 0) return dgn_bool(1);
+    char* buf = (char*)malloc((size_t)cnt * 512); if (!buf) return dgn_bool(0);
+    memset(buf, ' ', (size_t)cnt * 512); memcpy(buf, args[ao + 1].s, len);
+    int rc = dgn_bm_disk_rw((uint64_t)sec, buf, cnt, 1); free(buf); return dgn_bool(rc == 0);
+}
+
+#if defined(DGN_BAREMETAL) && !defined(DGN_USER)
+/* ---- bare-metal modules: `hw` (device access, clock) and `task` (preemptive multitasking) ---- */
+extern unsigned long long dgn_bm_now_us(void);
+extern unsigned long long dgn_bm_ticks(void);
+extern void   dgn_bm_putc(char c);
+extern size_t dgn_bm_heap_used(void);
+extern size_t dgn_bm_heap_peak(void);
+extern void   dgn_bm_halt(int code) __attribute__((noreturn));
+extern int    dgn_bm_task_create(void (*entry)(void*), const void* data, size_t n, size_t stack_bytes);
+extern int    dgn_bm_task_create_aff(void (*entry)(void*), const void* data, size_t n, size_t stack_bytes, int aff);
+extern int    dgn_bm_mutex_new(void);
+extern int    dgn_bm_mutex_trylock(int m);
+extern void   dgn_bm_mutex_lock(int m);
+extern void   dgn_bm_mutex_unlock(int m);
+extern void   dgn_bm_task_yield(void);
+extern void   dgn_bm_task_sleep_ms(unsigned long long ms);
+extern int    dgn_bm_task_id(void);
+extern int    dgn_bm_task_alive(int id);
+extern int    dgn_bm_task_count(void);
+
+static DgnVal dgn_hw_micros(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_now_us()); }
+extern char __bootinfo[] __attribute__((weak));
+static DgnVal dgn_hw_bootinfo(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)(uintptr_t)__bootinfo); }
+extern long dgn_ext_call(long cmd, long a, long b) __attribute__((weak));
+static DgnVal dgn_hw_ext(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (!dgn_ext_call) return dgn_int(-1); long c = n - ao > 0 ? (long)dgn_bm_num(args[ao]) : 0, x = n - ao > 1 ? (long)dgn_bm_num(args[ao + 1]) : 0, y = n - ao > 2 ? (long)dgn_bm_num(args[ao + 2]) : 0; return dgn_int((int64_t)dgn_ext_call(c, x, y)); }
+extern int dgn_ata_rw(uint64_t sector, int count, void* addr, int write); extern unsigned int dgn_ata_probe(void); extern void dgn_smp_set_parallel(int on); extern int dgn_smp_init(void); extern int dgn_smp_count(void); extern int dgn_smp_start(int cpu, int job, uint64_t arg); extern int dgn_smp_busy(int cpu); extern uint64_t dgn_smp_result(int cpu);
+static DgnVal dgn_hw_smp_init(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_smp_init()); }
+static DgnVal dgn_hw_smp_parallel(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); dgn_smp_set_parallel((int)dgn_bm_num(args[ao + 0])); return dgn_null(); }
+static DgnVal dgn_hw_ata_probe(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int((int64_t)dgn_ata_probe()); }
+static DgnVal dgn_hw_ata_rw(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_bool(0); return dgn_bool(dgn_ata_rw((uint64_t)dgn_bm_num(args[ao + 0]), (int)dgn_bm_num(args[ao + 1]), (void*)(uintptr_t)dgn_bm_num(args[ao + 2]), (int)dgn_bm_num(args[ao + 3]))); }
+static DgnVal dgn_hw_csum(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(0);
+    const uint8_t* p = (const uint8_t*)(uintptr_t)dgn_bm_num(args[ao + 0]); int64_t len = dgn_bm_num(args[ao + 1]); uint64_t s = (uint64_t)dgn_bm_num(args[ao + 2]);
+    int64_t i = 0; for (; i + 1 < len; i += 2) s += ((uint64_t)p[i] << 8) | p[i + 1]; if (i < len) s += (uint64_t)p[i] << 8;
+    while (s >> 16) s = (s & 0xFFFF) + (s >> 16); return dgn_int((int64_t)s); }
+static DgnVal dgn_hw_smp_count(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_smp_count()); }
+static DgnVal dgn_hw_smp_start(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(-1); return dgn_int(dgn_smp_start((int)dgn_bm_num(args[ao + 0]), (int)dgn_bm_num(args[ao + 1]), (uint64_t)dgn_bm_num(args[ao + 2]))); }
+static DgnVal dgn_hw_smp_busy(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_int(0); return dgn_int(dgn_smp_busy((int)dgn_bm_num(args[ao + 0]))); }
+static DgnVal dgn_hw_smp_result(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_int(0); return dgn_int((int64_t)dgn_smp_result((int)dgn_bm_num(args[ao + 0]))); }
+static DgnVal dgn_hw_millis(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)(dgn_bm_now_us() / 1000)); }
+static DgnVal dgn_hw_ticks(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_ticks()); }
+extern void dgn_bm_cur_enable(int on);
+extern void dgn_bm_input_inject(int kind, int type, int code, int value);
+/* inject(kind, type, code, value): feeds a raw input event (Linux key codes, as the hardware drivers do) from a driver written in Dragon */
+static DgnVal dgn_input_inject_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_null();
+    dgn_bm_input_inject((int)dgn_bm_num(args[ao]), (int)dgn_bm_num(args[ao + 1]), (int)dgn_bm_num(args[ao + 2]), (int)dgn_bm_num(args[ao + 3])); return dgn_null(); }
+static DgnVal dgn_input_cursor_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_bm_cur_enable(n - ao > 0 && dgn_truthy(args[ao])); return dgn_null(); }
+extern size_t dgn_bm_stack_free(void);
+static DgnVal dgn_hw_stack_free(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_stack_free()); }
+extern int dgn_bm_getc_nb(void);
+static DgnVal dgn_hw_getc_nb(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int(dgn_bm_getc_nb()); }
+static DgnVal dgn_hw_putc(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); dgn_bm_putc((char)dgn_bm_num(args[ao])); return dgn_null(); }
+static DgnVal dgn_hw_heap_used(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_heap_used()); }
+static DgnVal dgn_hw_heap_peak(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_heap_peak()); }
+static DgnVal dgn_hw_halt(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_bm_halt(n - ao > 0 ? (int)dgn_bm_num(args[ao]) : 0); }
+
+typedef struct { DgnVal fn; DgnVal arg; int has_arg; } DgnTaskBlk;
+static void dgn_task_entry(void* p) {            /* p points into this task's own stack, so the collector sees fn and arg */
+    DgnTaskBlk* b = (DgnTaskBlk*)p;
+    DgnVal a[1]; a[0] = b->arg;
+    dgn_call_val(b->fn, a, b->has_arg ? 1 : 0);
+}
+static DgnVal dgn_task_spawn(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = (n > 0 && args[0].tag != DGN_FUNC) ? 1 : 0;
+    if (n - ao < 1 || args[ao].tag != DGN_FUNC) return dgn_int(-1);
+    DgnTaskBlk b; memset(&b, 0, sizeof b); b.fn = args[ao];
+    if (n - ao > 1) { b.arg = args[ao + 1]; b.has_arg = 1; }
+    size_t stack = (n - ao > 2) ? (size_t)dgn_bm_num(args[ao + 2]) * 1024 : 0;      /* optional stack size in KB */
+    return dgn_int(dgn_bm_task_create(dgn_task_entry, &b, sizeof b, stack));
+}
+static DgnVal dgn_task_spawn_par(DgnVal* args, int n, DgnEnv* e) {   /* like spawn, but the task may run on any CPU core */
+    (void)e; int ao = (n > 0 && args[0].tag != DGN_FUNC) ? 1 : 0;
+    if (n - ao < 1 || args[ao].tag != DGN_FUNC) return dgn_int(-1);
+    DgnTaskBlk b; memset(&b, 0, sizeof b); b.fn = args[ao];
+    if (n - ao > 1) { b.arg = args[ao + 1]; b.has_arg = 1; }
+    size_t stack = (n - ao > 2) ? (size_t)dgn_bm_num(args[ao + 2]) * 1024 : 0;
+    return dgn_int(dgn_bm_task_create_aff(dgn_task_entry, &b, sizeof b, stack, 1));
+}
+static DgnVal dgn_task_yield(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; dgn_bm_task_yield(); return dgn_null(); }
+static DgnVal dgn_task_sleep(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_bm_task_sleep_ms(n - ao > 0 ? (unsigned long long)dgn_bm_num(args[ao]) : 0); return dgn_null(); }
+static DgnVal dgn_task_id(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_task_id()); }
+static DgnVal dgn_task_alive(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; return dgn_bool(n - ao > 0 && dgn_bm_task_alive((int)dgn_bm_num(args[ao]))); }
+static DgnVal dgn_task_count(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_task_count()); }
+static DgnVal dgn_task_wait(DgnVal* args, int n, DgnEnv* e) {
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null();
+    int id = (int)dgn_bm_num(args[ao]);
+    while (dgn_bm_task_alive(id)) dgn_bm_task_sleep_ms(1);
+    return dgn_null();
+}
+static DgnVal dgn_task_atomic(DgnVal* args, int n, DgnEnv* e) {   /* run fn with task switching off; an exception releases it */
+    (void)e; int ao = (n > 0 && args[0].tag != DGN_FUNC) ? 1 : 0; if (n - ao < 1) return dgn_null();
+    DgnTryFrame f; f.thrown = dgn_null();
+    dgn_bm_crit_enter(); dgn_try_push(&f);
+    if (setjmp(f.buf) == 0) { DgnVal r = dgn_call_val(args[ao], NULL, 0); dgn_try_pop(&f); dgn_bm_crit_exit(); return r; }
+    dgn_bm_crit_exit(); dgn_raise(f.thrown); return dgn_null();
+}
+static DgnVal dgn_task_mutex(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_mutex_new()); }
+static DgnVal dgn_task_lock(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao > 0) dgn_bm_mutex_lock((int)dgn_bm_num(args[ao])); return dgn_null(); }
+static DgnVal dgn_task_unlock(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao > 0) dgn_bm_mutex_unlock((int)dgn_bm_num(args[ao])); return dgn_null(); }
+static DgnVal dgn_task_locked(DgnVal* args, int n, DgnEnv* e) {   /* locked(mutex, fn): lock, run fn, unlock even on an exception */
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_null();
+    int m = (int)dgn_bm_num(args[ao]); DgnVal fn = args[ao + 1];
+    dgn_bm_mutex_lock(m);
+    DgnTryFrame f; f.thrown = dgn_null(); dgn_try_push(&f);
+    if (setjmp(f.buf) == 0) { DgnVal r = dgn_call_val(fn, NULL, 0); dgn_try_pop(&f); dgn_bm_mutex_unlock(m); return r; }
+    dgn_bm_mutex_unlock(m); dgn_raise(f.thrown); return dgn_null();
+}
+
+#endif
+
+#ifdef DGN_BAREMETAL
+/* gfx and input: in the kernel they are the screen and the devices, in a user program (.dxe) the program's own window and its events */
+extern int  dgn_bm_fb_init(int w, int h);
+extern long long dgn_bm_fb_vram(void);
+extern long long dgn_bm_fb_diag(void);
+extern uint32_t* dgn_bm_fb_ptr;
+extern int  dgn_bm_fb_w, dgn_bm_fb_h;
+extern void dgn_gfx_clear(uint32_t c);
+extern void dgn_gfx_pixel(int x, int y, uint32_t c);
+extern uint32_t dgn_gfx_get(int x, int y);
+extern void dgn_gfx_rect(int x, int y, int w, int h, uint32_t c);
+extern void dgn_gfx_box(int x, int y, int w, int h, uint32_t c);
+extern void dgn_gfx_line(int x0, int y0, int x1, int y1, uint32_t c);
+extern void dgn_gfx_circle(int cx, int cy, int r, uint32_t c, int fill);
+extern void dgn_gfx_text(int x, int y, const char* s, uint32_t fg, long bg, int scale);
+extern void dgn_gfx_scroll(int dy, uint32_t bg);
+extern int dgn_gfx_buffer(int on);
+extern void dgn_gfx_present(void);
+extern void dgn_gfx_glass_warm(const uint32_t* src, int stride, uint32_t tint, int ta);
+extern void dgn_gfx_resize(uint32_t* dst, int dw, int dh, const uint32_t* src, int stride, int sx, int sy, int sw, int sh);
+extern void dgn_gfx_sprite_make(uint32_t* dst, const uint32_t* b, const uint32_t* w, int n);
+extern void dgn_gfx_sprite(const uint32_t* src, int sw, int sh, int dx, int dy);
+extern void dgn_gfx_present_rect(int x, int y, int w, int h);
+extern void dgn_gfx_clip(int x, int y, int w, int h);
+extern void dgn_gfx_unclip(void);
+extern void dgn_gfx_clip_push(int x, int y, int w, int h);
+extern void dgn_gfx_clip_pop(void);
+extern void dgn_gfx_blit(const uint32_t* src, int sw, int sh, int stride, int dx, int dy);
+extern int dgn_gfx_jpeg_info(const uint8_t* src, int n);
+extern int dgn_gfx_jpeg(const uint8_t* src, int n, uint32_t* dst);
+extern void dgn_gfx_blit_scaled(const uint32_t* src, int sw, int sh, int dx, int dy, int dw, int dh, int cx, int cy, int cw, int ch);
+extern void dgn_gfx_blend(int x, int y, int w, int h, uint32_t c, int a);
+extern void dgn_gfx_rrect(int x, int y, int w, int h, int r, uint32_t c, int a);
+extern void dgn_gfx_gradient(int x, int y, int w, int h, uint32_t c0, uint32_t c1, int dir);
+extern void dgn_gfx_glow(int cx, int cy, int r, uint32_t c, int a);
+extern void dgn_gfx_shadow(int x, int y, int w, int h, int s, int a, int dy, int r);
+extern void dgn_gfx_blur(int x, int y, int w, int h, int rad, int passes);
+extern void dgn_gfx_saturate(int x, int y, int w, int h, int pct);
+extern void dgn_gfx_gpill(int x, int y, int w, int h, int r, uint32_t c0, uint32_t c1, int a);
+extern void dgn_gfx_glass(const uint32_t* src, int stride, int x, int y, int w, int h, int r, uint32_t tint, int ta, int corners);
+extern void dgn_gfx_rframe(int x, int y, int w, int h, int r, uint32_t c, int a, int corners);
+extern void dgn_gfx_aaline(float x0, float y0, float x1, float y1, float w, uint32_t c, int a);
+extern void dgn_gfx_aaring(float cx, float cy, float r, float th, uint32_t c, int a);
+extern void dgn_gfx_aadisc(float cx, float cy, float r, uint32_t c, int a);
+extern int dgn_gfx_twidth(const char* s, int size, int flags);
+extern int dgn_gfx_fontadd(const void* data, int size, int slot);
+extern int dgn_gfx_tmetric(int size, int flags, int which);
+extern int dgn_gfx_ttext(int x, int y, const char* s, uint32_t c, int size, int flags);
+#define DGN_GN(i) ((int)dgn_bm_num(args[ao + (i)]))
+#define DGN_GC(i) ((uint32_t)dgn_bm_num(args[ao + (i)]))
+extern int dgn_gfx_tw(void); extern int dgn_gfx_th(void);
+static int dgn_gfx_k = 256;
+extern int dgn_gfx_custom(void);
+static inline int dgn_gk(void) { return dgn_gfx_k != 256 && !dgn_gfx_custom(); }
+static inline int dgn_gs(int v) { return dgn_gk() ? (int)(((long)v * dgn_gfx_k + (v < 0 ? -128 : 128)) / 256) : v; }
+static inline int dgn_gw(int x, int w) { if (!dgn_gk()) return w; int d = dgn_gs(x + w) - dgn_gs(x); return (w > 0 && d < 1) ? 1 : d; }
+static DgnVal dgn_gfx_scale_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao > 0) { int k = DGN_GN(0); dgn_gfx_k = k < 64 ? 256 : k; } return dgn_int(dgn_gfx_k); }
+static DgnVal dgn_gfx_devw_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_gfx_tw()); }
+static DgnVal dgn_gfx_devh_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_gfx_th()); }
+static DgnVal dgn_con_diag_f(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_fb_diag()); }
+static DgnVal dgn_con_vram_f(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int((int64_t)dgn_bm_fb_vram()); }
+static DgnVal dgn_gfx_init_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; int w = n - ao > 0 ? DGN_GN(0) : 800, h = n - ao > 1 ? DGN_GN(1) : 600; return dgn_bool(dgn_bm_fb_init(w, h)); }
+extern int dgn_gfx_tw(void); extern int dgn_gfx_th(void); extern void dgn_gfx_surface(uint32_t* p, int w, int h);
+static DgnVal dgn_gfx_width_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_gk() ? dgn_gfx_tw() * 256 / dgn_gfx_k : dgn_gfx_tw()); }
+static DgnVal dgn_gfx_height_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_gk() ? dgn_gfx_th() * 256 / dgn_gfx_k : dgn_gfx_th()); }
+/* surface(address, width, height): draw into a block of 32-bit pixels instead of the screen; surface(0) goes back to the screen */
+static DgnVal dgn_gfx_surface_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO;
+    if (n - ao < 3) { dgn_gfx_surface(0, 0, 0); return dgn_null(); }
+    dgn_gfx_surface((uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), DGN_GN(2)); return dgn_null(); }
+static DgnVal dgn_gfx_clear_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_gfx_clear(n - ao > 0 ? DGN_GC(0) : 0); return dgn_null(); }
+static DgnVal dgn_gfx_pixel_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null(); dgn_gfx_pixel(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), DGN_GC(2)); return dgn_null(); }
+static DgnVal dgn_gfx_get_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_null(); return dgn_int(dgn_gfx_get(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)))); }
+static DgnVal dgn_gfx_rect_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_rect(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), DGN_GC(4)); return dgn_null(); }
+static DgnVal dgn_gfx_box_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_box(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), DGN_GC(4)); return dgn_null(); }
+static DgnVal dgn_gfx_line_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_line(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gs(DGN_GN(2)), dgn_gs(DGN_GN(3)), DGN_GC(4)); return dgn_null(); }
+static DgnVal dgn_gfx_circle_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_null(); dgn_gfx_circle(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gs(DGN_GN(2)), DGN_GC(3), n - ao > 4 && dgn_truthy(args[ao + 4])); return dgn_null(); }
+static DgnVal dgn_gfx_text_f(DgnVal* args, int n, DgnEnv* e) {   /* text(x, y, string, color[, scale[, background]]) */
+    (void)e; int ao = DGN_BM_AO; if (n - ao < 4 || args[ao + 2].tag != DGN_STR) return dgn_null();
+    int scale = n - ao > 4 ? DGN_GN(4) : 1; long bg = n - ao > 5 && args[ao + 5].tag != DGN_NULL ? (long)DGN_GC(5) : -1;
+    dgn_gfx_text(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), args[ao + 2].s, DGN_GC(3), bg, dgn_gk() ? (scale * dgn_gfx_k + 128) / 256 : scale); return dgn_null();
+}
+#ifdef DGN_USER
+extern void dgn_win_title(const char* t);
+static DgnVal dgn_gfx_title_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao > 0 && args[ao].tag == DGN_STR) dgn_win_title(args[ao].s); return dgn_null(); }
+#endif
+static DgnVal dgn_gfx_buffer_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; return dgn_bool(dgn_gfx_buffer(n - ao > 0 && dgn_truthy(args[ao]))); }
+static DgnVal dgn_gfx_present_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; dgn_gfx_present(); return dgn_null(); }
+/* blit(address, width, height, x, y[, stride]): copy a block of 32-bit pixels (rows `stride` pixels apart, default width) to the screen */
+static DgnVal dgn_gfx_blit_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null();
+    int w = DGN_GN(1); dgn_gfx_blit((const uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), w, DGN_GN(2), n - ao > 5 ? DGN_GN(5) : w, dgn_gs(DGN_GN(3)), dgn_gs(DGN_GN(4))); return dgn_null(); }
+/* jpeg_info(address, length): (width << 16) | height of a baseline JPEG, or a negative number when it cannot be decoded; jpeg(address, length, destination): decode it into 32-bit pixels, 0 on success */
+static DgnVal dgn_gfx_jpeg_info_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_int(-1);
+    return dgn_int(dgn_gfx_jpeg_info((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1))); }
+static DgnVal dgn_gfx_jpeg_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(-1);
+    return dgn_int(dgn_gfx_jpeg((const uint8_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), (uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 2]))); }
+static DgnVal dgn_gfx_blit_scaled_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 7) return dgn_null();
+    int hc = n - ao > 10; { extern int dgn_gfx_alpha; dgn_gfx_alpha = (n - ao > 11 && dgn_bm_num(args[ao + 11]) != 0); } dgn_gfx_blit_scaled((const uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), DGN_GN(2), dgn_gs(DGN_GN(3)), dgn_gs(DGN_GN(4)), dgn_gw(DGN_GN(3), DGN_GN(5)), dgn_gw(DGN_GN(4), DGN_GN(6)), hc ? dgn_gs(DGN_GN(7)) : 0, hc ? dgn_gs(DGN_GN(8)) : 0, hc ? dgn_gw(DGN_GN(7), DGN_GN(9)) : 0, hc ? dgn_gw(DGN_GN(8), DGN_GN(10)) : 0); return dgn_null(); }
+static DgnVal dgn_gfx_blend_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 6) return dgn_null(); dgn_gfx_blend(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), DGN_GC(4), DGN_GN(5)); return dgn_null(); }
+static DgnVal dgn_gfx_rrect_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 6) return dgn_null(); dgn_gfx_rrect(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), dgn_gs(DGN_GN(4)), DGN_GC(5), n - ao > 6 ? DGN_GN(6) : 255); return dgn_null(); }
+static DgnVal dgn_gfx_gradient_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 6) return dgn_null(); dgn_gfx_gradient(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), DGN_GC(4), DGN_GC(5), n - ao > 6 ? DGN_GN(6) : 0); return dgn_null(); }
+static DgnVal dgn_gfx_glow_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_glow(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gs(DGN_GN(2)), DGN_GC(3), DGN_GN(4)); return dgn_null(); }
+static DgnVal dgn_gfx_shadow_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 6) return dgn_null(); dgn_gfx_shadow(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), dgn_gs(DGN_GN(4)), DGN_GN(5), n - ao > 6 ? dgn_gs(DGN_GN(6)) : 0, n - ao > 7 ? dgn_gs(DGN_GN(7)) : 0); return dgn_null(); }
+static DgnVal dgn_gfx_saturate_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_saturate(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), DGN_GN(4)); return dgn_null(); }
+static DgnVal dgn_gfx_gpill_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 8) return dgn_null(); dgn_gfx_gpill(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), dgn_gs(DGN_GN(4)), DGN_GC(5), DGN_GC(6), DGN_GN(7)); return dgn_null(); }
+static DgnVal dgn_gfx_blur_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_blur(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), dgn_gs(DGN_GN(4)), n - ao > 5 ? DGN_GN(5) : 2); return dgn_null(); }
+static DgnVal dgn_gfx_glass_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 9) return dgn_null(); dgn_gfx_glass((const uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), dgn_gs(DGN_GN(2)), dgn_gs(DGN_GN(3)), dgn_gw(DGN_GN(2), DGN_GN(4)), dgn_gw(DGN_GN(3), DGN_GN(5)), dgn_gs(DGN_GN(6)), DGN_GC(7), DGN_GN(8), n - ao > 9 ? DGN_GN(9) : 15); return dgn_null(); }
+static DgnVal dgn_gfx_rframe_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 7) return dgn_null(); dgn_gfx_rframe(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), dgn_gw(DGN_GN(0), DGN_GN(2)), dgn_gw(DGN_GN(1), DGN_GN(3)), dgn_gs(DGN_GN(4)), DGN_GC(5), DGN_GN(6), n - ao > 7 ? DGN_GN(7) : 15); return dgn_null(); }
+static inline float dgn_gf(int v8) { return dgn_gk() ? (float)v8 * (float)dgn_gfx_k / 2048.0f : (float)v8 / 8.0f; }
+static DgnVal dgn_gfx_aaline_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 6) return dgn_null(); dgn_gfx_aaline(dgn_gf(DGN_GN(0)), dgn_gf(DGN_GN(1)), dgn_gf(DGN_GN(2)), dgn_gf(DGN_GN(3)), dgn_gf(DGN_GN(4)), DGN_GC(5), n - ao > 6 ? DGN_GN(6) : 255); return dgn_null(); }
+static DgnVal dgn_gfx_aaring_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_aaring(dgn_gf(DGN_GN(0)), dgn_gf(DGN_GN(1)), dgn_gf(DGN_GN(2)), dgn_gf(DGN_GN(3)), DGN_GC(4), n - ao > 5 ? DGN_GN(5) : 255); return dgn_null(); }
+static DgnVal dgn_gfx_aadisc_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_null(); dgn_gfx_aadisc(dgn_gf(DGN_GN(0)), dgn_gf(DGN_GN(1)), dgn_gf(DGN_GN(2)), DGN_GC(3), n - ao > 4 ? DGN_GN(4) : 255); return dgn_null(); }
+static DgnVal dgn_gfx_clip_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) { dgn_gfx_unclip(); return dgn_null(); } int x0 = dgn_gs(DGN_GN(0)), y0 = dgn_gs(DGN_GN(1)), x1 = dgn_gs(DGN_GN(0) + DGN_GN(2)), y1 = dgn_gs(DGN_GN(1) + DGN_GN(3)); dgn_gfx_clip(x0, y0, x1 - x0, y1 - y0); return dgn_null(); }
+static DgnVal dgn_gfx_clip_push_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_null(); int x0 = dgn_gs(DGN_GN(0)), y0 = dgn_gs(DGN_GN(1)), x1 = dgn_gs(DGN_GN(0) + DGN_GN(2)), y1 = dgn_gs(DGN_GN(1) + DGN_GN(3)); dgn_gfx_clip_push(x0, y0, x1 - x0, y1 - y0); return dgn_null(); }
+static DgnVal dgn_gfx_clip_pop_f(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; dgn_gfx_clip_pop(); return dgn_null(); }
+static DgnVal dgn_gfx_present_rect_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) { dgn_gfx_present(); return dgn_null(); } int x0 = dgn_gs(DGN_GN(0)), y0 = dgn_gs(DGN_GN(1)), x1 = dgn_gs(DGN_GN(0) + DGN_GN(2)), y1 = dgn_gs(DGN_GN(1) + DGN_GN(3)); dgn_gfx_present_rect(x0, y0, x1 - x0, y1 - y0); return dgn_null(); }
+static DgnVal dgn_gfx_resize_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 9) return dgn_null(); dgn_gfx_resize((uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), DGN_GN(2), (const uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 3]), DGN_GN(4), DGN_GN(5), DGN_GN(6), DGN_GN(7), DGN_GN(8)); return dgn_null(); }
+static DgnVal dgn_gfx_sprite_make_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_null(); dgn_gfx_sprite_make((uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), (const uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 1]), (const uint32_t*)(uintptr_t)dgn_bm_num(args[ao + 2]), DGN_GN(3)); return dgn_null(); }
+static DgnVal dgn_gfx_sprite_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_null(); dgn_gfx_sprite((const uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), DGN_GN(2), dgn_gs(DGN_GN(3)), dgn_gs(DGN_GN(4))); return dgn_null(); }
+static DgnVal dgn_gfx_glass_warm_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_null(); dgn_gfx_glass_warm((const uint32_t*)(uintptr_t)dgn_bm_num(args[ao]), DGN_GN(1), DGN_GC(2), DGN_GN(3)); return dgn_null(); }
+static DgnVal dgn_gfx_ttext_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5 || args[ao + 2].tag != DGN_STR) return dgn_int(0); return dgn_int(dgn_gfx_ttext(dgn_gs(DGN_GN(0)), dgn_gs(DGN_GN(1)), args[ao + 2].s, DGN_GC(3), dgn_gs(DGN_GN(4)), n - ao > 5 ? DGN_GN(5) : 0)); }
+static DgnVal dgn_gfx_twidth_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2 || args[ao].tag != DGN_STR) return dgn_int(0); int w = dgn_gfx_twidth(args[ao].s, dgn_gs(DGN_GN(1)), n - ao > 2 ? DGN_GN(2) : 0); return dgn_int(dgn_gk() ? (w * 256 + dgn_gfx_k - 1) / dgn_gfx_k : w); }
+static DgnVal dgn_gfx_tmetric_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(0); int v = dgn_gfx_tmetric(dgn_gs(DGN_GN(0)), DGN_GN(1), DGN_GN(2)); return dgn_int(dgn_gk() ? (v * 256 + dgn_gfx_k - 1) / dgn_gfx_k : v); }
+static DgnVal dgn_gfx_fontadd_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_int(-1); return dgn_int(dgn_gfx_fontadd((const void*)(uintptr_t)dgn_bm_num(args[ao]), (int)DGN_GN(1), (int)DGN_GN(2))); }
+static DgnVal dgn_gfx_scroll_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); dgn_gfx_scroll(DGN_GN(0), n - ao > 1 ? DGN_GC(1) : 0); return dgn_null(); }
+
+extern int dgn_bm_input_init(void);
+extern int dgn_bm_input_event(char* name, int* a, int* b, int* c);
+static DgnVal dgn_input_init_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_input_init()); }
+/* poll(): null when idle, otherwise {type:"key", key, down, shift, ctrl, alt} / {type:"mouse", x, y, left, right, middle} / {type:"wheel", delta} */
+static DgnVal dgn_input_poll_f(DgnVal* a, int n, DgnEnv* e) {
+    (void)a; (void)n; (void)e; char name[24]; int x = 0, y = 0, z = 0;
+    int k = dgn_bm_input_event(name, &x, &y, &z);
+    if (k == 0) return dgn_null();
+    DgnVal m = dgn_map_new();
+    if (k == 1) {
+        dgn_map_set(&m, "type", dgn_str("key")); dgn_map_set(&m, "key", dgn_str(name)); dgn_map_set(&m, "down", dgn_bool(x));
+        dgn_map_set(&m, "shift", dgn_bool(y & 1)); dgn_map_set(&m, "ctrl", dgn_bool(y & 2)); dgn_map_set(&m, "alt", dgn_bool(y & 4));
+    } else if (k == 2) {
+        dgn_map_set(&m, "type", dgn_str("mouse")); dgn_map_set(&m, "x", dgn_int(x)); dgn_map_set(&m, "y", dgn_int(y));
+        dgn_map_set(&m, "left", dgn_bool(z & 1)); dgn_map_set(&m, "right", dgn_bool(z & 2)); dgn_map_set(&m, "middle", dgn_bool(z & 4));
+    } else { dgn_map_set(&m, "type", dgn_str("wheel")); dgn_map_set(&m, "delta", dgn_int(x)); }
+    return m;
+}
+#endif
+
+#if defined(DGN_BAREMETAL) && !defined(DGN_USER)
+/* con: the text console on the framebuffer (everything printed also appears there once con.init() ran) */
+extern int dgn_bm_con_init(void); extern void dgn_bm_con_off(void); extern void dgn_bm_con_clear(void); extern void dgn_bm_con_redraw(void);
+extern void dgn_bm_con_goto(int x, int y); extern void dgn_bm_con_color(uint32_t f, long b); extern void dgn_bm_con_cursor(int on);
+extern int dgn_bm_con_cols(void), dgn_bm_con_rows(void), dgn_bm_con_x(void), dgn_bm_con_y(void);
+extern int dgn_bm_con_fbonly, dgn_bm_con_seronly;
+extern int dgn_bm_cap_begin(void); extern void dgn_bm_cap_end(int i); extern char* dgn_bm_cap_take(int i);
+/* capture() -> slot: from now on what this task prints is collected; read(slot) -> collected text (and empties it); release(slot) */
+static DgnVal dgn_con_capture_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_cap_begin()); }
+static DgnVal dgn_con_read_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); char* t = dgn_bm_cap_take((int)dgn_bm_num(args[ao])); if (!t) return dgn_null(); DgnVal v = dgn_str(t); free(t); return v; }
+static DgnVal dgn_con_release_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao > 0) dgn_bm_cap_end((int)dgn_bm_num(args[ao])); return dgn_null(); }
+static DgnVal dgn_con_init_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; int ok = 1;
+    if (!dgn_bm_fb_ptr || n - ao > 0) ok = dgn_bm_fb_init(n - ao > 0 ? DGN_GN(0) : 800, n - ao > 1 ? DGN_GN(1) : 600);
+    return dgn_bool(ok && dgn_bm_con_init()); }
+static DgnVal dgn_con_off_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; dgn_bm_con_off(); return dgn_null(); }
+static DgnVal dgn_con_clear_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; dgn_bm_con_clear(); return dgn_null(); }
+static DgnVal dgn_con_redraw_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; dgn_bm_con_redraw(); return dgn_null(); }
+static DgnVal dgn_con_goto_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_null(); dgn_bm_con_goto(DGN_GN(0), DGN_GN(1)); return dgn_null(); }
+static DgnVal dgn_con_color_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); dgn_bm_con_color(DGN_GC(0), n - ao > 1 && args[ao + 1].tag != DGN_NULL ? (long)DGN_GC(1) : -1); return dgn_null(); }
+static DgnVal dgn_con_cursor_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_bm_con_cursor(n - ao > 0 && dgn_truthy(args[ao])); return dgn_null(); }
+static DgnVal dgn_con_fbonly_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_bm_con_fbonly = n - ao > 0 && dgn_truthy(args[ao]); return dgn_null(); }
+static DgnVal dgn_con_seronly_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; dgn_bm_con_seronly = n - ao > 0 && dgn_truthy(args[ao]); return dgn_null(); }
+static DgnVal dgn_con_cols_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_con_cols()); }
+static DgnVal dgn_con_rows_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_con_rows()); }
+static DgnVal dgn_con_x_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_con_x()); }
+static DgnVal dgn_con_y_f(DgnVal* a, int n, DgnEnv* e) { (void)a; (void)n; (void)e; return dgn_int(dgn_bm_con_y()); }
+#endif
+
+#if defined(DGN_BAREMETAL) && !defined(DGN_USER)
+/* ---- user processes (x86-64 ring 3; other targets report failure) ---- */
+extern int dgn_proc_create(uint64_t base, uint64_t size);
+extern void dgn_proc_destroy(int pid);
+extern int dgn_proc_alive(int pid);
+extern uint64_t dgn_proc_base(int pid);
+extern uint64_t dgn_proc_size(int pid);
+extern uint64_t dgn_proc_mem(int pid);
+extern int dgn_proc_copy(int pid, uint64_t ua, void* k, uint64_t n, int to_user);
+extern int64_t dgn_proc_strlen(int pid, uint64_t ua, uint64_t max);
+extern int dgn_proc_start(int pid, uint64_t entry, uint64_t sp, uint64_t a0, uint64_t a1);
+extern uint64_t dgn_proc_reg(int pid, int i);
+extern void dgn_proc_set_reg(int pid, int i, uint64_t v);
+extern int dgn_proc_run(int pid);
+extern int dgn_proc_map_shared(int pid, uint64_t va, uint64_t kaddr, uint64_t n);
+extern int dgn_proc_release(int pid, uint64_t va, uint64_t n);
+extern int dgn_proc_set_exec(int pid, uint64_t va, uint64_t n, int on);
+extern int dgn_proc_fork(int pid);
+extern int dgn_proc_clone(int pid);
+extern uint64_t dgn_proc_frames_used(void);
+extern uint64_t dgn_proc_frames_total(void);
+#define DGN_PN(i) dgn_bm_num(args[ao + (i)])
+static DgnVal dgn_proc_create_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_int(-1); return dgn_int(dgn_proc_create((uint64_t)DGN_PN(0), (uint64_t)DGN_PN(1))); }
+static DgnVal dgn_proc_destroy_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); dgn_proc_destroy((int)DGN_PN(0)); return dgn_null(); }
+static DgnVal dgn_proc_alive_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; return dgn_bool(n - ao > 0 && dgn_proc_alive((int)DGN_PN(0))); }
+static DgnVal dgn_proc_base_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; return dgn_int(n - ao > 0 ? (int64_t)dgn_proc_base((int)DGN_PN(0)) : 0); }
+static DgnVal dgn_proc_size_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; return dgn_int(n - ao > 0 ? (int64_t)dgn_proc_size((int)DGN_PN(0)) : 0); }
+static DgnVal dgn_proc_mem_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; return dgn_int(n - ao > 0 ? (int64_t)dgn_proc_mem((int)DGN_PN(0)) : 0); }
+/* copy_in(pid, user_addr, kernel_addr, n): kernel -> process;  copy_out(...): process -> kernel.  false when the range leaves the process's memory */
+static DgnVal dgn_proc_copy_in_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_bool(0);
+    return dgn_bool(dgn_proc_copy((int)DGN_PN(0), (uint64_t)DGN_PN(1), (void*)(uintptr_t)DGN_PN(2), (uint64_t)DGN_PN(3), 1) == 0); }
+static DgnVal dgn_proc_copy_out_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_bool(0);
+    return dgn_bool(dgn_proc_copy((int)DGN_PN(0), (uint64_t)DGN_PN(1), (void*)(uintptr_t)DGN_PN(2), (uint64_t)DGN_PN(3), 0) == 0); }
+/* cstr(pid, user_addr, max): the NUL-terminated string in the process, or null when it is not entirely inside its memory */
+static DgnVal dgn_proc_cstr_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null();
+    int pid = (int)DGN_PN(0); uint64_t ua = (uint64_t)DGN_PN(1); int64_t len = dgn_proc_strlen(pid, ua, (uint64_t)DGN_PN(2));
+    if (len < 0) return dgn_null();
+    char* b = (char*)malloc((size_t)len + 1); if (!b) return dgn_null();
+    dgn_proc_copy(pid, ua, b, (uint64_t)len, 0); b[len] = 0;
+    DgnVal r = dgn_str(b); free(b); return r; }
+static DgnVal dgn_proc_start_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 5) return dgn_bool(0);
+    return dgn_bool(dgn_proc_start((int)DGN_PN(0), (uint64_t)DGN_PN(1), (uint64_t)DGN_PN(2), (uint64_t)DGN_PN(3), (uint64_t)DGN_PN(4)) == 0); }
+static DgnVal dgn_proc_run_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_int(-1); return dgn_int(dgn_proc_run((int)DGN_PN(0))); }
+static DgnVal dgn_proc_reg_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 2) return dgn_int(0); return dgn_int((int64_t)dgn_proc_reg((int)DGN_PN(0), (int)DGN_PN(1))); }
+static DgnVal dgn_proc_set_reg_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_null(); dgn_proc_set_reg((int)dgn_bm_num(args[ao + 0]), (int)dgn_bm_num(args[ao + 1]), (uint64_t)dgn_bm_num(args[ao + 2])); return dgn_null(); }
+static DgnVal dgn_proc_share_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_bool(0);
+    return dgn_bool(dgn_proc_map_shared((int)DGN_PN(0), (uint64_t)DGN_PN(1), (uint64_t)DGN_PN(2), (uint64_t)DGN_PN(3)) == 0); }
+static DgnVal dgn_proc_release_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 3) return dgn_bool(0);
+    return dgn_bool(dgn_proc_release((int)DGN_PN(0), (uint64_t)DGN_PN(1), (uint64_t)DGN_PN(2)) == 0); }
+static DgnVal dgn_proc_exec_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 4) return dgn_bool(0);
+    return dgn_bool(dgn_proc_set_exec((int)DGN_PN(0), (uint64_t)DGN_PN(1), (uint64_t)DGN_PN(2), (int)DGN_PN(3)) == 0); }
+static DgnVal dgn_proc_clone_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_int(-1); return dgn_int(dgn_proc_clone((int)DGN_PN(0))); }
+static DgnVal dgn_proc_fork_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_int(-1); return dgn_int(dgn_proc_fork((int)DGN_PN(0))); }
+static DgnVal dgn_proc_frames_used_f(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int((int64_t)dgn_proc_frames_used()); }
+static DgnVal dgn_proc_frames_total_f(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int((int64_t)dgn_proc_frames_total()); }
+extern int dgn_blob_count(void);
+extern const char* dgn_blob_name(int i);
+extern const void* dgn_blob_addr(int i);
+extern size_t dgn_blob_size(int i);
+static DgnVal dgn_blob_count_f(DgnVal* args, int n, DgnEnv* e) { (void)args; (void)n; (void)e; return dgn_int(dgn_blob_count()); }
+static DgnVal dgn_blob_name_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); const char* s = dgn_blob_name((int)DGN_PN(0)); return s ? dgn_str(s) : dgn_null(); }
+static DgnVal dgn_blob_addr_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); return dgn_int((int64_t)(uintptr_t)dgn_blob_addr((int)DGN_PN(0))); }
+static DgnVal dgn_blob_size_f(DgnVal* args, int n, DgnEnv* e) { (void)e; int ao = DGN_BM_AO; if (n - ao < 1) return dgn_null(); return dgn_int((int64_t)dgn_blob_size((int)DGN_PN(0))); }
+#endif
 
 static DgnVal dgn_load_module(const char* name) {
     DgnVal m=dgn_map_new();
@@ -3139,10 +3922,10 @@ static DgnVal dgn_load_module(const char* name) {
         dgn_map_set(&m,"range",dgn_func(dgn_range_wrap,-1));
     }
     else if(strcmp(name,"file")==0) {
-            dgn_map_set(&m, "read_all",   dgn_func(dgn_file_read_text, 1));    /* engine: read_all */
+            dgn_map_set(&m, "read_all",   dgn_func(dgn_file_read_text, 1));
             dgn_map_set(&m, "read_bytes",  dgn_func(dgn_file_read_bytes, 1));
-            dgn_map_set(&m, "write",      dgn_func(dgn_file_write_text, 2));   /* engine: write */
-            dgn_map_set(&m, "append",     dgn_func(dgn_file_append_text, 2));  /* engine: append */
+            dgn_map_set(&m, "write",      dgn_func(dgn_file_write_text, 2));
+            dgn_map_set(&m, "append",     dgn_func(dgn_file_append_text, 2));
             dgn_map_set(&m, "exists",     dgn_func(dgn_file_exists, 1));
             dgn_map_set(&m, "delete",     dgn_func(dgn_file_delete, 1));
             dgn_map_set(&m, "mkdir",      dgn_func(dgn_file_mkdir, 1));
@@ -3152,7 +3935,6 @@ static DgnVal dgn_load_module(const char* name) {
             dgn_map_set(&m, "is_dir",     dgn_func(dgn_file_is_dir, 1));
         }
         else if(strcmp(name,"os")==0) {
-    /* os.name, os.cwd, os.getenv, os.setenv, os.system, os.listdir, os.chdir */
 dgn_map_set(&m, "name", dgn_func(dgn_os_name_fn, 0));
     dgn_map_set(&m, "cwd",     dgn_func(dgn_os_cwd, 0));
     dgn_map_set(&m, "chdir",   dgn_func(dgn_os_chdir, 1));
@@ -3200,6 +3982,115 @@ else if(strcmp(name, "net") == 0) {
     dgn_map_set(&m, "socket_close",      dgn_func(dgn_net_socket_close,   1));
     dgn_map_set(&m, "start_http_server", dgn_func(dgn_net_start_server,   2));
 }
+#if !defined(DGN_BAREMETAL) || defined(DGN_USER)
+    else if(strcmp(name, "hw") == 0) {
+        dgn_map_set(&m, "peek8",  dgn_func(dgn_hw_peek8, 1));  dgn_map_set(&m, "peek16", dgn_func(dgn_hw_peek16, 1));
+        dgn_map_set(&m, "peek32", dgn_func(dgn_hw_peek32, 1)); dgn_map_set(&m, "peek64", dgn_func(dgn_hw_peek64, 1));
+        dgn_map_set(&m, "poke8",  dgn_func(dgn_hw_poke8, 2));  dgn_map_set(&m, "poke16", dgn_func(dgn_hw_poke16, 2));
+        dgn_map_set(&m, "poke32", dgn_func(dgn_hw_poke32, 2)); dgn_map_set(&m, "poke64", dgn_func(dgn_hw_poke64, 2));
+        dgn_map_set(&m, "alloc", dgn_func(dgn_hw_alloc, -1)); dgn_map_set(&m, "free", dgn_func(dgn_hw_free, 1));
+        dgn_map_set(&m, "memcpy", dgn_func(dgn_hw_memcpy, 3)); dgn_map_set(&m, "memset", dgn_func(dgn_hw_memset, 3)); dgn_map_set(&m, "inflate", dgn_func(dgn_hw_inflate, 4)); dgn_map_set(&m, "png_unfilter", dgn_func(dgn_hw_png_unfilter, 4)); dgn_map_set(&m, "pbkdf2_sha1", dgn_func(dgn_hw_pbkdf2_sha1, 5)); dgn_map_set(&m, "img_info", dgn_func(dgn_hw_img_info, 3)); dgn_map_set(&m, "img_decode", dgn_func(dgn_hw_img_decode, 4)); dgn_map_set(&m, "webp_info", dgn_func(dgn_hw_webp_info, 3)); dgn_map_set(&m, "webp_decode", dgn_func(dgn_hw_webp_decode, 5)); dgn_map_set(&m, "aud_open", dgn_func(dgn_hw_aud_open, 3)); dgn_map_set(&m, "aud_read", dgn_func(dgn_hw_aud_read, 3)); dgn_map_set(&m, "aud_seek", dgn_func(dgn_hw_aud_seek, 2)); dgn_map_set(&m, "aud_close", dgn_func(dgn_hw_aud_close, 1));
+        dgn_map_set(&m, "peek_str", dgn_func(dgn_hw_peek_str, 2)); dgn_map_set(&m, "poke_str", dgn_func(dgn_hw_poke_str, 2));
+    }
+#ifndef DGN_BAREMETAL
+    else if(strcmp(name, "disk") == 0) {
+        dgn_map_set(&m, "size", dgn_func(dgn_disk_size_f, 0)); dgn_map_set(&m, "read", dgn_func(dgn_disk_read_f, 2));
+        dgn_map_set(&m, "write", dgn_func(dgn_disk_write_f, 2));
+        dgn_map_set(&m, "read_to", dgn_func(dgn_disk_read_to_f, 3)); dgn_map_set(&m, "write_from", dgn_func(dgn_disk_write_from_f, 3));
+    }
+#endif
+#endif
+#ifdef DGN_USER
+    else if(strcmp(name, "gfx") == 0) {
+        dgn_map_set(&m, "title", dgn_func(dgn_gfx_title_f, 1));
+        dgn_map_set(&m, "init",   dgn_func(dgn_gfx_init_f, -1)); dgn_map_set(&m, "width",  dgn_func(dgn_gfx_width_f, 0));
+        dgn_map_set(&m, "height", dgn_func(dgn_gfx_height_f, 0)); dgn_map_set(&m, "clear",  dgn_func(dgn_gfx_clear_f, -1));
+        dgn_map_set(&m, "pixel",  dgn_func(dgn_gfx_pixel_f, 3));  dgn_map_set(&m, "get",    dgn_func(dgn_gfx_get_f, 2));
+        dgn_map_set(&m, "rect",   dgn_func(dgn_gfx_rect_f, 5));   dgn_map_set(&m, "box",    dgn_func(dgn_gfx_box_f, 5));
+        dgn_map_set(&m, "line",   dgn_func(dgn_gfx_line_f, 5));   dgn_map_set(&m, "circle", dgn_func(dgn_gfx_circle_f, -1));
+        dgn_map_set(&m, "text",   dgn_func(dgn_gfx_text_f, -1));  dgn_map_set(&m, "scroll", dgn_func(dgn_gfx_scroll_f, -1));
+        dgn_map_set(&m, "buffer", dgn_func(dgn_gfx_buffer_f, 1)); dgn_map_set(&m, "surface", dgn_func(dgn_gfx_surface_f, -1)); dgn_map_set(&m, "present", dgn_func(dgn_gfx_present_f, 0)); dgn_map_set(&m, "blit", dgn_func(dgn_gfx_blit_f, -1)); dgn_map_set(&m, "blit_scaled", dgn_func(dgn_gfx_blit_scaled_f, -1)); dgn_map_set(&m, "jpeg_info", dgn_func(dgn_gfx_jpeg_info_f, -1)); dgn_map_set(&m, "jpeg", dgn_func(dgn_gfx_jpeg_f, -1));
+        dgn_map_set(&m, "blend", dgn_func(dgn_gfx_blend_f, -1)); dgn_map_set(&m, "rrect", dgn_func(dgn_gfx_rrect_f, -1)); dgn_map_set(&m, "gradient", dgn_func(dgn_gfx_gradient_f, -1));
+        dgn_map_set(&m, "glow", dgn_func(dgn_gfx_glow_f, -1)); dgn_map_set(&m, "shadow", dgn_func(dgn_gfx_shadow_f, -1)); dgn_map_set(&m, "blur", dgn_func(dgn_gfx_blur_f, -1)); dgn_map_set(&m, "saturate", dgn_func(dgn_gfx_saturate_f, -1)); dgn_map_set(&m, "gpill", dgn_func(dgn_gfx_gpill_f, -1));
+        dgn_map_set(&m, "scale", dgn_func(dgn_gfx_scale_f, -1)); dgn_map_set(&m, "glass_warm", dgn_func(dgn_gfx_glass_warm_f, -1)); dgn_map_set(&m, "sprite_make", dgn_func(dgn_gfx_sprite_make_f, -1)); dgn_map_set(&m, "resize", dgn_func(dgn_gfx_resize_f, -1)); dgn_map_set(&m, "sprite", dgn_func(dgn_gfx_sprite_f, -1)); dgn_map_set(&m, "clip", dgn_func(dgn_gfx_clip_f, -1)); dgn_map_set(&m, "clip_push", dgn_func(dgn_gfx_clip_push_f, -1)); dgn_map_set(&m, "clip_pop", dgn_func(dgn_gfx_clip_pop_f, 0)); dgn_map_set(&m, "present_rect", dgn_func(dgn_gfx_present_rect_f, -1)); dgn_map_set(&m, "aaline", dgn_func(dgn_gfx_aaline_f, -1)); dgn_map_set(&m, "aaring", dgn_func(dgn_gfx_aaring_f, -1)); dgn_map_set(&m, "aadisc", dgn_func(dgn_gfx_aadisc_f, -1)); dgn_map_set(&m, "devw", dgn_func(dgn_gfx_devw_f, 0)); dgn_map_set(&m, "devh", dgn_func(dgn_gfx_devh_f, 0)); dgn_map_set(&m, "glass", dgn_func(dgn_gfx_glass_f, -1)); dgn_map_set(&m, "rframe", dgn_func(dgn_gfx_rframe_f, -1));
+        dgn_map_set(&m, "ttext", dgn_func(dgn_gfx_ttext_f, -1)); dgn_map_set(&m, "twidth", dgn_func(dgn_gfx_twidth_f, -1)); dgn_map_set(&m, "tmetric", dgn_func(dgn_gfx_tmetric_f, -1)); dgn_map_set(&m, "fontadd", dgn_func(dgn_gfx_fontadd_f, -1));
+    }
+    else if(strcmp(name, "input") == 0) {
+        dgn_map_set(&m, "init", dgn_func(dgn_input_init_f, 0)); dgn_map_set(&m, "poll", dgn_func(dgn_input_poll_f, 0));
+    }
+#endif
+#if defined(DGN_BAREMETAL) && !defined(DGN_USER)
+    else if(strcmp(name, "hw") == 0) {
+        dgn_map_set(&m, "peek8",  dgn_func(dgn_hw_peek8, 1));  dgn_map_set(&m, "peek16", dgn_func(dgn_hw_peek16, 1));
+        dgn_map_set(&m, "peek32", dgn_func(dgn_hw_peek32, 1)); dgn_map_set(&m, "peek64", dgn_func(dgn_hw_peek64, 1));
+        dgn_map_set(&m, "poke8",  dgn_func(dgn_hw_poke8, 2));  dgn_map_set(&m, "poke16", dgn_func(dgn_hw_poke16, 2));
+        dgn_map_set(&m, "poke32", dgn_func(dgn_hw_poke32, 2)); dgn_map_set(&m, "poke64", dgn_func(dgn_hw_poke64, 2));
+        dgn_map_set(&m, "micros", dgn_func(dgn_hw_micros, 0)); dgn_map_set(&m, "smp_init", dgn_func(dgn_hw_smp_init, 0)); dgn_map_set(&m, "smp_count", dgn_func(dgn_hw_smp_count, 0)); dgn_map_set(&m, "smp_parallel", dgn_func(dgn_hw_smp_parallel, 1)); dgn_map_set(&m, "ata_rw", dgn_func(dgn_hw_ata_rw, 4)); dgn_map_set(&m, "ata_probe", dgn_func(dgn_hw_ata_probe, 0)); dgn_map_set(&m, "csum", dgn_func(dgn_hw_csum, 3)); dgn_map_set(&m, "smp_start", dgn_func(dgn_hw_smp_start, 3)); dgn_map_set(&m, "smp_busy", dgn_func(dgn_hw_smp_busy, 1)); dgn_map_set(&m, "smp_result", dgn_func(dgn_hw_smp_result, 1)); dgn_map_set(&m, "millis", dgn_func(dgn_hw_millis, 0)); dgn_map_set(&m, "bootinfo", dgn_func(dgn_hw_bootinfo, 0)); dgn_map_set(&m, "ext", dgn_func(dgn_hw_ext, -1));
+        dgn_map_set(&m, "ticks",  dgn_func(dgn_hw_ticks, 0));  dgn_map_set(&m, "putc",   dgn_func(dgn_hw_putc, 1)); dgn_map_set(&m, "key", dgn_func(dgn_hw_getc_nb, 0));
+        dgn_map_set(&m, "heap_used", dgn_func(dgn_hw_heap_used, 0)); dgn_map_set(&m, "heap_peak", dgn_func(dgn_hw_heap_peak, 0));
+        dgn_map_set(&m, "halt",   dgn_func(dgn_hw_halt, 1)); dgn_map_set(&m, "stack_free", dgn_func(dgn_hw_stack_free, 0));
+        dgn_map_set(&m, "inb", dgn_func(dgn_hw_inb, 1)); dgn_map_set(&m, "inw", dgn_func(dgn_hw_inw, 1)); dgn_map_set(&m, "inl", dgn_func(dgn_hw_inl, 1));
+        dgn_map_set(&m, "ports", dgn_func(dgn_hw_ports_f, 0)); dgn_map_set(&m, "maplimit", dgn_func(dgn_hw_maplimit_f, 0)); dgn_map_set(&m, "insw", dgn_func(dgn_hw_insw, 3)); dgn_map_set(&m, "outsw", dgn_func(dgn_hw_outsw, 3));
+        dgn_map_set(&m, "outb", dgn_func(dgn_hw_outb, 2)); dgn_map_set(&m, "outw", dgn_func(dgn_hw_outw, 2)); dgn_map_set(&m, "outl", dgn_func(dgn_hw_outl, 2));
+        dgn_map_set(&m, "alloc", dgn_func(dgn_hw_alloc, -1)); dgn_map_set(&m, "free", dgn_func(dgn_hw_free, 1));
+        dgn_map_set(&m, "memcpy", dgn_func(dgn_hw_memcpy, 3)); dgn_map_set(&m, "memset", dgn_func(dgn_hw_memset, 3)); dgn_map_set(&m, "inflate", dgn_func(dgn_hw_inflate, 4)); dgn_map_set(&m, "png_unfilter", dgn_func(dgn_hw_png_unfilter, 4)); dgn_map_set(&m, "pbkdf2_sha1", dgn_func(dgn_hw_pbkdf2_sha1, 5)); dgn_map_set(&m, "img_info", dgn_func(dgn_hw_img_info, 3)); dgn_map_set(&m, "img_decode", dgn_func(dgn_hw_img_decode, 4)); dgn_map_set(&m, "webp_info", dgn_func(dgn_hw_webp_info, 3)); dgn_map_set(&m, "webp_decode", dgn_func(dgn_hw_webp_decode, 5)); dgn_map_set(&m, "aud_open", dgn_func(dgn_hw_aud_open, 3)); dgn_map_set(&m, "aud_read", dgn_func(dgn_hw_aud_read, 3)); dgn_map_set(&m, "aud_seek", dgn_func(dgn_hw_aud_seek, 2)); dgn_map_set(&m, "aud_close", dgn_func(dgn_hw_aud_close, 1));
+        dgn_map_set(&m, "peek_str", dgn_func(dgn_hw_peek_str, 2)); dgn_map_set(&m, "poke_str", dgn_func(dgn_hw_poke_str, 2));
+    }
+    else if(strcmp(name, "input") == 0) {
+        dgn_map_set(&m, "init", dgn_func(dgn_input_init_f, 0)); dgn_map_set(&m, "poll", dgn_func(dgn_input_poll_f, 0));
+        dgn_map_set(&m, "cursor", dgn_func(dgn_input_cursor_f, 1)); dgn_map_set(&m, "inject", dgn_func(dgn_input_inject_f, 4));
+    }
+    else if(strcmp(name, "disk") == 0) {
+        dgn_map_set(&m, "size", dgn_func(dgn_disk_size_f, 0)); dgn_map_set(&m, "read", dgn_func(dgn_disk_read_f, 2));
+        dgn_map_set(&m, "write", dgn_func(dgn_disk_write_f, 2));
+        dgn_map_set(&m, "read_to", dgn_func(dgn_disk_read_to_f, 3)); dgn_map_set(&m, "write_from", dgn_func(dgn_disk_write_from_f, 3));
+    }
+    else if(strcmp(name, "proc") == 0) {
+        dgn_map_set(&m, "create", dgn_func(dgn_proc_create_f, 2)); dgn_map_set(&m, "destroy", dgn_func(dgn_proc_destroy_f, 1));
+        dgn_map_set(&m, "alive", dgn_func(dgn_proc_alive_f, 1)); dgn_map_set(&m, "base", dgn_func(dgn_proc_base_f, 1));
+        dgn_map_set(&m, "size", dgn_func(dgn_proc_size_f, 1)); dgn_map_set(&m, "mem", dgn_func(dgn_proc_mem_f, 1));
+        dgn_map_set(&m, "copy_in", dgn_func(dgn_proc_copy_in_f, 4)); dgn_map_set(&m, "copy_out", dgn_func(dgn_proc_copy_out_f, 4));
+        dgn_map_set(&m, "cstr", dgn_func(dgn_proc_cstr_f, 3)); dgn_map_set(&m, "start", dgn_func(dgn_proc_start_f, 5));
+        dgn_map_set(&m, "run", dgn_func(dgn_proc_run_f, 1)); dgn_map_set(&m, "reg", dgn_func(dgn_proc_reg_f, 2));
+        dgn_map_set(&m, "set_reg", dgn_func(dgn_proc_set_reg_f, 3)); dgn_map_set(&m, "share", dgn_func(dgn_proc_share_f, 4));
+        dgn_map_set(&m, "release", dgn_func(dgn_proc_release_f, 3)); dgn_map_set(&m, "set_exec", dgn_func(dgn_proc_exec_f, 4)); dgn_map_set(&m, "fork", dgn_func(dgn_proc_fork_f, 1)); dgn_map_set(&m, "clone", dgn_func(dgn_proc_clone_f, 1));
+        dgn_map_set(&m, "frames_used", dgn_func(dgn_proc_frames_used_f, 0)); dgn_map_set(&m, "frames_total", dgn_func(dgn_proc_frames_total_f, 0));
+    }
+    else if(strcmp(name, "blob") == 0) {
+        dgn_map_set(&m, "count", dgn_func(dgn_blob_count_f, 0)); dgn_map_set(&m, "name", dgn_func(dgn_blob_name_f, 1));
+        dgn_map_set(&m, "addr", dgn_func(dgn_blob_addr_f, 1)); dgn_map_set(&m, "size", dgn_func(dgn_blob_size_f, 1));
+    }
+    else if(strcmp(name, "gfx") == 0) {
+        dgn_map_set(&m, "init",   dgn_func(dgn_gfx_init_f, -1)); dgn_map_set(&m, "width",  dgn_func(dgn_gfx_width_f, 0));
+        dgn_map_set(&m, "height", dgn_func(dgn_gfx_height_f, 0)); dgn_map_set(&m, "clear",  dgn_func(dgn_gfx_clear_f, -1));
+        dgn_map_set(&m, "pixel",  dgn_func(dgn_gfx_pixel_f, 3));  dgn_map_set(&m, "get",    dgn_func(dgn_gfx_get_f, 2));
+        dgn_map_set(&m, "rect",   dgn_func(dgn_gfx_rect_f, 5));   dgn_map_set(&m, "box",    dgn_func(dgn_gfx_box_f, 5));
+        dgn_map_set(&m, "line",   dgn_func(dgn_gfx_line_f, 5));   dgn_map_set(&m, "circle", dgn_func(dgn_gfx_circle_f, -1));
+        dgn_map_set(&m, "text",   dgn_func(dgn_gfx_text_f, -1));  dgn_map_set(&m, "scroll", dgn_func(dgn_gfx_scroll_f, -1));
+        dgn_map_set(&m, "buffer", dgn_func(dgn_gfx_buffer_f, 1)); dgn_map_set(&m, "surface", dgn_func(dgn_gfx_surface_f, -1)); dgn_map_set(&m, "present", dgn_func(dgn_gfx_present_f, 0)); dgn_map_set(&m, "blit", dgn_func(dgn_gfx_blit_f, -1)); dgn_map_set(&m, "blit_scaled", dgn_func(dgn_gfx_blit_scaled_f, -1)); dgn_map_set(&m, "jpeg_info", dgn_func(dgn_gfx_jpeg_info_f, -1)); dgn_map_set(&m, "jpeg", dgn_func(dgn_gfx_jpeg_f, -1));
+        dgn_map_set(&m, "blend", dgn_func(dgn_gfx_blend_f, -1)); dgn_map_set(&m, "rrect", dgn_func(dgn_gfx_rrect_f, -1)); dgn_map_set(&m, "gradient", dgn_func(dgn_gfx_gradient_f, -1));
+        dgn_map_set(&m, "glow", dgn_func(dgn_gfx_glow_f, -1)); dgn_map_set(&m, "shadow", dgn_func(dgn_gfx_shadow_f, -1)); dgn_map_set(&m, "blur", dgn_func(dgn_gfx_blur_f, -1)); dgn_map_set(&m, "saturate", dgn_func(dgn_gfx_saturate_f, -1)); dgn_map_set(&m, "gpill", dgn_func(dgn_gfx_gpill_f, -1));
+        dgn_map_set(&m, "scale", dgn_func(dgn_gfx_scale_f, -1)); dgn_map_set(&m, "glass_warm", dgn_func(dgn_gfx_glass_warm_f, -1)); dgn_map_set(&m, "sprite_make", dgn_func(dgn_gfx_sprite_make_f, -1)); dgn_map_set(&m, "resize", dgn_func(dgn_gfx_resize_f, -1)); dgn_map_set(&m, "sprite", dgn_func(dgn_gfx_sprite_f, -1)); dgn_map_set(&m, "clip", dgn_func(dgn_gfx_clip_f, -1)); dgn_map_set(&m, "clip_push", dgn_func(dgn_gfx_clip_push_f, -1)); dgn_map_set(&m, "clip_pop", dgn_func(dgn_gfx_clip_pop_f, 0)); dgn_map_set(&m, "present_rect", dgn_func(dgn_gfx_present_rect_f, -1)); dgn_map_set(&m, "aaline", dgn_func(dgn_gfx_aaline_f, -1)); dgn_map_set(&m, "aaring", dgn_func(dgn_gfx_aaring_f, -1)); dgn_map_set(&m, "aadisc", dgn_func(dgn_gfx_aadisc_f, -1)); dgn_map_set(&m, "devw", dgn_func(dgn_gfx_devw_f, 0)); dgn_map_set(&m, "devh", dgn_func(dgn_gfx_devh_f, 0)); dgn_map_set(&m, "glass", dgn_func(dgn_gfx_glass_f, -1)); dgn_map_set(&m, "rframe", dgn_func(dgn_gfx_rframe_f, -1));
+        dgn_map_set(&m, "ttext", dgn_func(dgn_gfx_ttext_f, -1)); dgn_map_set(&m, "twidth", dgn_func(dgn_gfx_twidth_f, -1)); dgn_map_set(&m, "tmetric", dgn_func(dgn_gfx_tmetric_f, -1)); dgn_map_set(&m, "fontadd", dgn_func(dgn_gfx_fontadd_f, -1));
+    }
+    else if(strcmp(name, "con") == 0) {
+        dgn_map_set(&m, "init", dgn_func(dgn_con_init_f, -1)); dgn_map_set(&m, "off", dgn_func(dgn_con_off_f, 0));
+        dgn_map_set(&m, "clear", dgn_func(dgn_con_clear_f, 0)); dgn_map_set(&m, "redraw", dgn_func(dgn_con_redraw_f, 0));
+        dgn_map_set(&m, "goto", dgn_func(dgn_con_goto_f, 2)); dgn_map_set(&m, "color", dgn_func(dgn_con_color_f, -1));
+        dgn_map_set(&m, "cursor", dgn_func(dgn_con_cursor_f, 1)); dgn_map_set(&m, "vram", dgn_func(dgn_con_vram_f, 0)); dgn_map_set(&m, "diag", dgn_func(dgn_con_diag_f, 0)); dgn_map_set(&m, "fbonly", dgn_func(dgn_con_fbonly_f, 1)); dgn_map_set(&m, "serialonly", dgn_func(dgn_con_seronly_f, 1));
+        dgn_map_set(&m, "capture", dgn_func(dgn_con_capture_f, 0)); dgn_map_set(&m, "read", dgn_func(dgn_con_read_f, 1)); dgn_map_set(&m, "release", dgn_func(dgn_con_release_f, 1));
+        dgn_map_set(&m, "cols", dgn_func(dgn_con_cols_f, 0)); dgn_map_set(&m, "rows", dgn_func(dgn_con_rows_f, 0));
+        dgn_map_set(&m, "x", dgn_func(dgn_con_x_f, 0)); dgn_map_set(&m, "y", dgn_func(dgn_con_y_f, 0));
+    }
+    else if(strcmp(name, "task") == 0) {
+        dgn_map_set(&m, "spawn",  dgn_func(dgn_task_spawn, -1)); dgn_map_set(&m, "spawn_par", dgn_func(dgn_task_spawn_par, -1)); dgn_map_set(&m, "pause", dgn_func(dgn_task_yield, 0));
+        dgn_map_set(&m, "sleep",  dgn_func(dgn_task_sleep, 1));  dgn_map_set(&m, "id",    dgn_func(dgn_task_id, 0));
+        dgn_map_set(&m, "alive",  dgn_func(dgn_task_alive, 1));  dgn_map_set(&m, "count", dgn_func(dgn_task_count, 0));
+        dgn_map_set(&m, "wait",   dgn_func(dgn_task_wait, 1));   dgn_map_set(&m, "atomic", dgn_func(dgn_task_atomic, 1));
+        dgn_map_set(&m, "mutex",  dgn_func(dgn_task_mutex, 0));  dgn_map_set(&m, "lock",   dgn_func(dgn_task_lock, 1));
+        dgn_map_set(&m, "unlock", dgn_func(dgn_task_unlock, 1)); dgn_map_set(&m, "locked", dgn_func(dgn_task_locked, 2));
+    }
+#endif
     else if(strcmp(name, "mem") == 0) {
         dgn_map_set(&m, "alloc", dgn_func(dgn_mem_alloc, 1));
         dgn_map_set(&m, "addr", dgn_func(dgn_mem_addr, 1));
@@ -3214,14 +4105,13 @@ else if(strcmp(name, "net") == 0) {
     }
 
     else if(strcmp(name, "ffi") == 0) {
-        /* Initialize the signature registry if empty */
         if(_dgn_ffi_sigs.tag == DGN_NULL) _dgn_ffi_sigs = dgn_map_new();
-        
-        dgn_map_set(&m, "loadlib",      dgn_func(dgn_ffi_loadlib,      2));  // this + path
-dgn_map_set(&m, "def",          dgn_func(dgn_ffi_def,          5));  // this + 4 args
-dgn_map_set(&m, "call",         dgn_func(dgn_ffi_call,        -1));  // this + variadic
-dgn_map_set(&m, "symbol_addr",  dgn_func(dgn_ffi_symbol_addr,  3));  // this + 2 args
-dgn_map_set(&m, "loadlib_call", dgn_func(dgn_ffi_loadlib_call, 4));  // this + 3 args
+
+        dgn_map_set(&m, "loadlib",      dgn_func(dgn_ffi_loadlib,      2));
+dgn_map_set(&m, "def",          dgn_func(dgn_ffi_def,          5));
+dgn_map_set(&m, "call",         dgn_func(dgn_ffi_call,        -1));
+dgn_map_set(&m, "symbol_addr",  dgn_func(dgn_ffi_symbol_addr,  3));
+dgn_map_set(&m, "loadlib_call", dgn_func(dgn_ffi_loadlib_call, 4));
     }
 
     else if(strcmp(name, "struct") == 0) {
@@ -3236,14 +4126,6 @@ dgn_map_set(&m, "loadlib_call", dgn_func(dgn_ffi_loadlib_call, 4));  // this + 3
 static DgnVal dgn_binop(const char* op, DgnVal a, DgnVal b) { (void)op;(void)a;(void)b; return dgn_null(); }
 static DgnVal dgn_unary(const char* op, DgnVal a)            { (void)op;(void)a; return dgn_null(); }
 
-/* ── Growable string buffer ──────────────────────────────────────────────
-   Purely additive: used only by the compiler's loop-accumulation
-   optimization (a "s = s + x" pattern inside a loop gets rewritten to
-   append into one of these instead of doing a full malloc+strcpy+strcat+
-   free EVERY iteration via dgn_add's string-concat path -- that's the
-   classic O(n^2) string-building antipattern for n concatenations). Not
-   GC-tracked itself (it's a transient loop-local C value, materialized
-   into a real GC-tracked DgnVal string exactly once, at the end). */
 typedef struct { char* data; size_t len; size_t cap; } DgnStrBuf;
 
 static void dgn_strbuf_init(DgnStrBuf* sb, const char* seed) {
@@ -3279,12 +4161,125 @@ static DgnVal dgn_strbuf_to_dgnval(DgnStrBuf* sb) {
     return v;
 }
 
+static int dgn_is_objlike(DgnVal v){ return v.tag==DGN_MAP||v.tag==DGN_CLASS||v.tag==DGN_INSTANCE; }
+static DgnVal dgn_b_class_name(DgnVal v){
+    if(v.tag==DGN_INSTANCE||v.tag==DGN_CLASS){ DgnVal n=dgn_map_get(v,"__name__"); if(n.tag==DGN_STR) return n; }
+    return dgn_str("");
+}
+static DgnVal dgn_b_is_a(DgnVal obj, DgnVal cls){
+    if(cls.tag!=DGN_CLASS || !(obj.tag==DGN_INSTANCE||obj.tag==DGN_CLASS)) return dgn_bool(0);
+    DgnVal tn=dgn_map_get(cls,"__name__"); if(tn.tag!=DGN_STR) return dgn_bool(0);
+    DgnVal cur=obj; int guard=0;
+    while(dgn_is_objlike(cur) && guard++<64){
+        DgnVal n=dgn_map_get(cur,"__name__");
+        if(n.tag==DGN_STR && strcmp(n.s,tn.s)==0) return dgn_bool(1);
+        cur=dgn_map_get(cur,"__parent__");
+    }
+    return dgn_bool(0);
+}
+static int dgn_map_has_key(DgnVal m,const char* key){
+    if(!dgn_is_objlike(m)) return 0;
+    return dgn_map_find(m.map, key) >= 0;
+}
+static DgnVal dgn_b_has_attr(DgnVal obj, DgnVal name){
+    if(name.tag!=DGN_STR || !dgn_is_objlike(obj)) return dgn_bool(0);
+    DgnVal cur=obj; int guard=0;
+    while(dgn_is_objlike(cur) && guard++<64){
+        if(dgn_map_has_key(cur,name.s)) return dgn_bool(1);
+        cur=dgn_map_get(cur,"__parent__");
+    }
+    return dgn_bool(0);
+}
+static DgnVal dgn_b_set_attr(DgnVal obj, DgnVal name, DgnVal v){
+    if(name.tag==DGN_STR && dgn_is_objlike(obj)) dgn_map_set(&obj,name.s,v);
+    return dgn_null();
+}
+static DgnVal dgn_b_same(DgnVal a, DgnVal b){
+    if(a.tag!=b.tag) return dgn_bool(0);
+    switch(a.tag){
+        case DGN_NULL: return dgn_bool(1);
+        case DGN_BOOL: case DGN_INT: return dgn_bool(a.i==b.i);
+        case DGN_FLOAT: return dgn_bool(a.f==b.f);
+        case DGN_STR: return dgn_bool(strcmp(a.s,b.s)==0);
+        case DGN_LIST: return dgn_bool(a.list==b.list);
+        case DGN_MAP: case DGN_CLASS: case DGN_INSTANCE: return dgn_bool(a.map==b.map);
+        case DGN_FUNC: return dgn_bool(a.func==b.func);
+        default: return dgn_bool(0);
+    }
+}
+static double dgn_num_of(DgnVal v){ return v.tag==DGN_INT? (double)v.i : (v.tag==DGN_FLOAT? v.f : 0.0); }
+static int dgn_is_num(DgnVal v){ return v.tag==DGN_INT||v.tag==DGN_FLOAT; }
+static DgnVal dgn_b_min(DgnVal* a,int n){ int bi=-1; for(int i=0;i<n;i++){ if(!dgn_is_num(a[i])) continue; if(bi<0||dgn_num_of(a[i])<dgn_num_of(a[bi])) bi=i; } return bi<0?dgn_null():a[bi]; }
+static DgnVal dgn_b_max(DgnVal* a,int n){ int bi=-1; for(int i=0;i<n;i++){ if(!dgn_is_num(a[i])) continue; if(bi<0||dgn_num_of(a[i])>dgn_num_of(a[bi])) bi=i; } return bi<0?dgn_null():a[bi]; }
+static DgnVal dgn_b_abs(DgnVal v){ if(v.tag==DGN_INT) return dgn_int(v.i<0?-v.i:v.i); return dgn_float(fabs(dgn_num_of(v))); }
+static DgnVal dgn_b_pow(DgnVal a,DgnVal b){ return dgn_float(pow(dgn_num_of(a),dgn_num_of(b))); }
+static DgnVal dgn_b_sin(DgnVal a){ return dgn_float(sin(dgn_num_of(a))); }
+static DgnVal dgn_b_floor_int(DgnVal a){ return dgn_int((int64_t)floor(dgn_num_of(a))); }
+static DgnVal dgn_b_round_int(DgnVal a){ return dgn_int((int64_t)llround(dgn_num_of(a))); }
+static DgnVal dgn_b_now_ms(void){
+#ifdef _WIN32
+    return dgn_int((int64_t)GetTickCount64());
+#else
+    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); return dgn_int((int64_t)ts.tv_sec*1000+ts.tv_nsec/1000000);
+#endif
+}
+typedef struct { char* d; size_t n, cap; } DgnSb;
+static void dgn_sb_put(DgnSb* b,const char* s,size_t k){ if(b->n+k+1>b->cap){ size_t c=b->cap?b->cap:256; while(c<b->n+k+1) c*=2; b->d=(char*)realloc(b->d,c); b->cap=c; } memcpy(b->d+b->n,s,k); b->n+=k; b->d[b->n]=0; }
+static void dgn_sb_puts(DgnSb* b,const char* s){ dgn_sb_put(b,s,strlen(s)); }
+static void dgn_json_put_str(DgnSb* b,const char* s){
+    dgn_sb_put(b,"\"",1);
+    for(const unsigned char* p=(const unsigned char*)s;*p;p++){
+        switch(*p){
+            case '"': dgn_sb_puts(b,"\\\""); break;
+            case '\\': dgn_sb_puts(b,"\\\\"); break;
+            case '\n': dgn_sb_puts(b,"\\n"); break;
+            case '\r': dgn_sb_puts(b,"\\r"); break;
+            case '\t': dgn_sb_puts(b,"\\t"); break;
+            default:
+                if(*p<0x20){ char u[8]; snprintf(u,sizeof u,"\\u%04x",*p); dgn_sb_puts(b,u); }
+                else dgn_sb_put(b,(const char*)p,1);
+        }
+    }
+    dgn_sb_put(b,"\"",1);
+}
+static void dgn_json_compact_into(DgnSb* b, DgnVal v, int depth){
+    char buf[64];
+    if(depth>200){ dgn_sb_puts(b,"null"); return; }
+    switch(v.tag){
+        case DGN_BOOL: dgn_sb_puts(b, v.i?"true":"false"); break;
+        case DGN_INT: snprintf(buf,sizeof buf,"%lld",(long long)v.i); dgn_sb_puts(b,buf); break;
+        case DGN_FLOAT:
+            if(isfinite(v.f) && v.f==floor(v.f) && fabs(v.f)<9.0e15) snprintf(buf,sizeof buf,"%lld",(long long)v.f);
+            else if(isfinite(v.f)) snprintf(buf,sizeof buf,"%.15g",v.f);
+            else snprintf(buf,sizeof buf,"null");
+            dgn_sb_puts(b,buf); break;
+        case DGN_STR: dgn_json_put_str(b,v.s); break;
+        case DGN_LIST:
+            dgn_sb_put(b,"[",1);
+            for(int i=0;i<v.list->len;i++){ if(i) dgn_sb_put(b,",",1); dgn_json_compact_into(b,v.list->data[i],depth+1); }
+            dgn_sb_put(b,"]",1); break;
+        case DGN_MAP: case DGN_INSTANCE: {
+            int first=1; dgn_sb_put(b,"{",1);
+            for(int i=0;i<v.map->cap;i++){
+                if(!v.map->entries[i].used) continue;
+                if(v.map->entries[i].val.tag==DGN_NULL) continue;
+                if(!first) dgn_sb_put(b,",",1); first=0;
+                dgn_json_put_str(b,v.map->entries[i].key); dgn_sb_put(b,":",1);
+                dgn_json_compact_into(b,v.map->entries[i].val,depth+1);
+            }
+            dgn_sb_put(b,"}",1); break;
+        }
+        default: dgn_sb_puts(b,"null");
+    }
+}
+static DgnVal dgn_b_json_compact(DgnVal v){
+    DgnSb b={0,0,0}; dgn_json_compact_into(&b,v,0);
+    DgnVal r=dgn_str(b.d?b.d:"null"); free(b.d); return r;
+}
+
 static char** _dgn_argv=NULL; static int _dgn_argc=0;
-static void dgn_runtime_init(int argc, char** argv, void* stack_bottom) { 
-    _dgn_argc=argc; _dgn_argv=argv; srand((unsigned)time(NULL)); 
+static void dgn_runtime_init(int argc, char** argv, void* stack_bottom) {
+    _dgn_argc=argc; _dgn_argv=argv; srand((unsigned)time(NULL));
     _dgn_stack_bottom = stack_bottom;
 }
-/* ============================================================
-   End of Dragon Native Runtime
-   ============================================================ */
 "#;

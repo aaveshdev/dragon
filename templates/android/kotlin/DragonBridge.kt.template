@@ -4,20 +4,23 @@ package __DRAGON_PACKAGE__
 class DragonBridge {
     companion object {
         init {
-            System.loadLibrary("applib") // matches -o applib above
+            System.loadLibrary("applib")
         }
     }
 
-    /** Calls the Dragon render() function; returns the current UI tree as JSON. */
     external fun render(): String
 
-    /** Calls the Dragon on_event(evt) handler. Return value is unused (Dragon's on_event returns 0). */
     external fun on_event(evt: String): Long
 
-    /** Tells Dragon where to read/write documents (ui.dgn's doc_path()/
-     *  read_doc()/write_doc()/etc.) -- call once at startup with
-     *  context.filesDir.absolutePath before your first render(). */
     external fun set_storage_dir(path: String): Long
 
     external fun set_asset_dir(path: String): Long
+
+    external fun theme(): String
+
+    external fun http_request_seq(): Long
+    external fun http_request_url(): String
+    external fun http_request_event(): String
+    external fun http_request_method(): String
+    external fun http_request_body(): String
 }

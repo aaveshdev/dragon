@@ -1,0 +1,194 @@
+B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+CRC_TABLE = null
+
+func crcTable() {
+    if (CRC_TABLE != null) { return CRC_TABLE }
+    t = []
+    n = 0
+    while (n < 256) {
+        c = n
+        k = 0
+        while (k < 8) {
+            if ((c & 1) == 1) { c = 3988292384 ^ (c >> 1) } else { c = c >> 1 }
+            k = k + 1
+        }
+        t.push(c)
+        n = n + 1
+    }
+    CRC_TABLE = t
+    return t
+}
+
+func crc32(bytes) {
+    t = crcTable()
+    c = 4294967295
+    for b in bytes { c = t[(c ^ b) & 255] ^ (c >> 8) }
+    return c ^ 4294967295
+}
+
+func adler32(bytes) {
+    a = 1
+    b = 0
+    for x in bytes {
+        a = (a + x) % 65521
+        b = (b + a) % 65521
+    }
+    return (b << 16) | a
+}
+
+func be32(n) { return [(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255] }
+
+func chunk(type, data) {
+    body = []
+    i = 0
+    while (i < 4) {
+        body.push(ord(type.substring(i, i + 1)))
+        i = i + 1
+    }
+    for b in data { body.push(b) }
+    out = be32(len(data))
+    for b in body { out.push(b) }
+    for b in be32(crc32(body)) { out.push(b) }
+    return out
+}
+
+func zlibStored(raw) {
+    out = [120, 1]
+    n = len(raw)
+    pos = 0
+    if (n == 0) { out.push(1); out.push(0); out.push(0); out.push(255); out.push(255) }
+    while (pos < n) {
+        size = n - pos
+        if (size > 65535) { size = 65535 }
+        last = pos + size >= n ? 1 : 0
+        out.push(last)
+        out.push(size & 255)
+        out.push((size >> 8) & 255)
+        out.push((size & 255) ^ 255)
+        out.push(((size >> 8) & 255) ^ 255)
+        i = pos
+        while (i < pos + size) {
+            out.push(raw[i])
+            i = i + 1
+        }
+        pos = pos + size
+    }
+    for b in be32(adler32(raw)) { out.push(b) }
+    return out
+}
+
+func pngFromBits(bits, width, height, stride) {
+    raw = []
+    y = 0
+    while (y < height) {
+        raw.push(0)
+        i = y * stride
+        while (i < (y + 1) * stride) {
+            raw.push(bits[i])
+            i = i + 1
+        }
+        y = y + 1
+    }
+    out = [137, 80, 78, 71, 13, 10, 26, 10]
+    head = be32(width) + be32(height) + [1, 0, 0, 0, 0]
+    for b in chunk("IHDR", head) { out.push(b) }
+    for b in chunk("IDAT", zlibStored(raw)) { out.push(b) }
+    for b in chunk("IEND", []) { out.push(b) }
+    return out
+}
+
+func base64(bytes) {
+    out = []
+    n = len(bytes)
+    i = 0
+    while (i < n) {
+        b0 = bytes[i]
+        b1 = i + 1 < n ? bytes[i + 1] : 0
+        b2 = i + 2 < n ? bytes[i + 2] : 0
+        out.push(B64_CHARS.substring(b0 >> 2, (b0 >> 2) + 1))
+        j = ((b0 & 3) << 4) | (b1 >> 4)
+        out.push(B64_CHARS.substring(j, j + 1))
+        if (i + 1 < n) {
+            j = ((b1 & 15) << 2) | (b2 >> 6)
+            out.push(B64_CHARS.substring(j, j + 1))
+        } else { out.push("=") }
+        if (i + 2 < n) { out.push(B64_CHARS.substring(b2 & 63, (b2 & 63) + 1)) } else { out.push("=") }
+        i = i + 3
+    }
+    return out.join("")
+}
+
+func rasterize(strokes, srcW, srcH, outW, lineW) {
+    if (srcW < 1) { srcW = 1 }
+    k = outW / srcW
+    outH = floor_int(srcH * k)
+    if (outH < 1) { outH = 1 }
+    stride = floor_int((outW + 7) / 8)
+    bits = []
+    total = stride * outH
+    i = 0
+    while (i < total) {
+        bits.push(255)
+        i = i + 1
+    }
+    r = lineW / 2
+    if (r < 0.5) { r = 0.5 }
+    for s in strokes {
+        if (len(s) < 2) { continue }
+        p = 1
+        while (p < len(s)) {
+            x1 = s[p - 1][0] * k
+            y1 = s[p - 1][1] * k
+            x2 = s[p][0] * k
+            y2 = s[p][1] * k
+            dx = x2 - x1
+            dy = y2 - y1
+            ax = dx < 0 ? 0 - dx : dx
+            ay = dy < 0 ? 0 - dy : dy
+            steps = floor_int(ax > ay ? ax : ay) + 1
+            st = 0
+            while (st <= steps) {
+                f = st / steps
+                stamp(bits, stride, outW, outH, x1 + dx * f, y1 + dy * f, r)
+                st = st + 1
+            }
+            p = p + 1
+        }
+    }
+    return {bits: bits, width: outW, height: outH, stride: stride}
+}
+
+func stamp(bits, stride, w, h, cx, cy, r) {
+    y0 = floor_int(cy - r)
+    y1 = floor_int(cy + r)
+    x0 = floor_int(cx - r)
+    x1 = floor_int(cx + r)
+    r2 = r * r
+    y = y0
+    while (y <= y1) {
+        if (y >= 0 and y < h) {
+            x = x0
+            while (x <= x1) {
+                if (x >= 0 and x < w) {
+                    ddx = x + 0.5 - cx
+                    ddy = y + 0.5 - cy
+                    if (ddx * ddx + ddy * ddy <= r2) {
+                        idx = y * stride + (x >> 3)
+                        bits[idx] = bits[idx] & (255 ^ (128 >> (x & 7)))
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+func sketchPngBytes(strokes, srcW, srcH, outW = 800, lineW = 3) {
+    bm = rasterize(strokes, srcW, srcH, outW, lineW)
+    return pngFromBits(bm.bits, bm.width, bm.height, bm.stride)
+}
+
+func sketchPngBase64(strokes, srcW, srcH, outW = 800, lineW = 3) {
+    return base64(sketchPngBytes(strokes, srcW, srcH, outW, lineW))
+}

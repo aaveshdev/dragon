@@ -1,0 +1,36 @@
+import math
+func churn(n) {
+    total = 0
+    i = 0
+    while (i < n) {
+        xs = []
+        j = 0
+        while (j < 20) { xs.push("item" + str(i * j)); j = j + 1 }
+        m = {k: xs, n: i}
+        total = total + len(m.k) + m.n
+        i = i + 1
+    }
+    return total
+}
+func main() {
+    showln("churn " + str(churn(30000)))
+    vals = [0.1, 1.5, 2.0 / 3.0, 100.0, 12345.6789, 1e10, 1.5e-5, 123456789.0, 0.000123, 3.14159265358979]
+    for v in vals { showln("f " + str(v)) }
+    showln("sqrt2 " + str(math.sqrt(2)))
+    showln("pow " + str(math.pow(2, 10)) + " " + str(math.pow(2, 0.5)))
+    showln("sin " + str(math.sin(1.0)) + " cos " + str(math.cos(1.0)))
+    showln("exp " + str(math.exp(1.0)) + " log " + str(math.log(10.0)))
+    showln("floor " + str(math.floor(-2.5)) + " ceil " + str(math.ceil(-2.5)))
+    s = "The quick brown fox"
+    showln(s.upper() + "|" + s.lower() + "|" + str(len(s)))
+    showln(str(s.split(" ")) + " " + str(len(s.split(" "))))
+    words = ["pear", "apple", "fig", "banana"]
+    words.sort()
+    showln(words.join(","))
+    showln(str(10 % 3) + " " + str(7 / 2))
+    big = 1
+    k = 0
+    while (k < 20) { big = big * 3; k = k + 1 }
+    showln("big " + str(big))
+}
+main()

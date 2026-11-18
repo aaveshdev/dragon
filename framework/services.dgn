@@ -1,0 +1,508 @@
+import "json"
+import "file"
+import "dragon/core" as *
+import "dragon/runtime" as *
+import "dragon/widgets" as *
+
+func u_ease(name, t) {
+    x = u_clamp(t, 0.0, 1.0)
+    if (name == null or name == "linear") { return x }
+    if (name == "easeIn") { return x * x * x }
+    if (name == "easeOut") { inv = 1 - x
+        return 1 - inv * inv * inv }
+    if (name == "easeInOut" or name == "fastOutSlowIn") {
+        if (x < 0.5) { return 4 * x * x * x }
+        k = -2 * x + 2
+        return 1 - k * k * k / 2
+    }
+    if (name == "bounceOut") {
+        n1 = 7.5625
+        d1 = 2.75
+        if (x < 1 / d1) { return n1 * x * x }
+        if (x < 2 / d1) { y = x - 1.5 / d1
+            return n1 * y * y + 0.75 }
+        if (x < 2.5 / d1) { y = x - 2.25 / d1
+            return n1 * y * y + 0.9375 }
+        y = x - 2.625 / d1
+        return n1 * y * y + 0.984375
+    }
+    if (name == "bounceIn") { return 1 - u_ease("bounceOut", 1 - x) }
+    if (name == "elasticOut") {
+        if (x <= 0) { return 0.0 }
+        if (x >= 1) { return 1.0 }
+        c4 = 2.0943951023931953
+        return pow(2, -10 * x) * sin((x * 10 - 0.75) * c4) + 1
+    }
+    return x
+}
+
+func u_lerp(a, b, t) {
+    if (typeof(a) == "instance" and class_name(a) == "Color") {
+        return Color.fromARGB(
+            round_int(a.a + (b.a - a.a) * t), round_int(a.r + (b.r - a.r) * t),
+            round_int(a.g + (b.g - a.g) * t), round_int(a.b + (b.b - a.b) * t))
+    }
+    return a + (b - a) * t
+}
+
+class Tween {
+    func init(begin = 0.0, end = 1.0) {
+        this.begin = begin
+        this.end = end
+    }
+    func transform(t) { return u_lerp(this.begin, this.end, t) }
+    func evaluate(animation) { return u_lerp(this.begin, this.end, animation.value) }
+    func animate(animation) { return TweenAnimation(this, animation) }
+}
+class ColorTween extends Tween {
+    func init(begin = null, end = null) { super.init(begin: begin, end: end) }
+}
+class IntTween extends Tween {
+    func init(begin = 0, end = 1) { super.init(begin: begin, end: end) }
+    func transform(t) { return round_int(u_lerp(this.begin, this.end, t)) }
+}
+
+class TweenAnimation {
+    func init(tween, parent) {
+        this.tween = tween
+        this.parent = parent
+    }
+    func addListener(fn) { this.parent.addListener(fn) }
+    func removeListener(fn) { this.parent.removeListener(fn) }
+    func get_value() { return this.tween.transform(this.parent.value) }
+}
+
+class CurvedAnimation {
+    func init(parent, curve = null) {
+        this.parent = parent
+        this.curve = curve
+    }
+    func addListener(fn) { this.parent.addListener(fn) }
+    func removeListener(fn) { this.parent.removeListener(fn) }
+}
+
+func animationValue(a) {
+    cls = class_name(a)
+    if (cls == "TweenAnimation") { return a.tween.transform(animationValue(a.parent)) }
+    if (cls == "CurvedAnimation") { return u_ease(a.curve, animationValue(a.parent)) }
+    return a.value
+}
+
+class Animator extends Notifier {
+    func init(duration = null, vsync = null, lowerBound = 0.0, upperBound = 1.0, value = null) {
+        super.init()
+        this.duration = u_ms(duration == null ? Duration(milliseconds: 300) : duration)
+        this.lowerBound = lowerBound
+        this.upperBound = upperBound
+        this.value = value == null ? lowerBound : value
+        this.status = "dismissed"
+        this.dir = 0
+        this.looping = False
+        this.reverseLoop = False
+        this.last = 0
+        this.target = upperBound
+        this.onDone = null
+        this.attached = False
+    }
+    func attach() {
+        if (not this.attached) {
+            this.attached = True
+            RT.tickers.push(this)
+        }
+    }
+    func detach() {
+        this.attached = False
+        me = this
+        RT.tickers = RT.tickers.filter(func(t) { return not same(t, me) })
+    }
+    func forward(from = null) {
+        if (from != null) { this.value = from }
+        return this.animateTo(this.upperBound)
+    }
+    func reverse(from = null) {
+        if (from != null) { this.value = from }
+        return this.animateTo(this.lowerBound)
+    }
+    func animateTo(target, duration = null) {
+        this.target = target
+        this.looping = False
+        this.last = 0
+        span = this.upperBound - this.lowerBound
+        frac = span == 0 ? 1.0 : abs(target - this.value) / span
+        this.run_ms = u_ms(duration == null ? Duration(milliseconds: this.duration) : duration)
+        this.run_ms = max(1, floor_int(this.run_ms * frac))
+        this.from_v = this.value
+        this.elapsed = 0
+        this.dir = target >= this.value ? 1 : -1
+        this.status = this.dir > 0 ? "forward" : "reverse"
+        this.attach()
+        RT.dirty = True
+    }
+    func repeat(reverse = False, period = null) {
+        this.looping = True
+        this.reverseLoop = reverse
+        this.last = 0
+        this.run_ms = u_ms(period == null ? Duration(milliseconds: this.duration) : period)
+        this.from_v = this.lowerBound
+        this.target = this.upperBound
+        this.elapsed = 0
+        this.dir = 1
+        this.status = "forward"
+        this.attach()
+    }
+    func stop() {
+        this.detach()
+        this.looping = False
+    }
+    func reset() {
+        this.stop()
+        this.value = this.lowerBound
+        this.status = "dismissed"
+        this.notifyListeners()
+    }
+    func isAnimating() { return this.attached }
+    func isCompleted() { return this.status == "completed" }
+    func isDismissed() { return this.status == "dismissed" }
+    func tick(now) {
+        if (this.last == 0) { this.last = now }
+        this.elapsed = this.elapsed + (now - this.last)
+        this.last = now
+        p = u_clamp(this.elapsed / this.run_ms, 0.0, 1.0)
+        this.value = this.from_v + (this.target - this.from_v) * p
+        if (p >= 1.0) {
+            if (this.looping) {
+                if (this.reverseLoop) {
+                    tmp = this.from_v
+                    this.from_v = this.target
+                    this.target = tmp
+                } else {
+                    this.value = this.lowerBound
+                }
+                this.elapsed = 0
+            } else {
+                this.value = this.target
+                this.status = this.dir > 0 ? "completed" : "dismissed"
+                this.detach()
+            }
+        }
+        this.notifyListeners()
+    }
+    func onExit() {
+        this.detach()
+        this.listeners = []
+    }
+}
+
+class AnimBuilder extends View {
+    func init(animation, builder, child = null, key = null) {
+        super.init(key: key)
+        this.animation = animation
+        this.builder = builder
+        this.child = child
+    }
+    func build(context) { return this.builder(context, this.child) }
+}
+
+class TickerProviderStateMixin {
+}
+
+class HttpResponse {
+    func init(m) {
+        this.statusCode = m.status == null ? 0 : m.status
+        this.body = m.body == null ? "" : m.body
+        this.error = m.error
+        this.headers = m.headers == null ? {} : m.headers
+        this.ok = this.error == null and this.statusCode >= 200 and this.statusCode < 300
+    }
+    func json() { return json.decode(this.body) }
+}
+
+HTTP_OPTIONS = {insecure: False}
+
+func u_http(method, url, headers, body, timeoutMs, callback, parts = null) {
+    args = {method: method, url: url, headers: headers == null ? {} : headers, body: body, timeout: timeoutMs}
+    if (parts != null) { args.bodyParts = parts }
+    if (HTTP_OPTIONS.insecure) { args.insecure = True }
+    Platform.invoke("http", args,
+        func(res) {
+            if (res == null) { res = {error: "no response"} }
+            callback(HttpResponse(res))
+        })
+}
+
+class Http {
+    func allowInsecure(on) { HTTP_OPTIONS.insecure = on == True }
+    func get(url, callback, headers = null, timeout = 30000) { u_http("GET", url, headers, null, timeout, callback) }
+    func post(url, callback, body = null, headers = null, timeout = 30000) {
+        b = body
+        if (b != null and typeof(b) != "string") { b = json.encode(b) }
+        u_http("POST", url, headers, b, timeout, callback)
+    }
+    func put(url, callback, body = null, headers = null, timeout = 30000) {
+        b = body
+        if (b != null and typeof(b) != "string") { b = json.encode(b) }
+        u_http("PUT", url, headers, b, timeout, callback)
+    }
+    func delete(url, callback, headers = null, timeout = 30000) { u_http("DELETE", url, headers, null, timeout, callback) }
+
+    func multipart(url, callback, fields, file, headers = null, timeout = 60000) {
+        boundary = "----DragonFormBoundary7MA4YWxkTrZu0gW"
+        parts = []
+        for k in fields.keys() {
+            parts.push({text: "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + k + "\"\r\n\r\n" + str(fields[k]) + "\r\n"})
+        }
+        parts.push({text: "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + (file.field == null ? "file" : file.field) + "\"; filename=\"" + file.name + "\"\r\nContent-Type: " + (file.type == null ? "application/octet-stream" : file.type) + "\r\n\r\n"})
+        parts.push({base64: file.base64})
+        parts.push({text: "\r\n--" + boundary + "--\r\n"})
+        h = {}
+        if (headers != null) { for k in headers.keys() { h[k] = headers[k] } }
+        h["Content-Type"] = "multipart/form-data; boundary=" + boundary
+        u_http("POST", url, h, null, timeout, callback, parts)
+    }
+}
+
+class Prefs {
+    func path() { return RT.docs_dir + "/dragon_prefs.json" }
+    func load() {
+        if (RT.prefs_cache != null) { return RT.prefs_cache }
+        raw = file.read_all(Prefs.path())
+        data = {}
+        if (raw != null and raw != "") {
+            try { data = json.decode(raw) } catch (e) { data = {} }
+        }
+        if (data == null) { data = {} }
+        RT.prefs_cache = data
+        return data
+    }
+    func save() { file.write(Prefs.path(), json.encode(Prefs.load())) }
+    func get(key, fallback = null) {
+        v = Prefs.load()[key]
+        return v == null ? fallback : v
+    }
+    func set(key, value) {
+        Prefs.load()[key] = value
+        Prefs.save()
+    }
+    func remove(key) {
+        Prefs.load().remove(key)
+        Prefs.save()
+    }
+    func contains(key) { return Prefs.load()[key] != null }
+    func keys() { return Prefs.load().keys() }
+    func clear() {
+        RT.prefs_cache = {}
+        Prefs.save()
+    }
+}
+RT.prefs_cache = null
+
+class Clipboard {
+    func setText(text) { Platform.invoke("clipboard.set", {text: text}) }
+    func getText(callback) { Platform.invoke("clipboard.get", {}, func(r) { callback(r == null ? null : r.text) }) }
+}
+class Haptics {
+    func lightImpact() { Platform.invoke("haptic", {kind: "light"}) }
+    func mediumImpact() { Platform.invoke("haptic", {kind: "medium"}) }
+    func heavyImpact() { Platform.invoke("haptic", {kind: "heavy"}) }
+    func selectionClick() { Platform.invoke("haptic", {kind: "selection"}) }
+    func vibrate(ms = 50) { Platform.invoke("vibrate", {ms: ms}) }
+}
+class Toast {
+    func show(message, long = False) { Platform.invoke("toast", {message: message, long: long}) }
+}
+class Links {
+    func launch(url, callback = null) { Platform.invoke("openUrl", {url: url}, callback) }
+}
+class Share {
+    func text(text, subject = null) { Platform.invoke("share", {text: text, subject: subject}) }
+}
+class DeviceInfo {
+    func get(callback) { Platform.invoke("deviceInfo", {}, callback) }
+}
+class Permissions {
+    func request(name, callback) { Platform.invoke("permission.request", {name: name}, func(r) { callback(r != null and r.granted == True) }) }
+    func check(name, callback) { Platform.invoke("permission.check", {name: name}, func(r) { callback(r != null and r.granted == True) }) }
+}
+class Notifications {
+    func show(title, body = "", id = 1) { Platform.invoke("notify", {title: title, body: body, id: id}) }
+    func cancel(id) { Platform.invoke("notify.cancel", {id: id}) }
+}
+class Pickers {
+    func pickFile(callback, mime = "*/*") { Platform.invoke("pickFile", {mime: mime}, callback) }
+    func pickImage(callback) { Platform.invoke("pickFile", {mime: "image/*"}, callback) }
+    func takePhoto(callback) { Platform.invoke("takePhoto", {}, callback) }
+}
+class Location {
+    func current(callback) { Platform.invoke("location", {}, callback) }
+}
+class SystemBars {
+    func setStatusBarColor(color, darkIcons = False) { Platform.invoke("statusBar", {color: u_color(color), darkIcons: darkIcons}) }
+    func setPreferredOrientation(o) { Platform.invoke("orientation", {mode: o}) }
+    func exitApp() { Platform.invoke("exit", {}) }
+}
+
+class Time {
+    func init(hour, minute) {
+        this.hour = hour
+        this.minute = minute
+    }
+    func now() {
+        ms = now_ms()
+        mins = floor_int(ms / 60000) % 1440
+        return Time(floor_int(mins / 60), mins % 60)
+    }
+    func format() {
+        h = str(this.hour)
+        m = str(this.minute)
+        if (len(h) < 2) { h = "0" + h }
+        if (len(m) < 2) { m = "0" + m }
+        return h + ":" + m
+    }
+}
+class DateTime {
+    func init(year, month = 1, day = 1, hour = 0, minute = 0, second = 0) {
+        this.year = year
+        this.month = month
+        this.day = day
+        this.hour = hour
+        this.minute = minute
+        this.second = second
+    }
+    func now() { return DateTime.fromMillis(now_ms()) }
+    func fromMillis(ms) {
+        total = floor_int(ms / 1000)
+        days = floor_int(total / 86400)
+        rest = total - days * 86400
+        z = days + 719468
+        era = floor_int(z / 146097)
+        doe = z - era * 146097
+        yoe = floor_int((doe - floor_int(doe / 1460) + floor_int(doe / 36524) - floor_int(doe / 146096)) / 365)
+        y = yoe + era * 400
+        doy = doe - (365 * yoe + floor_int(yoe / 4) - floor_int(yoe / 100))
+        mp = floor_int((5 * doy + 2) / 153)
+        d = doy - floor_int((153 * mp + 2) / 5) + 1
+        m = mp < 10 ? mp + 3 : mp - 9
+        if (m <= 2) { y = y + 1 }
+        hh = floor_int(rest / 3600)
+        mm = floor_int((rest - hh * 3600) / 60)
+        return DateTime(y, m, d, hh, mm, rest - hh * 3600 - mm * 60)
+    }
+    func daysSinceEpoch() {
+        y = this.month <= 2 ? this.year - 1 : this.year
+        era = floor_int(y / 400)
+        yoe = y - era * 400
+        mi = this.month > 2 ? this.month - 3 : this.month + 9
+        doy = floor_int((153 * mi + 2) / 5) + this.day - 1
+        doe = yoe * 365 + floor_int(yoe / 4) - floor_int(yoe / 100) + doy
+        return era * 146097 + doe - 719468
+    }
+    func toMillis() {
+        return (this.daysSinceEpoch() * 86400 + this.hour * 3600 + this.minute * 60 + this.second) * 1000
+    }
+    func addDays(n) {
+        r = DateTime.fromMillis((this.daysSinceEpoch() + n) * 86400000)
+        r.hour = this.hour
+        r.minute = this.minute
+        r.second = this.second
+        return r
+    }
+    func weekday() {
+        d = this.daysSinceEpoch()
+        w = (d + 3) % 7
+        if (w < 0) { w = w + 7 }
+        return w + 1
+    }
+    func isLeapYear() {
+        y = this.year
+        return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0
+    }
+    func daysInMonth() {
+        m = this.month
+        if (m == 2) { return this.isLeapYear() ? 29 : 28 }
+        if (m == 4 or m == 6 or m == 9 or m == 11) { return 30 }
+        return 31
+    }
+    func isSameDay(other) {
+        return other != null and this.year == other.year and this.month == other.month and this.day == other.day
+    }
+
+    func format(pattern = null) {
+        if (pattern == null) { pattern = "yyyy-MM-dd" }
+        months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        out = []
+        i = 0
+        n = len(pattern)
+        while (i < n) {
+            c = pattern.substring(i, i + 1)
+            j = i
+            while (j < n and pattern.substring(j, j + 1) == c) { j = j + 1 }
+            run = j - i
+            if (c == "y") {
+                y = str(this.year)
+                if (run == 2) { out.push(y.substring(len(y) - 2, len(y))) } else { out.push(y) }
+            } elif (c == "M") {
+                if (run >= 4) { out.push(months[this.month - 1]) }
+                elif (run == 3) { out.push(months[this.month - 1].substring(0, 3)) }
+                else { out.push(run == 2 ? u_pad2(this.month) : str(this.month)) }
+            } elif (c == "d") {
+                out.push(run >= 2 ? u_pad2(this.day) : str(this.day))
+            } elif (c == "H") {
+                out.push(run >= 2 ? u_pad2(this.hour) : str(this.hour))
+            } elif (c == "h") {
+                h12 = this.hour % 12
+                if (h12 == 0) { h12 = 12 }
+                out.push(run >= 2 ? u_pad2(h12) : str(h12))
+            } elif (c == "m") {
+                out.push(run >= 2 ? u_pad2(this.minute) : str(this.minute))
+            } elif (c == "s") {
+                out.push(run >= 2 ? u_pad2(this.second) : str(this.second))
+            } elif (c == "a") {
+                out.push(this.hour < 12 ? "AM" : "PM")
+            } else {
+                k = 0
+                while (k < run) {
+                    out.push(c)
+                    k = k + 1
+                }
+            }
+            i = j
+        }
+        return out.join("")
+    }
+}
+
+func u_pad2(n) {
+    s = str(n)
+    if (len(s) < 2) { s = "0" + s }
+    return s
+}
+
+func showDatePicker(callback, initialDate = null, firstDate = null, lastDate = null) {
+    init = initialDate == null ? "" : initialDate.format()
+    Platform.invoke("datePicker", {initial: init}, func(r) {
+        if (r == null or r.date == null) { callback(null) } else {
+            p = r.date.split("-")
+            callback(DateTime(parse_int(p[0]), parse_int(p[1]), parse_int(p[2])))
+        }
+    })
+}
+func showTimePicker(callback, initialTime = null) {
+    init = initialTime == null ? "" : initialTime.format()
+    Platform.invoke("timePicker", {initial: init}, func(r) {
+        if (r == null or r.time == null) { callback(null) } else {
+            p = r.time.split(":")
+            callback(Time(parse_int(p[0]), parse_int(p[1])))
+        }
+    })
+}
+
+class AppEvents {
+    func addBackHandler(fn) { RT.back_handlers.push(fn) }
+    func removeBackHandler(fn) {
+        RT.back_handlers = RT.back_handlers.filter(func(f) { return not same(f, fn) })
+    }
+    func addObserver(fn) { RT.lifecycle_listeners.push(fn) }
+    func removeObserver(fn) {
+        RT.lifecycle_listeners = RT.lifecycle_listeners.filter(func(f) { return not same(f, fn) })
+    }
+}

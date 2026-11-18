@@ -1,0 +1,1061 @@
+import "dragon/ui" as *
+import "package:dragon_audio" as *
+
+func fmtTime(ms) {
+    if (ms == null or ms < 0) { ms = 0 }
+    s = floor_int(ms / 1000)
+    m = floor_int(s / 60)
+    r = s - m * 60
+    return str(m) + ":" + (r < 10 ? "0" : "") + str(r)
+}
+
+func fmtLong(ms) {
+    s = floor_int(ms / 1000)
+    h = floor_int(s / 3600)
+    m = floor_int((s - h * 3600) / 60)
+    if (h > 0) { return str(h) + " h " + str(m) + " min" }
+    return str(m) + " min"
+}
+
+func hueOf(key) {
+    n = parse_float(str(key))
+    if (n == null) { n = 0 }
+    return (n * 47 + 200) % 360
+}
+
+func plural(n, one, many) {
+    return str(n) + " " + (n == 1 ? one : many)
+}
+
+class ArtCache {
+    func init() {
+        this.paths = {}
+        this.pending = {}
+    }
+}
+ART = ArtCache()
+
+class AlbumArt extends LiveView {
+    func init(albumId, size = 48, radius = 8, big = False, key = null) {
+        super.init(key: key)
+        this.albumId = albumId
+        this.size = size
+        this.radius = radius
+        this.big = big
+    }
+    func createState() { return AlbumArtState() }
+}
+
+class AlbumArtState extends Live {
+    func onInit() { this.request() }
+    func onWidgetChange(old) { this.request() }
+    func cacheKey() { return str(this.widget.albumId) + (this.widget.big ? "_L" : "_S") }
+    func request() {
+        k = this.cacheKey()
+        if (ART.paths[k] != null or ART.pending[k] != null) { return }
+        ART.pending[k] = True
+        MusicLibrary.artwork(this.widget.albumId, this.widget.big ? 640 : 192, func(path) {
+            ART.paths[k] = path == null ? "" : path
+            ART.pending.remove(k)
+            RT.dirty = True
+        })
+    }
+    func build(context) {
+        w = this.widget
+        path = ART.paths[this.cacheKey()]
+        radius = Corners.circular(w.radius)
+        if (path != null and path != "") {
+            return Round(borderRadius: radius, child: Picture.file(path, width: w.size, height: w.size, fit: Fit.cover))
+        }
+        h = hueOf(w.albumId)
+        return Box(width: w.size, height: w.size,
+            decoration: Look(borderRadius: radius, gradient: LinearGradient(
+                colors: [u_hsl(h, 0.55, 0.38), u_hsl(h + 40, 0.60, 0.22)],
+                begin: Alignment.topLeft, end: Alignment.bottomRight)),
+            child: Center(child: Icon(Icons.music_note, size: w.size * 0.42, color: Color(0xB3FFFFFF))))
+    }
+}
+
+class MusicStore {
+    func init() {
+        this.tracks = []
+        this.byId = {}
+        this.albums = []
+        this.artists = []
+        this.favorites = {}
+        this.playlists = []
+        this.recent = []
+        this.sortMode = "title"
+        this.status = "init"
+        this.error = null
+        this.version = Signal(0)
+        this.eq = null
+        this.eqApplied = False
+        this.restored = False
+        this.songCache = null
+        this.libraryVersion = 0
+        this.notifAsked = False
+    }
+
+    func bump() { this.version.setValue(this.version.value + 1) }
+
+    func loadPrefs() {
+        this.favorites = {}
+        for id in Prefs.get("favorites", []) { this.favorites[id] = True }
+        this.playlists = Prefs.get("playlists", [])
+        this.recent = Prefs.get("recent", [])
+        this.sortMode = Prefs.get("sort", "title")
+        this.eq = Prefs.get("eq", null)
+    }
+    func savePlaylists() { Prefs.set("playlists", this.playlists) }
+    func saveFavorites() { Prefs.set("favorites", this.favorites.keys()) }
+
+    func start() {
+        this.loadPrefs()
+        me = this
+        MusicLibrary.hasAccess(func(ok) {
+            if (ok) { me.scan() } else {
+                me.status = "needsPermission"
+                me.bump()
+            }
+        })
+    }
+
+    func requestAccess() {
+        me = this
+        MusicLibrary.requestAccess(func(ok) {
+            if (ok) { me.scan() } else {
+                me.status = "needsPermission"
+                me.error = "Permission denied. Allow access to music and audio in the system settings."
+                me.bump()
+            }
+        })
+    }
+
+    func scan() {
+        me = this
+        this.status = "scanning"
+        this.bump()
+        MusicLibrary.scan(func(tracks, err) {
+            if (err != null and tracks.length == 0) {
+                me.status = err == "permission" ? "needsPermission" : "error"
+                me.error = err
+                me.bump()
+                return
+            }
+            me.setTracks(tracks)
+            me.status = "ready"
+            me.bump()
+            me.restoreLast()
+        })
+    }
+
+    func setTracks(list) {
+        this.byId = {}
+        for t in list {
+            t["key"] = (t.title + " " + t.artist + " " + t.album).lower()
+            t["tkey"] = t.title.lower()
+            t["akey"] = t.artist.lower()
+            this.byId[t.id] = t
+        }
+        this.tracks = list
+        this.libraryVersion = this.libraryVersion + 1
+        albums = {}
+        artists = {}
+        for t in list {
+            a = albums[t.albumId]
+            if (a == null) {
+                a = {id: t.albumId, name: t.album, artist: t.artist, year: t.year, tracks: [], ms: 0, key: t.album.lower()}
+                albums[t.albumId] = a
+            }
+            a.tracks.push(t)
+            a.ms = a.ms + t.durationMs
+            r = artists[t.artist]
+            if (r == null) {
+                r = {name: t.artist, tracks: [], albums: {}, albumId: t.albumId, key: t.artist.lower()}
+                artists[t.artist] = r
+            }
+            r.tracks.push(t)
+            r.albums[t.albumId] = True
+        }
+        this.albums = albums.values()
+        for a in this.albums { a.tracks.sort_by(func(t) { return t.track }) }
+        this.albums.sort_by(func(a) { return a.key + "~" + a.id })
+        this.artists = artists.values()
+        this.artists.sort_by(func(a) { return a.key })
+    }
+
+    func songs(query) {
+        q = query.lower().trim()
+        key = this.sortMode + "|" + q + "|" + str(this.libraryVersion)
+        if (this.songCache != null and this.songCache.key == key) { return this.songCache.list }
+        out = this.tracks
+        if (q != "") { out = out.filter(func(t) { return t.key.contains(q) }) }
+        else { out = out.filter(func(t) { return True }) }
+        m = this.sortMode
+        if (m == "title") { out.sort_by(func(t) { return t.tkey }) }
+        elif (m == "artist") { out.sort_by(func(t) { return t.akey }) }
+        elif (m == "album") { out.sort_by(func(t) { return t.album.lower() }) }
+        elif (m == "recent") { out.sort_by(func(t) { return 0 - t.added }) }
+        elif (m == "duration") { out.sort_by(func(t) { return t.durationMs }) }
+        total = 0
+        for t in out { total = total + t.durationMs }
+        this.songCache = {key: key, list: out, total: total}
+        return out
+    }
+    func songsTotal() { return this.songCache == null ? 0 : this.songCache.total }
+
+    func resolve(ids) {
+        out = []
+        for id in ids {
+            t = this.byId[id]
+            if (t != null) { out.push(t) }
+        }
+        return out
+    }
+
+    func isFavorite(id) { return this.favorites[id] == True }
+    func toggleFavorite(id) {
+        if (this.isFavorite(id)) { this.favorites.remove(id) } else { this.favorites[id] = True }
+        this.saveFavorites()
+        this.bump()
+    }
+    func favoriteTracks() {
+        return this.tracks.filter(func(t) { return STORE.favorites[t.id] == True })
+    }
+
+    func addRecent(id) {
+        r = this.recent.filter(func(x) { return x != id })
+        r.insert(0, id)
+        if (r.length > 60) { r.pop() }
+        this.recent = r
+        Prefs.set("recent", r)
+    }
+
+    func createPlaylist(name) {
+        n = name.trim()
+        if (n == "") { return null }
+        p = {name: n, ids: []}
+        this.playlists.push(p)
+        this.savePlaylists()
+        this.bump()
+        return p
+    }
+    func deletePlaylist(i) {
+        this.playlists.remove_at(i)
+        this.savePlaylists()
+        this.bump()
+    }
+    func addToPlaylist(i, id) {
+        p = this.playlists[i]
+        if (not p.ids.contains(id)) { p.ids.push(id) }
+        this.savePlaylists()
+        this.bump()
+    }
+    func removeFromPlaylist(i, id) {
+        p = this.playlists[i]
+        p.ids = p.ids.filter(func(x) { return x != id })
+        this.savePlaylists()
+        this.bump()
+    }
+
+    func saveLast() {
+        st = AudioPlayer.state.value
+        q = AudioPlayer.queue
+        if (q.length == 0 or st.index < 0) { return }
+        ids = []
+        i = 0
+        while (i < q.length and i < 500) { ids.push(q[i].id); i = i + 1 }
+        Prefs.set("last", {ids: ids, index: st.index, pos: st.positionMs})
+    }
+    func restoreLast() {
+        if (this.restored) { return }
+        this.restored = True
+        last = Prefs.get("last", null)
+        if (last == null or last.ids == null) { return }
+        tracks = this.resolve(last.ids)
+        if (tracks.length == 0) { return }
+        idx = last.index
+        if (idx >= tracks.length) { idx = 0 }
+        AudioPlayer.setQueue(tracks, idx, False)
+        AudioPlayer.seekTo(last.pos == null ? 0 : last.pos)
+        applyEq()
+    }
+}
+STORE = MusicStore()
+
+func applyEq() {
+    if (STORE.eqApplied or STORE.eq == null) { return }
+    STORE.eqApplied = True
+    AudioPlayer.setEqualizer(STORE.eq)
+}
+
+func playTracks(tracks, index) {
+    if (tracks.length == 0) { return }
+    if (not STORE.notifAsked) {
+        STORE.notifAsked = True
+        Permissions.request("notifications", func(granted) { })
+    }
+    AudioPlayer.setQueue(tracks, index, True)
+    STORE.addRecent(tracks[index].id)
+    applyEq()
+}
+
+func shuffleAll(tracks) {
+    if (tracks.length == 0) { return }
+    AudioPlayer.setShuffle(True)
+    playTracks(tracks, floor_int(now_ms()) % tracks.length)
+}
+
+func isCurrent(track) {
+    return AudioPlayer.state.value.mediaId == track.id
+}
+
+class EqBars extends View {
+    func init(color = null, size = 20, key = null) {
+        super.init(key: key)
+        this.color = color
+        this.size = size
+    }
+    func build(context) {
+        return Icon(Icons.graphic_eq, size: this.size, color: this.color)
+    }
+}
+
+class SectionLabel extends View {
+    func init(text, key = null) {
+        super.init(key: key)
+        this.text = text
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Pad(padding: Insets.fromLTRB(16, 18, 16, 6),
+            child: Text(this.text.upper(), style: Font(fontSize: 12, fontWeight: Weight.w700,
+                letterSpacing: 1.2, color: cs.onSurfaceVariant)))
+    }
+}
+
+class EmptyState extends View {
+    func init(icon, title, message = "", action = null, key = null) {
+        super.init(key: key)
+        this.icon = icon
+        this.title = title
+        this.message = message
+        this.action = action
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        kids = [
+            Icon(this.icon, size: 64, color: cs.onSurfaceVariant),
+            Space(height: 16),
+            Text(this.title, style: Font(fontSize: 20, fontWeight: Weight.w600), textAlign: TextAlign.center)
+        ]
+        if (this.message != "") {
+            kids.push(Space(height: 8))
+            kids.push(Text(this.message, style: Font(color: cs.onSurfaceVariant), textAlign: TextAlign.center))
+        }
+        if (this.action != null) {
+            kids.push(Space(height: 24))
+            kids.push(this.action)
+        }
+        return Center(child: Pad(padding: Insets.all(32),
+            child: Col(mainSize: MainSize.min, children: kids)))
+    }
+}
+
+func showTrackMenu(context, t, extraMenu, onExtra) {
+    showSheet(context: context, showDragHandle: True, builder: func(c) {
+        fav = STORE.isFavorite(t.id)
+        items = [
+            Item(leading: AlbumArt(t.albumId, size: 44, radius: 8), title: Text(t.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(t.artist + " · " + t.album, maxLines: 1, overflow: TextOverflow.ellipsis)),
+            Rule(),
+            Item(leading: Icon(Icons.queue_play_next), title: Text("Play next"),
+                onTap: func() { Nav.pop(c); AudioPlayer.addToQueue(t, True); Toast.show("Playing next") }),
+            Item(leading: Icon(Icons.playlist_add), title: Text("Add to queue"),
+                onTap: func() { Nav.pop(c); AudioPlayer.addToQueue(t, False); Toast.show("Added to queue") }),
+            Item(leading: Icon(fav ? Icons.favorite : Icons.favorite_border), title: Text(fav ? "Remove from favourites" : "Add to favourites"),
+                onTap: func() { Nav.pop(c); STORE.toggleFavorite(t.id) }),
+            Item(leading: Icon(Icons.library_add), title: Text("Add to playlist…"),
+                onTap: func() { Nav.pop(c); showPlaylistPicker(context, t) })
+        ]
+        if (extraMenu != null) {
+            items.push(Item(leading: Icon(Icons.delete), title: Text(extraMenu),
+                onTap: func() { Nav.pop(c); if (onExtra != null) { onExtra(t) } }))
+        }
+        return Safe(child: Col(mainSize: MainSize.min, children: items))
+    })
+}
+
+class TrackTile extends View {
+    func init(track, onTap, extraMenu = null, onExtra = null, key = null) {
+        super.init(key: key)
+        this.track = track
+        this.onTap = onTap
+        this.extraMenu = extraMenu
+        this.onExtra = onExtra
+    }
+    func build(context) {
+        t = this.track
+        cs = Theme.of(context).colorScheme
+        playing = isCurrent(t)
+        extraMenu = this.extraMenu
+        onExtra = this.onExtra
+        titleColor = playing ? cs.primary : cs.onSurface
+        return Tap(onTap: this.onTap, child: Space(height: 64, child: Pad(
+            padding: Insets.only(left: 16, right: 4),
+            child: Row(children: [
+                AlbumArt(t.albumId, size: 48, radius: 8),
+                Space(width: 14),
+                Grow(child: Col(mainSize: MainSize.min, main: Main.center, cross: Cross.start, children: [
+                    Text(t.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: Font(fontSize: 16, fontWeight: playing ? Weight.w700 : Weight.w500, color: titleColor)),
+                    Space(height: 2),
+                    Text(t.artist + " · " + t.album, maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: Font(fontSize: 13, color: cs.onSurfaceVariant))
+                ])),
+                playing ? Pad(padding: Insets.only(right: 4), child: EqBars(color: cs.primary)) : Space(width: 0),
+                Text(fmtTime(t.durationMs), style: Font(fontSize: 12, color: cs.onSurfaceVariant)),
+                IconButton(onTap: func() { showTrackMenu(context, t, extraMenu, onExtra) },
+                    icon: Icon(Icons.more_vert, color: cs.onSurfaceVariant))
+            ]))))
+    }
+}
+
+class TrackList extends LiveView {
+    func init(tracks, extraMenu = null, onExtra = null, header = null, key = null) {
+        super.init(key: key)
+        this.tracks = tracks
+        this.extraMenu = extraMenu
+        this.onExtra = onExtra
+        this.header = header
+    }
+    func createState() { return TrackListState() }
+}
+class TrackListState extends Live {
+    func onInit() { this.ctl = ScrollController() }
+    func build(context) {
+        w = this.widget
+        tracks = w.tracks
+        return Feed.builder(itemCount: tracks.length, itemExtent: 64, virtual: True, controller: this.ctl,
+            itemBuilder: func(c, i) {
+                return TrackTile(tracks[i], func() { playTracks(tracks, i) }, extraMenu: w.extraMenu, onExtra: w.onExtra,
+                    key: ValueKey(tracks[i].id))
+            })
+    }
+}
+
+class MiniPlayer extends View {
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return SignalBuilder(valueListenable: AudioPlayer.state, builder: func(c, st, child) {
+            t = AudioPlayer.current()
+            if (t == null) { return Space(height: 0) }
+            frac = st.durationMs > 0 ? st.positionMs / st.durationMs : 0.0
+            if (frac > 1.0) { frac = 1.0 }
+            return Surface(color: cs.surfaceVariant.withOpacity(0.55), child: Col(mainSize: MainSize.min, children: [
+                Tap(onTap: func() { openNowPlaying(context) }, child: Space(height: 64, child: Pad(
+                    padding: Insets.only(left: 12, right: 4),
+                    child: Row(children: [
+                        AlbumArt(t.albumId, size: 44, radius: 8),
+                        Space(width: 12),
+                        Grow(child: Col(mainSize: MainSize.min, main: Main.center, cross: Cross.start, children: [
+                            Text(t.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 15, fontWeight: Weight.w600)),
+                            Text(t.artist, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 12, color: cs.onSurfaceVariant))
+                        ])),
+                        IconButton(onTap: func() { AudioPlayer.previous() }, icon: Icon(Icons.skip_previous)),
+                        IconButton(onTap: func() { AudioPlayer.toggle() },
+                            icon: Icon(st.playing ? Icons.pause : Icons.play_arrow, size: 32)),
+                        IconButton(onTap: func() { AudioPlayer.next() }, icon: Icon(Icons.skip_next))
+                    ])))),
+                ProgressBar(value: frac, minHeight: 2)
+            ]))
+        })
+    }
+}
+
+func openNowPlaying(context) {
+    Nav.push(context, Route(builder: func(c) { return NowPlayingPage() }))
+}
+
+func showNewPlaylistDialog(context, onCreated = null) {
+    ctl = TextController()
+    showDialog(context: context, builder: func(c) {
+        return Alert(title: Text("New playlist"),
+            content: Input(controller: ctl, autofocus: True, decoration: FieldLook(hintText: "Playlist name")),
+            actions: [
+                FlatButton(onTap: func() { Nav.pop(c) }, child: Text("Cancel")),
+                SolidButton(onTap: func() {
+                    p = STORE.createPlaylist(ctl.text)
+                    Nav.pop(c)
+                    if (p != null and onCreated != null) { onCreated(STORE.playlists.length - 1) }
+                }, child: Text("Create"))
+            ])
+    })
+}
+
+func showPlaylistPicker(context, track) {
+    showSheet(context: context, showDragHandle: True, builder: func(c) {
+        items = [
+            Item(leading: Icon(Icons.add), title: Text("New playlist"), onTap: func() {
+                Nav.pop(c)
+                showNewPlaylistDialog(context, func(i) { STORE.addToPlaylist(i, track.id); Toast.show("Added to playlist") })
+            })
+        ]
+        i = 0
+        for p in STORE.playlists {
+            idx = i
+            items.push(Item(leading: Icon(Icons.queue_music), title: Text(p.name),
+                subtitle: Text(plural(p.ids.length, "song", "songs")),
+                onTap: func() {
+                    STORE.addToPlaylist(idx, track.id)
+                    Nav.pop(c)
+                    Toast.show("Added to " + STORE.playlists[idx].name)
+                }))
+            i = i + 1
+        }
+        return Safe(child: Col(mainSize: MainSize.min, children: [
+            Pad(padding: Insets.fromLTRB(16, 0, 16, 8), child: Text("Add to playlist", style: Font(fontSize: 18, fontWeight: Weight.w700))),
+            Feed(shrinkWrap: True, children: items)
+        ]))
+    })
+}
+
+func showChoiceSheet(context, title, options, current, onPick) {
+    showSheet(context: context, showDragHandle: True, builder: func(c) {
+        items = []
+        for o in options {
+            opt = o
+            items.push(Item(title: Text(opt.label), trailing: opt.value == current ? Icon(Icons.check) : null,
+                onTap: func() { Nav.pop(c); onPick(opt.value) }))
+        }
+        return Safe(child: Col(mainSize: MainSize.min, children: [
+            Pad(padding: Insets.fromLTRB(16, 0, 16, 8), child: Text(title, style: Font(fontSize: 18, fontWeight: Weight.w700))),
+            Feed(shrinkWrap: True, children: items)
+        ]))
+    })
+}
+
+class QueueSheet extends LiveView {
+    func createState() { return QueueSheetState() }
+}
+class QueueSheetState extends Live {
+    func onInit() { this.ctl = ScrollController() }
+    func build(context) {
+        me = this
+        cs = Theme.of(context).colorScheme
+        return SignalBuilder(valueListenable: AudioPlayer.state, builder: func(c, st, child) {
+            q = AudioPlayer.queue
+            return Space(height: 520, child: Col(children: [
+                Pad(padding: Insets.fromLTRB(20, 4, 8, 4), child: Row(children: [
+                    Grow(child: Text("Queue · " + plural(q.length, "song", "songs"),
+                        style: Font(fontSize: 18, fontWeight: Weight.w700))),
+                    IconButton(onTap: func() { Nav.pop(context) }, icon: Icon(Icons.close))
+                ])),
+                Grow(child: q.length == 0 ? EmptyState(Icons.queue_music, "Queue is empty") :
+                    Feed.builder(itemCount: q.length, itemExtent: 60, virtual: True, controller: me.ctl,
+                        itemBuilder: func(c2, i) {
+                            t = q[i]
+                            cur = i == st.index
+                            return Tap(onTap: func() { AudioPlayer.skipTo(i) }, child: Space(height: 60, child: Pad(
+                                padding: Insets.only(left: 16, right: 4),
+                                child: Row(children: [
+                                    AlbumArt(t.albumId, size: 40, radius: 6),
+                                    Space(width: 12),
+                                    Grow(child: Col(mainSize: MainSize.min, main: Main.center, cross: Cross.start, children: [
+                                        Text(t.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                            style: Font(fontSize: 15, fontWeight: cur ? Weight.w700 : Weight.w500, color: cur ? cs.primary : cs.onSurface)),
+                                        Text(t.artist, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 12, color: cs.onSurfaceVariant))
+                                    ])),
+                                    cur ? EqBars(color: cs.primary) : Space(width: 0),
+                                    IconButton(onTap: func() { AudioPlayer.removeFromQueue(i) }, icon: Icon(Icons.close, size: 20, color: cs.onSurfaceVariant))
+                                ]))))
+                        }))
+            ]))
+        })
+    }
+}
+
+class EqualizerPage extends LiveView {
+    func createState() { return EqualizerPageState() }
+}
+class EqualizerPageState extends Live {
+    func onInit() {
+        this.info = null
+        me = this
+        AudioPlayer.equalizer(func(r) { me.update(func() { me.info = r }) })
+    }
+    func push(options) {
+        me = this
+        AudioPlayer.setEqualizer(options, func(r) { me.update(func() { me.info = r }) })
+    }
+    func save() {
+        info = this.info
+        if (info == null or not info.available) { return }
+        levels = info.bands.map(func(b) { return b.level })
+        STORE.eq = {enabled: info.enabled, levels: levels, bass: info.bass}
+        Prefs.set("eq", STORE.eq)
+    }
+    func build(context) {
+        me = this
+        cs = Theme.of(context).colorScheme
+        info = this.info
+        body = null
+        if (info == null) { body = Center(child: Spinner()) }
+        elif (not info.available) {
+            body = EmptyState(Icons.equalizer, "Equalizer unavailable", "Start playing a song first, or this device does not provide an equalizer.")
+        } else {
+            rows = [
+                SwitchItem(title: Text("Equalizer"), value: info.enabled, onChange: func(v) { me.push({enabled: v}); me.save() }),
+                Space(height: 12)
+            ]
+            chips = []
+            pi = 0
+            for name in info.presets {
+                idx = pi
+                chips.push(ActionTag(label: Text(name), onTap: func() { me.push({enabled: True, preset: idx}); me.save() }))
+                pi = pi + 1
+            }
+            rows.insert(1, Pad(padding: Insets.symmetric(horizontal: 12), child: Flow(gap: 8, children: chips)))
+            i = 0
+            for b in info.bands {
+                band = i
+                label = b.hz >= 1000 ? str(round_int(b.hz / 100) / 10) + " kHz" : str(round_int(b.hz)) + " Hz"
+                rows.push(Pad(padding: Insets.symmetric(horizontal: 16), child: Row(children: [
+                    Space(width: 70, child: Text(label, style: Font(color: cs.onSurfaceVariant))),
+                    Grow(child: Slider(value: b.level, min: info.minLevel, max: info.maxLevel,
+                        onChange: func(v) { b.level = floor_int(v) },
+                        onChangeEnd: func(v) { me.push({enabled: True, band: band, level: floor_int(v)}); me.save() })),
+                    Space(width: 44, child: Text(str(round_int(b.level / 100)) + " dB", textAlign: TextAlign.right,
+                        style: Font(fontSize: 12, color: cs.onSurfaceVariant)))
+                ])))
+                i = i + 1
+            }
+            if (info.bassSupported) {
+                rows.push(SectionLabel("Bass boost"))
+                rows.push(Pad(padding: Insets.symmetric(horizontal: 16), child: Slider(value: info.bass, min: 0, max: 1000,
+                    onChange: func(v) { info.bass = floor_int(v) },
+                    onChangeEnd: func(v) { me.push({bass: floor_int(v)}); me.save() })))
+            }
+            body = Feed(children: rows)
+        }
+        return Screen(topBar: TopBar(title: Text("Equalizer")), body: body)
+    }
+}
+
+class NowPlayingPage extends LiveView {
+    func createState() { return NowPlayingState() }
+}
+
+class NowPlayingState extends Live {
+    func onInit() { this.drag = null }
+
+    func speedLabel(v) { return (v == 1.0 ? "1" : str(v)) + "×" }
+
+    func build(context) {
+        me = this
+        cs = Theme.of(context).colorScheme
+        return SignalBuilder(valueListenable: AudioPlayer.state, builder: func(c, st, child) {
+            t = AudioPlayer.current()
+            if (t == null) {
+                return Screen(topBar: TopBar(leading: IconButton(onTap: func() { Nav.pop(context) }, icon: Icon(Icons.keyboard_arrow_down))),
+                    body: EmptyState(Icons.music_note, "Nothing playing", "Pick a song from your library."))
+            }
+            h = hueOf(t.albumId)
+            dur = st.durationMs > 0 ? st.durationMs : t.durationMs
+            pos = me.drag != null ? me.drag : st.positionMs
+            if (pos > dur) { pos = dur }
+            fav = STORE.isFavorite(t.id)
+            media = Display.of(context)
+            artSize = media.size.width - 64
+            maxArt = media.size.height - 470
+            if (artSize > maxArt) { artSize = maxArt }
+            if (artSize < 140) { artSize = 140 }
+            small = st.shuffle ? cs.primary : cs.onSurfaceVariant
+            repIcon = st.repeat == "one" ? Icons.repeat_one : Icons.repeat
+            repColor = st.repeat == "off" ? cs.onSurfaceVariant : cs.primary
+            return Screen(
+                backgroundColor: u_hsl(h, 0.45, 0.13),
+                body: Box(
+                    decoration: Look(gradient: LinearGradient(
+                        colors: [u_hsl(h, 0.50, 0.24), u_hsl(h + 30, 0.40, 0.09)], begin: Alignment.topCenter, end: Alignment.bottomCenter)),
+                    child: Safe(child: Col(children: [
+                        Pad(padding: Insets.symmetric(horizontal: 4), child: Row(children: [
+                            IconButton(onTap: func() { Nav.pop(context) }, icon: Icon(Icons.keyboard_arrow_down, size: 32)),
+                            Grow(child: Col(mainSize: MainSize.min, children: [
+                                Text("PLAYING FROM ALBUM", style: Font(fontSize: 10, letterSpacing: 1.4, color: cs.onSurfaceVariant)),
+                                Text(t.album, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 13, fontWeight: Weight.w600))
+                            ])),
+                            IconButton(onTap: func() { showSheet(context: context, isScrollControlled: True, showDragHandle: True,
+                                builder: func(c2) { return QueueSheet() }) }, icon: Icon(Icons.queue_music))
+                        ])),
+                        Grow(child: Center(child: AlbumArt(t.albumId, size: artSize, radius: 20, big: True))),
+                        Pad(padding: Insets.fromLTRB(28, 8, 12, 0), child: Row(children: [
+                            Grow(child: Col(mainSize: MainSize.min, cross: Cross.start, children: [
+                                Text(t.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 24, fontWeight: Weight.w800)),
+                                Space(height: 2),
+                                Text(t.artist, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 16, color: cs.onSurfaceVariant))
+                            ])),
+                            IconButton(onTap: func() { STORE.toggleFavorite(t.id) },
+                                icon: Icon(fav ? Icons.favorite : Icons.favorite_border, color: fav ? Color(0xFFFF5C8A) : cs.onSurface, size: 28))
+                        ])),
+                        Pad(padding: Insets.symmetric(horizontal: 12), child: Slider(
+                            value: dur > 0 ? pos : 0, min: 0, max: dur > 0 ? dur : 1,
+                            onChange: func(v) { me.update(func() { me.drag = floor_int(v) }) },
+                            onChangeEnd: func(v) { AudioPlayer.seekTo(v); me.update(func() { me.drag = null }) })),
+                        Pad(padding: Insets.symmetric(horizontal: 28), child: Row(main: Main.spaceBetween, children: [
+                            Text(fmtTime(pos), style: Font(fontSize: 12, color: cs.onSurfaceVariant)),
+                            Text("-" + fmtTime(dur - pos), style: Font(fontSize: 12, color: cs.onSurfaceVariant))
+                        ])),
+                        Row(main: Main.spaceEvenly, children: [
+                            IconButton(onTap: func() { AudioPlayer.setShuffle(not st.shuffle) }, icon: Icon(Icons.shuffle, color: small)),
+                            IconButton(onTap: func() { AudioPlayer.previous() }, icon: Icon(Icons.skip_previous, size: 40)),
+                            Box(decoration: Look(color: cs.primary, borderRadius: Corners.circular(40)),
+                                child: IconButton(onTap: func() { AudioPlayer.toggle() },
+                                    icon: Icon(st.playing ? Icons.pause : Icons.play_arrow, size: 44, color: cs.onPrimary))),
+                            IconButton(onTap: func() { AudioPlayer.next() }, icon: Icon(Icons.skip_next, size: 40)),
+                            IconButton(onTap: func() {
+                                nxt = st.repeat == "off" ? "all" : (st.repeat == "all" ? "one" : "off")
+                                AudioPlayer.setRepeat(nxt)
+                            }, icon: Icon(repIcon, color: repColor))
+                        ]),
+                        Pad(padding: Insets.fromLTRB(12, 4, 12, 8), child: Row(main: Main.spaceEvenly, children: [
+                            FlatButton(onTap: func() {
+                                showChoiceSheet(context, "Playback speed", [
+                                    {label: "0.75×", value: 0.75}, {label: "1× (normal)", value: 1.0}, {label: "1.25×", value: 1.25},
+                                    {label: "1.5×", value: 1.5}, {label: "2×", value: 2.0}], st.speed, func(v) { AudioPlayer.setSpeed(v) })
+                            }, child: Row(mainSize: MainSize.min, children: [Icon(Icons.speed, size: 20), Space(width: 6), Text(me.speedLabel(st.speed))])),
+                            FlatButton(onTap: func() {
+                                showChoiceSheet(context, "Sleep timer", [
+                                    {label: "Off", value: 0}, {label: "5 minutes", value: 5}, {label: "15 minutes", value: 15},
+                                    {label: "30 minutes", value: 30}, {label: "45 minutes", value: 45}, {label: "1 hour", value: 60}],
+                                    0, func(v) { AudioPlayer.setSleepTimer(v) })
+                            }, child: Row(mainSize: MainSize.min, children: [Icon(Icons.bedtime, size: 20, color: st.sleepLeftMs > 0 ? cs.primary : null),
+                                Space(width: 6), Text(st.sleepLeftMs > 0 ? str(floor_int(st.sleepLeftMs / 60000) + 1) + " min" : "Sleep")])),
+                            FlatButton(onTap: func() {
+                                Nav.push(context, Route(builder: func(c2) { return EqualizerPage() }))
+                            }, child: Row(mainSize: MainSize.min, children: [Icon(Icons.equalizer, size: 20), Space(width: 6), Text("EQ")]))
+                        ]))
+                    ]))))
+        })
+    }
+}
+
+class TracksPage extends View {
+    func init(title, subtitle, tracks, albumId = null, playlistIndex = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.subtitle = subtitle
+        this.tracks = tracks
+        this.albumId = albumId
+        this.playlistIndex = playlistIndex
+    }
+    func build(context) {
+        w = this.widget == null ? this : this.widget
+        cs = Theme.of(context).colorScheme
+        tracks = this.tracks
+        pidx = this.playlistIndex
+        actions = []
+        if (pidx != null) {
+            actions.push(IconButton(icon: Icon(Icons.delete), onTap: func() {
+                STORE.deletePlaylist(pidx)
+                Nav.pop(context)
+            }))
+        }
+        art = this.albumId != null ? AlbumArt(this.albumId, size: 96, radius: 12, big: True) :
+            Box(width: 96, height: 96, alignment: Alignment.center, decoration: Look(color: cs.primaryContainer, borderRadius: Corners.circular(12)),
+                child: Icon(Icons.queue_music, size: 44, color: cs.onPrimaryContainer))
+        header = Pad(padding: Insets.all(16), child: Row(children: [
+            art,
+            Space(width: 16),
+            Grow(child: Col(mainSize: MainSize.min, cross: Cross.start, children: [
+                Text(this.title, maxLines: 2, overflow: TextOverflow.ellipsis, style: Font(fontSize: 20, fontWeight: Weight.w800)),
+                Space(height: 4),
+                Text(this.subtitle, style: Font(color: cs.onSurfaceVariant)),
+                Space(height: 10),
+                Row(children: [
+                    SolidButton(onTap: func() { AudioPlayer.setShuffle(False); playTracks(tracks, 0) },
+                        child: Row(mainSize: MainSize.min, children: [Icon(Icons.play_arrow, size: 20), Space(width: 4), Text("Play")])),
+                    Space(width: 8),
+                    LineButton(onTap: func() { shuffleAll(tracks) },
+                        child: Row(mainSize: MainSize.min, children: [Icon(Icons.shuffle, size: 18), Space(width: 4), Text("Shuffle")]))
+                ])
+            ]))
+        ]))
+        list = tracks.length == 0 ? EmptyState(Icons.music_note, "No songs here yet") :
+            TrackList(tracks, extraMenu: pidx != null ? "Remove from playlist" : null,
+                onExtra: func(t) { if (pidx != null) { STORE.removeFromPlaylist(pidx, t.id) } })
+        return Screen(topBar: TopBar(title: Text(this.title), actions: actions),
+            body: Col(cross: Cross.stretch, children: [header, Grow(child: list), MiniPlayer()]))
+    }
+}
+
+class PlaylistPage extends View {
+    func init(index, key = null) {
+        super.init(key: key)
+        this.index = index
+    }
+    func build(context) {
+        idx = this.index
+        return SignalBuilder(valueListenable: STORE.version, builder: func(c, v, child) {
+            if (idx >= STORE.playlists.length) { return Screen(topBar: TopBar(title: Text("Playlist")), body: Space(height: 0)) }
+            p = STORE.playlists[idx]
+            tracks = STORE.resolve(p.ids)
+            return TracksPage(p.name, plural(tracks.length, "song", "songs"), tracks, playlistIndex: idx)
+        })
+    }
+}
+
+class FavoritesPage extends View {
+    func build(context) {
+        return SignalBuilder(valueListenable: STORE.version, builder: func(c, v, child) {
+            tracks = STORE.favoriteTracks()
+            return TracksPage("Favourites", plural(tracks.length, "song", "songs"), tracks)
+        })
+    }
+}
+
+class RecentPage extends View {
+    func build(context) {
+        tracks = STORE.resolve(STORE.recent)
+        return TracksPage("Recently played", plural(tracks.length, "song", "songs"), tracks)
+    }
+}
+
+class SongsTab extends View {
+    func init(query, onSort, key = null) {
+        super.init(key: key)
+        this.query = query
+        this.onSort = onSort
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        songs = STORE.songs(this.query)
+        onSort = this.onSort
+        if (songs.length == 0) {
+            return EmptyState(Icons.search, this.query != "" ? "No matches" : "No music found",
+                this.query != "" ? "Try a different search." : "Add music files to your device and rescan.")
+        }
+        total = STORE.songsTotal()
+        labels = {title: "Title", artist: "Artist", album: "Album", recent: "Recently added", duration: "Duration"}
+        return Col(children: [
+            Pad(padding: Insets.fromLTRB(16, 4, 4, 0), child: Row(children: [
+                Grow(child: Text(plural(songs.length, "song", "songs") + " · " + fmtLong(total),
+                    style: Font(color: cs.onSurfaceVariant, fontSize: 13))),
+                Menu(
+                    child: Pad(padding: Insets.symmetric(horizontal: 8, vertical: 8), child: Row(mainSize: MainSize.min, children: [
+                        Icon(Icons.sort, size: 18, color: cs.onSurfaceVariant), Space(width: 6),
+                        Text(labels[STORE.sortMode], style: Font(fontSize: 13, color: cs.onSurfaceVariant))])),
+                    itemBuilder: func(c) {
+                        return [MenuItem(value: "title", child: Text("Title")), MenuItem(value: "artist", child: Text("Artist")),
+                            MenuItem(value: "album", child: Text("Album")), MenuItem(value: "recent", child: Text("Recently added")),
+                            MenuItem(value: "duration", child: Text("Duration"))]
+                    },
+                    onSelected: func(v) { onSort(v) }),
+                IconButton(onTap: func() { shuffleAll(songs) }, icon: Icon(Icons.shuffle, color: cs.primary))
+            ])),
+            Grow(child: TrackList(songs))
+        ])
+    }
+}
+
+class AlbumsTab extends LiveView {
+    func init(query, key = null) {
+        super.init(key: key)
+        this.query = query
+    }
+    func createState() { return AlbumsTabState() }
+}
+class AlbumsTabState extends Live {
+    func onInit() { this.ctl = ScrollController() }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        q = this.widget.query.lower().trim()
+        albums = STORE.albums
+        if (q != "") { albums = albums.filter(func(a) { return a.key.contains(q) or a.artist.lower().contains(q) }) }
+        if (albums.length == 0) { return EmptyState(Icons.album, "No albums") }
+        return Feed.builder(itemCount: albums.length, itemExtent: 76, virtual: True, controller: this.ctl, itemBuilder: func(c, i) {
+            a = albums[i]
+            return Tap(onTap: func() {
+                Nav.push(context, Route(builder: func(c2) {
+                    return TracksPage(a.name, a.artist + " · " + plural(a.tracks.length, "song", "songs"), a.tracks, albumId: a.id)
+                }))
+            }, child: Space(height: 76, child: Pad(padding: Insets.symmetric(horizontal: 16), child: Row(children: [
+                AlbumArt(a.id, size: 56, radius: 10),
+                Space(width: 14),
+                Grow(child: Col(mainSize: MainSize.min, main: Main.center, cross: Cross.start, children: [
+                    Text(a.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 16, fontWeight: Weight.w600)),
+                    Text(a.artist + " · " + plural(a.tracks.length, "song", "songs"), maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: Font(fontSize: 13, color: cs.onSurfaceVariant))
+                ])),
+                Icon(Icons.chevron_right, color: cs.onSurfaceVariant)
+            ]))))
+        })
+    }
+}
+
+class ArtistsTab extends LiveView {
+    func init(query, key = null) {
+        super.init(key: key)
+        this.query = query
+    }
+    func createState() { return ArtistsTabState() }
+}
+class ArtistsTabState extends Live {
+    func onInit() { this.ctl = ScrollController() }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        q = this.widget.query.lower().trim()
+        artists = STORE.artists
+        if (q != "") { artists = artists.filter(func(a) { return a.key.contains(q) }) }
+        if (artists.length == 0) { return EmptyState(Icons.person, "No artists") }
+        return Feed.builder(itemCount: artists.length, itemExtent: 72, virtual: True, controller: this.ctl, itemBuilder: func(c, i) {
+            a = artists[i]
+            n = a.albums.keys().length
+            return Tap(onTap: func() {
+                Nav.push(context, Route(builder: func(c2) {
+                    return TracksPage(a.name, plural(n, "album", "albums") + " · " + plural(a.tracks.length, "song", "songs"), a.tracks, albumId: a.albumId)
+                }))
+            }, child: Space(height: 72, child: Pad(padding: Insets.symmetric(horizontal: 16), child: Row(children: [
+                Oval(child: AlbumArt(a.albumId, size: 52, radius: 26)),
+                Space(width: 14),
+                Grow(child: Col(mainSize: MainSize.min, main: Main.center, cross: Cross.start, children: [
+                    Text(a.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: Font(fontSize: 16, fontWeight: Weight.w600)),
+                    Text(plural(n, "album", "albums") + " · " + plural(a.tracks.length, "song", "songs"),
+                        style: Font(fontSize: 13, color: cs.onSurfaceVariant))
+                ])),
+                Icon(Icons.chevron_right, color: cs.onSurfaceVariant)
+            ]))))
+        })
+    }
+}
+
+class LibraryTab extends View {
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        favCount = STORE.favoriteTracks().length
+        items = [
+            Item(leading: Box(width: 48, height: 48, alignment: Alignment.center, decoration: Look(color: Color(0x33FF5C8A), borderRadius: Corners.circular(10)),
+                    child: Icon(Icons.favorite, color: Color(0xFFFF5C8A))),
+                title: Text("Favourites"), subtitle: Text(plural(favCount, "song", "songs")),
+                onTap: func() { Nav.push(context, Route(builder: func(c) { return FavoritesPage() })) }),
+            Item(leading: Box(width: 48, height: 48, alignment: Alignment.center, decoration: Look(color: cs.secondaryContainer, borderRadius: Corners.circular(10)),
+                    child: Icon(Icons.schedule, color: cs.onSecondaryContainer)),
+                title: Text("Recently played"), subtitle: Text(plural(STORE.resolve(STORE.recent).length, "song", "songs")),
+                onTap: func() { Nav.push(context, Route(builder: func(c) { return RecentPage() })) }),
+            SectionLabel("Playlists"),
+            Item(leading: Box(width: 48, height: 48, alignment: Alignment.center, decoration: Look(color: cs.primaryContainer, borderRadius: Corners.circular(10)),
+                    child: Icon(Icons.add, color: cs.onPrimaryContainer)),
+                title: Text("New playlist"), onTap: func() { showNewPlaylistDialog(context) })
+        ]
+        i = 0
+        for p in STORE.playlists {
+            idx = i
+            items.push(Item(leading: Box(width: 48, height: 48, alignment: Alignment.center, decoration: Look(color: cs.surfaceVariant, borderRadius: Corners.circular(10)),
+                    child: Icon(Icons.queue_music, color: cs.onSurfaceVariant)),
+                title: Text(p.name), subtitle: Text(plural(p.ids.length, "song", "songs")),
+                onTap: func() { Nav.push(context, Route(builder: func(c) { return PlaylistPage(idx) })) }))
+            i = i + 1
+        }
+        return Feed(children: items)
+    }
+}
+
+class HomePage extends LiveView {
+    func createState() { return HomeState() }
+}
+
+class HomeState extends Live {
+    func onInit() {
+        this.tab = 0
+        this.searching = False
+        this.query = ""
+        this.search = TextController()
+        me = this
+        STORE.version.addListener(func() { RT.dirty = True })
+        AppEvents.addObserver(func(s) {
+            if (s == "paused" or s == "inactive") { STORE.saveLast() }
+        })
+        AudioPlayer.onTrackChanged = func(st) { STORE.saveLast() }
+        AudioPlayer.start()
+        STORE.start()
+    }
+
+    func setSearch(on) {
+        me = this
+        this.update(func() {
+            me.searching = on
+            if (not on) { me.query = ""; me.search.clear() }
+        })
+    }
+
+    func body(context) {
+        me = this
+        cs = Theme.of(context).colorScheme
+        s = STORE.status
+        if (s == "init" or s == "scanning") {
+            return Center(child: Col(mainSize: MainSize.min, children: [
+                Spinner(), Space(height: 16), Text("Scanning your music…")]))
+        }
+        if (s == "needsPermission") {
+            return EmptyState(Icons.library_music, "Play your music",
+                STORE.error ?? "Dragon Music needs permission to read the audio files on your device.",
+                action: SolidButton(onTap: func() { STORE.requestAccess() }, child: Text("Allow access")))
+        }
+        if (s == "error") {
+            return EmptyState(Icons.error, "Couldn't read your library", str(STORE.error),
+                action: SolidButton(onTap: func() { STORE.scan() }, child: Text("Try again")))
+        }
+        if (STORE.tracks.length == 0) {
+            return EmptyState(Icons.music_note, "No music found", "Copy some songs to your device, then scan again.",
+                action: SolidButton(onTap: func() { STORE.scan() }, child: Text("Rescan")))
+        }
+        if (this.tab == 0) {
+            return SongsTab(this.query, func(m) { STORE.sortMode = m; Prefs.set("sort", m); STORE.bump() })
+        }
+        if (this.tab == 1) { return AlbumsTab(this.query) }
+        if (this.tab == 2) { return ArtistsTab(this.query) }
+        return LibraryTab()
+    }
+
+    func build(context) {
+        me = this
+        titles = ["Songs", "Albums", "Artists", "Library"]
+        searchable = this.tab < 3
+        title = this.searching ?
+            Input(controller: this.search, autofocus: True, decoration: FieldLook(hintText: "Search songs, artists, albums"),
+                onChange: func(v) { me.update(func() { me.query = v }) }) :
+            Text(titles[this.tab], style: Font(fontWeight: Weight.w800, fontSize: 24))
+        actions = []
+        if (searchable and STORE.status == "ready") {
+            actions.push(IconButton(onTap: func() { me.setSearch(not me.searching) }, icon: Icon(this.searching ? Icons.close : Icons.search)))
+        }
+        actions.push(Menu(icon: Icon(Icons.more_vert), itemBuilder: func(c) {
+                return [MenuItem(value: "scan", child: Text("Rescan library")), MenuItem(value: "eq", child: Text("Equalizer"))]
+            },
+            onSelected: func(v) {
+                if (v == "scan") { STORE.scan() }
+                elif (v == "eq") { Nav.push(context, Route(builder: func(c) { return EqualizerPage() })) }
+            }))
+        return Screen(
+            topBar: TopBar(title: title, actions: actions),
+            body: Col(cross: Cross.stretch, children: [Grow(child: this.body(context)), MiniPlayer()]),
+            bottomBar: NavBar(selectedIndex: this.tab,
+                onDestinationSelected: func(i) { me.update(func() { me.tab = i }) },
+                destinations: [
+                    NavItem(icon: Icons.music_note, label: "Songs"),
+                    NavItem(icon: Icons.album, label: "Albums"),
+                    NavItem(icon: Icons.person, label: "Artists"),
+                    NavItem(icon: Icons.library_music, label: "Library")
+                ]))
+    }
+}
+
+func main() {
+    seed = Color(0xFF8B5CF6)
+    runApp(App(title: "Dragon Music", debugShowCheckedModeBanner: False,
+        theme: ThemeSpec(brightness: "light", primarySwatch: seed),
+        darkTheme: ThemeSpec(brightness: "dark", primarySwatch: seed),
+        themeMode: "dark",
+        home: HomePage()))
+}

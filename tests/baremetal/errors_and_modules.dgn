@@ -1,0 +1,38 @@
+import math
+import json
+
+func main() {
+    pairs = [[10, 2], [9, 0], [20, 4]]
+
+    for pair in pairs {
+        a = pair[0]
+        b = pair[1]
+        try {
+            if b == 0 {
+                raise "Cannot divide by zero!"
+            }
+            result = a / b
+            showln(`${a} / ${b} = ${result}`)
+        } catch (err) {
+            showln(`  error dividing ${a} by ${b}: ${err}`)
+        } finally {
+            showln(`  (finished attempt: ${a} / ${b})`)
+        }
+    }
+
+    showln("")
+    showln(`math.sqrt(144) = ${math.sqrt(144)}`)
+    showln(`math.abs(-7) = ${math.abs(-7)}`)
+    showln(`math.floor(9.8) = ${math.floor(9.8)}`)
+    showln(`PI = ${PI}`)
+
+    showln("")
+    profile = { name: "Ember", species: "Dragon", level: 42 }
+    encoded = json.encode(profile)
+    showln(`encoded: ${encoded}`)
+
+    decoded = json.decode(encoded)
+    showln(`decoded.name: ${decoded.name}, decoded.level: ${decoded.level}`)
+}
+
+main()

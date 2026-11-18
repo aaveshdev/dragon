@@ -1,7 +1,5 @@
 import ui;
 
-// lib/main.dgn — your app starts here. Edit this file (and anything else
-// under lib/) to build your app;
 
 tap_count = 0;
 

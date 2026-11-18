@@ -1,0 +1,1 @@
+func af(x) { return x + 1 }

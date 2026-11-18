@@ -2,21 +2,19 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CrossTarget {
-    AndroidArm64,   // arm64-v8a   — required, virtually all modern devices
-    AndroidArmv7,   // armeabi-v7a — older 32-bit devices
-    AndroidX86_64,  // x86_64      — emulator
-    AndroidX86,     // x86         — legacy emulator
-    IosArm64,           // physical device
-    IosArm64Simulator,  // Apple Silicon simulator
-    IosX86_64Simulator, // Intel simulator
+    AndroidArm64,
+    AndroidArmv7,
+    AndroidX86_64,
+    AndroidX86,
+    IosArm64,
+    IosArm64Simulator,
+    IosX86_64Simulator,
+    WindowsX64,
 }
 
 impl CrossTarget {
-    /// Parses a comma-separated `--target` spec, expanding the group
-    /// aliases `android-all`, `ios-all`, and `all`.
     pub fn parse_list(spec: &str) -> Result<Vec<CrossTarget>, String> {
         let mut out = Vec::new();
         for tok in spec.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -43,17 +41,17 @@ impl CrossTarget {
                 "ios-arm64" | "ios-device" | "ios" => out.push(CrossTarget::IosArm64),
                 "ios-arm64-sim" | "ios-sim-arm64" => out.push(CrossTarget::IosArm64Simulator),
                 "ios-x86_64-sim" | "ios-sim-x86_64" => out.push(CrossTarget::IosX86_64Simulator),
+                "windows" | "windows-x64" | "win64" => out.push(CrossTarget::WindowsX64),
                 other => {
                     return Err(format!(
                         "Unknown --target '{}'. Valid values: android-arm64, android-armv7, \
                          android-x86_64, android-x86, android-all, ios-arm64, ios-arm64-sim, \
-                         ios-x86_64-sim, ios-all, all",
+                         ios-x86_64-sim, ios-all, windows-x64, all",
                         other
                     ));
                 }
             }
         }
-        // De-duplicate while preserving order (e.g. "android-all,android-arm64").
         let mut seen = Vec::new();
         for t in out {
             if !seen.contains(&t) {
@@ -61,6 +59,10 @@ impl CrossTarget {
             }
         }
         Ok(seen)
+    }
+
+    pub fn is_windows(self) -> bool {
+        matches!(self, CrossTarget::WindowsX64)
     }
 
     pub fn is_android(self) -> bool {
@@ -74,10 +76,9 @@ impl CrossTarget {
     }
 
     pub fn is_ios(self) -> bool {
-        !self.is_android()
+        !self.is_android() && !self.is_windows()
     }
 
-    /// Directory name Android Studio / Gradle expects under `jniLibs/`.
     pub fn android_abi_dir(self) -> &'static str {
         match self {
             CrossTarget::AndroidArm64 => "arm64-v8a",
@@ -88,8 +89,6 @@ impl CrossTarget {
         }
     }
 
-    /// NDK clang driver name, minus the `<api-level>` infix which is
-    /// inserted by `ndk_clang_path`.
     fn android_triple_prefix(self) -> &'static str {
         match self {
             CrossTarget::AndroidArm64 => "aarch64-linux-android",
@@ -100,8 +99,6 @@ impl CrossTarget {
         }
     }
 
-    /// Apple `-target` triple, e.g. `arm64-apple-ios15.0` or
-    /// `arm64-apple-ios15.0-simulator`.
     pub fn ios_clang_target(self, min_version: &str) -> String {
         match self {
             CrossTarget::IosArm64 => format!("arm64-apple-ios{}", min_version),
@@ -129,9 +126,6 @@ impl CrossTarget {
         }
     }
 
-    /// True for the two simulator slices, which Apple requires to be
-    /// merged into one fat `.a` before packaging into an xcframework
-    /// (an xcframework may only contain one library per platform variant).
     pub fn is_ios_simulator(self) -> bool {
         matches!(
             self,
@@ -148,15 +142,11 @@ impl CrossTarget {
             CrossTarget::IosArm64 => "ios-arm64",
             CrossTarget::IosArm64Simulator => "ios-arm64-sim",
             CrossTarget::IosX86_64Simulator => "ios-x86_64-sim",
+            CrossTarget::WindowsX64 => "windows-x64",
         }
     }
 }
 
-/// Locates the Android NDK's prebuilt LLVM toolchain and returns the path
-/// to the per-ABI `clang` wrapper (e.g. `aarch64-linux-android24-clang`).
-///
-/// Resolution order: `$ANDROID_NDK_HOME`, then `$ANDROID_NDK_ROOT`,
-/// then `$ANDROID_HOME/ndk/<latest>`.
 pub fn ndk_clang_path(target: CrossTarget, api_level: u32) -> Result<PathBuf, String> {
     let ndk_root = env::var("ANDROID_NDK_HOME")
         .or_else(|_| env::var("ANDROID_NDK_ROOT"))
@@ -222,10 +212,6 @@ fn find_latest_ndk_under_sdk() -> Option<PathBuf> {
     versions.pop()
 }
 
-/// Resolves the Apple `clang` driver via `xcrun` and the SDK sysroot path
-/// for the given iOS slice. Building for iOS is only possible from macOS —
-/// this is an Apple SDK/toolchain restriction, not something a `--target`
-/// flag can work around.
 pub fn ios_clang_and_sysroot(target: CrossTarget) -> Result<(PathBuf, PathBuf), String> {
     if !cfg!(target_os = "macos") {
         return Err(format!(

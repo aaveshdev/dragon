@@ -1,0 +1,100 @@
+import "json"
+import "dragon/ui" as *
+
+class MusicLibrary {
+    func requestAccess(callback) { Permissions.request("audio", callback) }
+    func hasAccess(callback) { Permissions.check("audio", callback) }
+    func scan(callback, minDurationMs = 10000) {
+        Platform.invoke("media.query", {minDurationMs: minDurationMs}, func(r) {
+            if (r == null) { callback([], "unavailable") } else { callback(r.tracks == null ? [] : r.tracks, r.error) }
+        })
+    }
+    func artwork(albumId, size, callback) {
+        Platform.invoke("media.art", {albumId: albumId, size: size}, func(r) {
+            callback(r == null ? null : r.path)
+        })
+    }
+}
+
+class AudioPlayer {
+    func idle() {
+        return {active: False, playing: False, buffering: False, ended: False, positionMs: 0, durationMs: 0,
+                index: -1, count: 0, mediaId: "", nextIndex: -1, shuffle: False, repeat: "off", speed: 1.0,
+                sleepLeftMs: 0}
+    }
+    func same_state(a, b) {
+        if (a.playing != b.playing or a.buffering != b.buffering or a.index != b.index or a.count != b.count) { return False }
+        if (a.mediaId != b.mediaId or a.shuffle != b.shuffle or a.repeat != b.repeat or a.speed != b.speed) { return False }
+        if (a.durationMs != b.durationMs or a.active != b.active or a.ended != b.ended) { return False }
+        if ((a.sleepLeftMs > 0) != (b.sleepLeftMs > 0)) { return False }
+        d = a.positionMs - b.positionMs
+        if (d < 0) { d = 0 - d }
+        return d < 400 and a.sleepLeftMs / 60000 == b.sleepLeftMs / 60000
+    }
+    func start(everyMs = 500) {
+        if (AudioPlayer.timer != null) { return }
+        AudioPlayer.timer = Timer.periodic(Duration(milliseconds: everyMs), func() { AudioPlayer.refresh() })
+    }
+    func refresh() {
+        Platform.invoke("audio.state", {}, func(r) {
+            if (r == null) { return }
+            cur = AudioPlayer.state.value
+            if (not AudioPlayer.same_state(cur, r)) {
+                AudioPlayer.state.setValue(r)
+                if (r.mediaId != cur.mediaId and AudioPlayer.onTrackChanged != null) { AudioPlayer.onTrackChanged(r) }
+            }
+        })
+    }
+    func setQueue(tracks, index = 0, play = True) {
+        items = []
+        for t in tracks {
+            items.push({id: t.id, uri: t.uri, title: t.title, artist: t.artist, album: t.album, albumId: t.albumId, durationMs: t.durationMs})
+        }
+        AudioPlayer.queue = tracks
+        AudioPlayer.start()
+        Platform.invoke("audio.setQueue", {items: items, index: index, play: play}, func(r) { AudioPlayer.refresh() })
+    }
+    func play() { Platform.invoke("audio.play", {}); AudioPlayer.refresh() }
+    func pause() { Platform.invoke("audio.pause", {}); AudioPlayer.refresh() }
+    func toggle() { Platform.invoke("audio.toggle", {}); AudioPlayer.refresh() }
+    func next() { Platform.invoke("audio.next", {}); AudioPlayer.refresh() }
+    func previous() { Platform.invoke("audio.previous", {}); AudioPlayer.refresh() }
+    func seekTo(ms) { Platform.invoke("audio.seek", {ms: floor_int(ms)}); AudioPlayer.refresh() }
+    func skipTo(index) { Platform.invoke("audio.skipTo", {index: index}); AudioPlayer.refresh() }
+    func setShuffle(on) { Platform.invoke("audio.shuffle", {on: on}); AudioPlayer.refresh() }
+    func setRepeat(mode) { Platform.invoke("audio.repeat", {mode: mode}); AudioPlayer.refresh() }
+    func setSpeed(value) { Platform.invoke("audio.speed", {value: value}); AudioPlayer.refresh() }
+    func stop() { Platform.invoke("audio.stop", {}); AudioPlayer.queue = []; AudioPlayer.refresh() }
+    func setSleepTimer(minutes) { Platform.invoke("audio.sleep", {minutes: minutes}); AudioPlayer.refresh() }
+    func addToQueue(track, next = False) {
+        AudioPlayer.start()
+        Platform.invoke("audio.queue.add", {item: {id: track.id, uri: track.uri, title: track.title, artist: track.artist,
+                        album: track.album, albumId: track.albumId, durationMs: track.durationMs}, next: next}, func(r) { AudioPlayer.refresh() })
+        st = AudioPlayer.state.value
+        if (next and st.index >= 0 and st.index < AudioPlayer.queue.length) {
+            AudioPlayer.queue.insert(st.index + 1, track)
+        } else { AudioPlayer.queue.push(track) }
+    }
+    func removeFromQueue(index) {
+        Platform.invoke("audio.queue.remove", {index: index}, func(r) { AudioPlayer.refresh() })
+        if (index >= 0 and index < AudioPlayer.queue.length) { AudioPlayer.queue.remove_at(index) }
+    }
+    func moveInQueue(from, to) {
+        Platform.invoke("audio.queue.move", {from: from, to: to}, func(r) { AudioPlayer.refresh() })
+        if (from >= 0 and from < AudioPlayer.queue.length and to >= 0 and to < AudioPlayer.queue.length) {
+            t = AudioPlayer.queue.remove_at(from)
+            AudioPlayer.queue.insert(to, t)
+        }
+    }
+    func current() {
+        st = AudioPlayer.state.value
+        if (st.index < 0 or st.index >= AudioPlayer.queue.length) { return null }
+        return AudioPlayer.queue[st.index]
+    }
+    func equalizer(callback) { Platform.invoke("audio.eq.get", {}, callback) }
+    func setEqualizer(options, callback = null) { Platform.invoke("audio.eq.set", options, callback) }
+}
+AudioPlayer.state = Signal(AudioPlayer.idle())
+AudioPlayer.queue = []
+AudioPlayer.timer = null
+AudioPlayer.onTrackChanged = null

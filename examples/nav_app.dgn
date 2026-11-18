@@ -1,0 +1,149 @@
+import ui;
+
+username = "";
+password = "";
+show_dialog = False;
+show_snackbar = False;
+notif_count = 3;
+selected_tab = 0;
+selected_plan = "Free";
+selected_theme = "Obsidian";
+loading = False;
+
+func on_event(evt: str) {
+    if (evt == "go_login") {
+        nav_push("login");
+    } else if (str_starts_with(evt, "field_user:")) {
+        username = str_after(evt, 11);
+    } else if (str_starts_with(evt, "field_pass:")) {
+        password = str_after(evt, 11);
+    } else if (evt == "do_login") {
+        loading = True;
+        nav_push("home");
+    } else if (evt == "__nav_back__") {
+        nav_pop();
+    } else if (evt == "open_profile") {
+        nav_push("profile");
+    } else if (str_starts_with(evt, "tab:")) {
+        selected_tab = parse_int(str_after(evt, 4));
+    } else if (evt == "show_info") {
+        show_dialog = True;
+    } else if (evt == "confirm_info") {
+        show_dialog = False;
+        show_snackbar = True;
+    } else if (evt == "dismiss_info") {
+        show_dialog = False;
+    } else if (evt == "dismiss_snackbar") {
+        show_snackbar = False;
+    } else if (str_starts_with(evt, "plan:")) {
+        selected_plan = str_after(evt, 5);
+    } else if (str_starts_with(evt, "theme:")) {
+        selected_theme = str_after(evt, 6);
+    }
+    return 0;
+}
+
+func render() {
+    route = nav_route();
+    if (route == "/") {
+        return welcome_screen();
+    } else if (route == "login") {
+        return login_screen();
+    } else if (route == "home") {
+        return home_screen();
+    } else if (route == "profile") {
+        return profile_screen();
+    }
+    return welcome_screen();
+}
+
+func welcome_screen() {
+    return Page(Container(
+        Center(Column([
+            GradientBox(120, 120, "#E8935B", "#4FB0A5", 60),
+            Heading("Dragon Nav Demo"),
+            Caption("Multi-page navigation, transitions and the back stack, all built from Dragon."),
+            WideButton("Get started", "go_login")
+        ])),
+        -1, -1, "#14171F", 0, "", 0, 0
+    ));
+}
+
+func login_screen() {
+    return Page(Column([
+        BackAppBar("Sign in", "__nav_back__"),
+        Padding(Column([
+            IconTextField(username, "Username", "field_user", "person", ""),
+            PasswordField(password, "Password", "field_pass"),
+            WideButton("Continue", "do_login")
+        ]), 20)
+    ]));
+}
+
+func home_screen() {
+    tabs = ["Home", "Search", "Person"];
+    body = Column([]);
+    if (selected_tab == 0) {
+        body = home_feed();
+    } else if (selected_tab == 1) {
+        body = search_tab();
+    } else {
+        body = settings_tab();
+    }
+    return Page(Column([
+        AppBar("Dashboard"),
+        Expanded(Padding(body, 20)),
+        BottomNavigationBar(tabs, selected_tab, "tab")
+    ]));
+}
+
+func home_feed() {
+    return Column([
+        Row([
+            Badge(GestureDetector(Icon("notifications"), "show_info"), notif_count),
+            Spacer(),
+            GestureDetector(Avatar("DG", 40, "#4FB0A5"), "open_profile")
+        ]),
+        Card([
+            Subheading("Welcome back"),
+            Text("Everything below is rendered from one Dragon render() tree."),
+            LinearProgress(0.65)
+        ]),
+        Wrap([
+            SelectableChip("Design", "noop", True),
+            SelectableChip("Native", "noop", False),
+            SelectableChip("Fast", "noop", False)
+        ]),
+        AlertDialog(show_dialog, "Notifications", "You have " + notif_count + " new alerts.", "Got it", "confirm_info", "Later", "dismiss_info"),
+        Snackbar(show_snackbar, "Marked as read", "Undo", "dismiss_snackbar")
+    ]);
+}
+
+func search_tab() {
+    return Column([
+        Subheading("Search"),
+        TextField("", "Search anything", "search_query"),
+        Center(CircularProgress())
+    ]);
+}
+
+func settings_tab() {
+    return Column([
+        Subheading("Plan"),
+        RadioGroup(["Free", "Pro", "Team"], selected_plan, "plan"),
+        Divider(),
+        Subheading("Theme"),
+        DropdownButton(["Obsidian", "Daylight", "Contrast"], selected_theme, "theme")
+    ]);
+}
+
+func profile_screen() {
+    return Page(Column([
+        BackAppBar("Profile", "__nav_back__"),
+        Padding(Center(Column([
+            Avatar("DG", 96, "#E8935B"),
+            Heading(username == "" ? "Guest" : username),
+            OutlinedButton("Log out", "__nav_back__")
+        ])), 20)
+    ]));
+}

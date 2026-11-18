@@ -20,43 +20,48 @@ impl Parser {
     }
 
     fn is_lambda_start(&self) -> bool {
-        if self.current().value != "(" { return false; }
+        if !self.cur_is("(") { return false; }
         let mut i = 1;
         loop {
             let t = self.peek(i);
-            if t.typ == TokenType::Eof || t.typ == TokenType::Newline || t.value == "{" { return false; }
+            if t.typ == TokenType::Eof || t.typ == TokenType::Newline { return false; }
+            if t.typ == TokenType::String { i += 1; continue; }
+            if t.value == "{" { return false; }
             if t.value == ")" {
-                return self.peek(i + 1).value == "=>";
+                return self.peek_is(i + 1, "=>");
             }
-            if t.value == "..." { i += 1; continue; } // skip rest param prefix
+            if t.value == "..." { i += 1; continue; }
             i += 1;
         }
     }
 
-
     fn is_destructuring_assignment(&self) -> bool {
-        let cur = self.current().value.as_str();
-        if cur != "[" && cur != "{" { return false; }
+        if !self.cur_is("[") && !self.cur_is("{") { return false; }
 
         let mut depth = 0;
         let mut i = 0;
         loop {
             let t = self.peek(i);
             if t.typ == TokenType::Eof { return false; }
-            
-            // Track bracket depth
+
+            if t.typ == TokenType::String { i += 1; continue; }
             if t.value == "[" || t.value == "{" || t.value == "(" { depth += 1; }
             else if t.value == "]" || t.value == "}" || t.value == ")" {
                 depth -= 1;
-                // Once we close the outermost bracket, check if the next token is "="
                 if depth == 0 {
-                    return self.peek(i + 1).value == "=";
+                    return self.peek_is(i + 1, "=");
                 }
             }
-            
+
             i += 1;
-            if i > 200 { return false; } // Safety limit for infinite loops
+            if i > 200 { return false; }
         }
+    }
+
+    fn cur_is(&self, s: &str) -> bool { self.peek_is(0, s) }
+    fn peek_is(&self, n: usize, s: &str) -> bool {
+        let t = self.peek(n);
+        t.typ != TokenType::String && t.value == s
     }
 
     fn current(&self) -> &Token {
@@ -72,7 +77,8 @@ impl Parser {
     }
 
     fn match_token(&mut self, s: &str) -> bool {
-        if self.current().value == s {
+
+        if self.current().typ != TokenType::String && self.current().value == s {
             self.advance();
             true
         } else {
@@ -81,7 +87,7 @@ impl Parser {
     }
 
     fn expect(&mut self, s: &str) -> Result<Token, String> {
-        if self.current().value == s || (s == "NAME" && matches!(self.current().typ, TokenType::Name)) {
+        if (self.current().typ != TokenType::String && self.current().value == s) || (s == "NAME" && matches!(self.current().typ, TokenType::Name)) {
             Ok(self.advance())
         } else {
             let friendly_expected = if s == "NAME" { "identifier" } else { s };
@@ -106,7 +112,7 @@ impl Parser {
         let line = self.current().line;
         if self.match_token("{") {
             let mut stmts = Vec::new();
-            while self.current().value != "}" && self.current().typ != TokenType::Eof {
+            while !self.cur_is("}") && self.current().typ != TokenType::Eof {
                 stmts.push(self.parse_stmt()?);
             }
             self.expect("}")?;
@@ -126,22 +132,21 @@ impl Parser {
         }
 
         let line = self.current().line;
-        let cur = self.current().value.clone();
+        let cur = if self.current().typ == TokenType::String { String::new() } else { self.current().value.clone() };
 
         let is_var = cur == "var";
         let is_destruct = self.is_destructuring_assignment();
 
         if is_var || is_destruct {
             if is_var { self.advance(); }
-            // Destructuring: let [a, b, ...rest] = expr  OR  let {x, y} = expr
-            if self.current().value == "[" {
+            if self.cur_is("[") {
                 self.advance();
-                let mut names: Vec<Option<String>> = Vec::new(); // None = skip slot (_)
+                let mut names: Vec<Option<String>> = Vec::new();
                 let mut rest_name: Option<String> = None;
-                while self.current().value != "]" && self.current().typ != TokenType::Eof {
-                    if self.current().value == "," { self.advance(); continue; }
-                    if self.current().value == "..." {
-                        self.advance(); // consume "..."
+                while !self.cur_is("]") && self.current().typ != TokenType::Eof {
+                    if self.cur_is(",") { self.advance(); continue; }
+                    if self.cur_is("...") {
+                        self.advance();
                         rest_name = Some(self.expect("NAME")?.value);
                         break;
                     }
@@ -153,7 +158,6 @@ impl Parser {
                 self.expect("=")?;
                 let rhs = self.parse_expr()?;
                 self.match_end_of_stmt()?;
-                // Build: tmp = rhs; a = tmp[0]; b = tmp[1]; ...rest = tmp.slice(N)
                 let tmp = { self.destruct_counter += 1; format!("__destruct_{}__", self.destruct_counter) };
                 let mut stmts = vec![
                     Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
@@ -174,7 +178,6 @@ impl Parser {
                 }
                 if let Some(rn) = rest_name {
                     let n = names.len();
-                    // rest = tmp.slice(n)
                     stmts.push(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(
                         Box::new(Expr { node: ExprNode::Var(rn), line }),
                         Box::new(Expr { node: ExprNode::Call(
@@ -188,11 +191,11 @@ impl Parser {
                 }
                 return Ok(Stmt { node: StmtNode::Multi(stmts), line });
             }
-            if self.current().value == "{" {
+            if self.cur_is("{") {
                 self.advance();
-                let mut bindings: Vec<(String, String)> = Vec::new(); // (key, local_name)
-                while self.current().value != "}" && self.current().typ != TokenType::Eof {
-                    if self.current().value == "," { self.advance(); continue; }
+                let mut bindings: Vec<(String, String)> = Vec::new();
+                while !self.cur_is("}") && self.current().typ != TokenType::Eof {
+                    if self.cur_is(",") { self.advance(); continue; }
                     let key = self.expect("NAME")?.value;
                     let local = if self.match_token(":") {
                         self.expect("NAME")?.value
@@ -224,7 +227,6 @@ impl Parser {
                 }
                 return Ok(Stmt { node: StmtNode::Multi(stmts), line });
             }
-            // Plain `let name = expr`
             if is_var {
                 let name = self.expect("NAME")?.value;
                 self.expect("=")?;
@@ -235,32 +237,31 @@ impl Parser {
                     Box::new(val),
                 ), line }), line });
             }
-        } // End of var block
+        }
 
         if cur == "augment" {
             self.advance();
             let target_type = self.expect("NAME")?.value;
             self.expect("{")?;
             let mut methods = Vec::new();
-            while self.current().value != "}" && self.current().typ != TokenType::Eof {
-                methods.push(self.parse_func(false)?); 
+            while !self.cur_is("}") && self.current().typ != TokenType::Eof {
+                methods.push(self.parse_func(false)?);
             }
             self.expect("}")?;
             return Ok(Stmt { node: StmtNode::Augment(target_type, methods), line });
         }
 
         if cur == "const" { return self.parse_const(); }
-        // if cur == "var" { self.advance(); } 
-        if cur == "async" { 
-            self.advance(); 
-            return self.parse_func(true); // ADD THIS BLOCK
+        if cur == "async" {
+            self.advance();
+            return self.parse_func(true);
         }
         if cur == "func" { return self.parse_func(false); }
         if cur == "class" { return self.parse_class(); }
         if cur == "return" {
             self.advance();
             let mut val = None;
-            if self.current().value != ";" && self.current().value != "}" && self.current().typ != TokenType::Newline {
+            if !self.cur_is(";") && !self.cur_is("}") && self.current().typ != TokenType::Newline {
                 val = Some(self.parse_expr()?);
             }
             self.match_end_of_stmt()?;
@@ -275,13 +276,13 @@ impl Parser {
         if cur == "continue" { self.advance(); self.match_end_of_stmt()?; return Ok(Stmt { node: StmtNode::Continue, line }); }
         if cur == "import" { return self.parse_import(); }
         if cur == "do" { return self.parse_dowhile(); }
-        if cur == "raise" { 
-            self.advance(); 
-            let e = self.parse_expr()?; 
-            self.match_end_of_stmt()?; 
-            return Ok(Stmt { node: StmtNode::Raise(e), line }); 
+        if cur == "raise" {
+            self.advance();
+            let e = self.parse_expr()?;
+            self.match_end_of_stmt()?;
+            return Ok(Stmt { node: StmtNode::Raise(e), line });
         }
-        
+
         if cur == "{" {
             if self.is_object_literal() {
                 let e = self.parse_expr()?;
@@ -292,8 +293,8 @@ impl Parser {
         }
 
         let expr = self.parse_expr()?;
-        if self.current().value == "=" {
-             self.advance(); 
+        if self.cur_is("=") {
+             self.advance();
              let rhs = self.parse_expr()?;
              self.match_end_of_stmt()?;
              return Ok(Stmt { node: StmtNode::Expr(Expr { node: ExprNode::Assign(Box::new(expr), Box::new(rhs)), line }), line });
@@ -301,11 +302,10 @@ impl Parser {
 
         let current_val = self.current().value.clone();
         if matches!(current_val.as_str(), "+=" | "-=" | "*=" | "/=" | "%=") {
-            let op = &current_val[..1]; // "+", "-", "*", "/", "%"
+            let op = &current_val[..1];
             self.advance();
             let rhs = self.parse_expr()?;
             self.match_end_of_stmt()?;
-            // Desugar:  target OP= rhs  →  target = target OP rhs
             let bin = Expr {
                 node: ExprNode::Binary(op.to_string(), Box::new(expr.clone()), Box::new(rhs)),
                 line,
@@ -324,8 +324,8 @@ impl Parser {
         if self.match_token(";") {
             return Ok(());
         }
-        
-        if self.current().typ == TokenType::Newline || self.current().typ == TokenType::Eof || self.current().value == "}" {
+
+        if self.current().typ == TokenType::Newline || self.current().typ == TokenType::Eof || self.cur_is("}") {
             return Ok(());
         }
         Ok(())
@@ -344,7 +344,7 @@ impl Parser {
             }
             else if t.value == ":" && depth == 0 { return true; }
             i += 1;
-            if i > 50 { return false; } 
+            if i > 50 { return false; }
         }
     }
 
@@ -369,10 +369,10 @@ impl Parser {
         let mut params = Vec::new();
         let mut default_inits = Vec::new();
         let mut req_params = 0;
-        
-        if self.current().value != ")" {
+
+        if !self.cur_is(")") {
             loop {
-                if self.current().value == "..." {
+                if self.cur_is("...") {
                     self.advance();
                     let rest_name = self.expect("NAME")?.value;
                     params.push((format!("...{}", rest_name), None));
@@ -386,7 +386,7 @@ impl Parser {
                     p_type = Some(self.expect("NAME")?.value);
                 }
                 params.push((p_name.clone(), p_type));
-                
+
                 if self.match_token("=") {
                     let def_expr = self.parse_expr()?;
                     let p_var = Expr { node: ExprNode::Var(p_name.clone()), line };
@@ -399,7 +399,7 @@ impl Parser {
                     }
                     req_params += 1;
                 }
-                
+
                 if !self.match_token(",") { break; }
             }
         }
@@ -414,20 +414,19 @@ impl Parser {
             }
         }
 
-        // FIX: Added req_params here!
         Ok(Stmt { node: StmtNode::FuncDef(name, params, req_params, Box::new(body), is_async), line })
     }
 
     fn parse_bitwise(&mut self) -> Result<Expr, String> {
-    let mut node = self.parse_add()?; 
+    let mut node = self.parse_add()?;
     while self.current().typ == TokenType::Op {
         let op = self.current().value.clone();
         if ["<<", ">>", "&", "|", "^"].contains(&op.as_str()) {
             self.advance();
             let rhs = self.parse_add()?;
-            node = Expr { 
-                node: ExprNode::Binary(op, Box::new(node.clone()), Box::new(rhs)), 
-                line: node.line 
+            node = Expr {
+                node: ExprNode::Binary(op, Box::new(node.clone()), Box::new(rhs)),
+                line: node.line
             };
             continue;
         }
@@ -455,14 +454,13 @@ impl Parser {
         let cond = self.parse_expr()?;
         if has_paren { self.expect(")")?; }
         let body = self.parse_block()?;
-        
+
         let mut chain = vec![(Some(cond), body)];
-        
 
         while self.current().typ == TokenType::Newline {
             self.advance();
         }
-        
+
         while self.match_token("elif") {
             let p = self.match_token("(");
             let c = self.parse_expr()?;
@@ -508,7 +506,7 @@ impl Parser {
         if self.match_token("(") {
             self.match_token("var");
             if matches!(self.current().typ, TokenType::Name)
-                && (self.peek(1).value == "in" || self.peek(1).value == ",")
+                && (self.peek_is(1, "in") || self.peek_is(1, ","))
             {
                 let name = self.advance().value;
                 let value_var = if self.match_token(",") {
@@ -522,9 +520,9 @@ impl Parser {
                 return Ok(Stmt { node: StmtNode::For(name, value_var, iter, Box::new(body)), line });
             }
             let mut init = None;
-            if self.current().value != ";" {
+            if !self.cur_is(";") {
                 let ex = self.parse_expr()?;
-                if self.current().value == "=" {
+                if self.cur_is("=") {
                     self.advance();
                     let rhs = self.parse_expr()?;
                     init = Some(Expr { node: ExprNode::Assign(Box::new(ex.clone()), Box::new(rhs)), line: ex.line });
@@ -534,12 +532,12 @@ impl Parser {
             }
             self.expect(";")?;
             let mut cond = None;
-            if self.current().value != ";" { cond = Some(self.parse_expr()?); }
+            if !self.cur_is(";") { cond = Some(self.parse_expr()?); }
             self.expect(";")?;
             let mut step = None;
-            if self.current().value != ")" {
+            if !self.cur_is(")") {
                  let ex = self.parse_expr()?;
-                 if self.current().value == "=" {
+                 if self.cur_is("=") {
                     self.advance();
                     let rhs = self.parse_expr()?;
                     step = Some(Expr { node: ExprNode::Assign(Box::new(ex.clone()), Box::new(rhs)), line: ex.line });
@@ -568,13 +566,18 @@ impl Parser {
         let line = self.current().line;
         self.expect("import")?;
         let path = if self.current().typ == TokenType::String {
-            self.advance().value 
+            self.advance().value
         } else {
             self.expect("NAME")?.value
         };
         let mut as_name = None;
         if self.match_token("as") {
-            as_name = Some(self.expect("NAME")?.value);
+            if self.cur_is("*") {
+                self.advance();
+                as_name = Some("*".to_string());
+            } else {
+                as_name = Some(self.expect("NAME")?.value);
+            }
         }
         self.match_end_of_stmt()?;
         Ok(Stmt { node: StmtNode::Import(path, as_name), line })
@@ -608,7 +611,7 @@ impl Parser {
         self.expect("{")?;
         let mut cases = Vec::new();
         let mut default = None;
-        while self.current().value != "}" && self.current().typ != TokenType::Eof {
+        while !self.cur_is("}") && self.current().typ != TokenType::Eof {
             if self.match_token("case") {
                 let v = self.parse_expr()?;
                 self.expect(":")?;
@@ -630,8 +633,7 @@ impl Parser {
     }
 
     fn parse_ternary(&mut self) -> Result<Expr, String> {
-        // MUST be changed from parse_or() to parse_null_coalesce()
-        let node = self.parse_null_coalesce()?; 
+        let node = self.parse_null_coalesce()?;
         if self.match_token("?") {
             let t = self.parse_expr()?;
             self.expect(":")?;
@@ -645,9 +647,9 @@ impl Parser {
         let mut node = self.parse_or()?;
         while self.match_token("??") {
             let rhs = self.parse_or()?;
-            node = Expr { 
-                node: ExprNode::Binary("??".to_string(), Box::new(node.clone()), Box::new(rhs)), 
-                line: node.line 
+            node = Expr {
+                node: ExprNode::Binary("??".to_string(), Box::new(node.clone()), Box::new(rhs)),
+                line: node.line
             };
         }
         Ok(node)
@@ -673,12 +675,12 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expr, String> {
         let line = self.current().line;
-        
+
         if self.match_token("not") {
             let e = self.parse_not()?;
             return Ok(Expr { node: ExprNode::Unary("not".to_string(), Box::new(e)), line });
         }
-        if self.current().typ == TokenType::Op && self.current().value == "!" {
+        if self.current().typ == TokenType::Op && self.cur_is("!") {
             self.advance();
             let e = self.parse_not()?;
             return Ok(Expr { node: ExprNode::Unary("not".to_string(), Box::new(e)), line });
@@ -751,7 +753,7 @@ impl Parser {
             Ok(Expr { node: ExprNode::Unary(op, Box::new(v)), line: 0 })
         } else if self.match_token("new") {
             let mut cls_expr = self.parse_primary()?;
-            
+
             while self.match_token(".") {
                 let t = self.advance();
                 let attr = match t.typ {
@@ -759,42 +761,71 @@ impl Parser {
                     _ => return Err(format!("Expected property name after '.', got '{}' at line {}", t.value, t.line))
                 };
                 let line = cls_expr.line;
-                cls_expr = Expr { 
-                    node: ExprNode::GetAttr(Box::new(cls_expr), attr), 
-                    line 
+                cls_expr = Expr {
+                    node: ExprNode::GetAttr(Box::new(cls_expr), attr),
+                    line
                 };
             }
 
-            let mut args = Vec::new();
-            if self.match_token("(") && self.current().value != ")" {
-                loop {
-                    args.push(self.parse_expr()?);
-                    if !self.match_token(",") { break; }
-                }
-                self.expect(")")?;
-            } else if self.current().value == ")" {
-                self.advance();
-            }
-            
+            let args = if self.match_token("(") {
+                self.parse_call_args()?
+            } else {
+                Vec::new()
+            };
+
             return Ok(Expr { node: ExprNode::New(Box::new(cls_expr), args), line: 0 });
         } else {
             self.parse_postfix()
         }
     }
 
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, String> {
+        let mut args: Vec<Expr> = Vec::new();
+        let mut named: Vec<(String, Expr)> = Vec::new();
+        let line = self.current().line;
+        loop {
+            while self.current().typ == TokenType::Newline { self.advance(); }
+            if self.cur_is(")") { break; }
+            let cur_is_name = matches!(self.current().typ, TokenType::Name | TokenType::Keyword(_));
+            if cur_is_name && self.peek_is(1, ":") && self.peek(1).typ == TokenType::Op {
+                let name = self.advance().value;
+                self.advance();
+                while self.current().typ == TokenType::Newline { self.advance(); }
+                let val = self.parse_expr()?;
+                if named.iter().any(|(n, _)| *n == name) {
+                    return Err(format!("Duplicate named argument '{}' at line {}", name, line));
+                }
+                named.push((name, val));
+            } else {
+                if !named.is_empty() {
+                    return Err(format!(
+                        "Positional argument cannot follow named arguments at line {}",
+                        self.current().line
+                    ));
+                }
+                args.push(self.parse_expr()?);
+            }
+            while self.current().typ == TokenType::Newline { self.advance(); }
+            if !self.match_token(",") { break; }
+        }
+        while self.current().typ == TokenType::Newline { self.advance(); }
+        self.expect(")")?;
+        if !named.is_empty() {
+            let mut pairs = vec![(
+                "__named__".to_string(),
+                Expr { node: ExprNode::Bool(true), line },
+            )];
+            pairs.extend(named);
+            args.push(Expr { node: ExprNode::Obj(pairs), line });
+        }
+        Ok(args)
+    }
+
     fn parse_postfix(&mut self) -> Result<Expr, String> {
         let mut node = self.parse_primary()?;
         loop {
             if self.match_token("(") {
-                let mut args = Vec::new();
-                let is_end = self.current().typ == TokenType::Op && self.current().value == ")";
-                if !is_end {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.match_token(",") { break; }
-                    }
-                }
-                self.expect(")")?;
+                let args = self.parse_call_args()?;
                 node = Expr { node: ExprNode::Call(Box::new(node.clone()), args), line: node.line };
             } else if self.match_token("?.") {
                 let t = self.advance();
@@ -809,7 +840,7 @@ impl Parser {
                     TokenType::Name | TokenType::Keyword(_) => t.value,
                     _ => return Err(format!("Expected property name after '.', got '{}' at line {}", t.value, t.line))
                 };
-                
+
                 node = Expr { node: ExprNode::GetAttr(Box::new(node.clone()), attr), line: node.line };
             } else if self.match_token("[") {
                 let idx = self.parse_expr()?;
@@ -832,9 +863,7 @@ impl Parser {
             TokenType::Number => { self.advance(); Ok(Expr { node: ExprNode::Number(t.num_val.unwrap()), line }) },
             TokenType::String => {
                 self.advance();
-                // Backtick interpolated strings are stored with \x01 prefix
                 if let Some(raw) = t.value.strip_prefix('\x01') {
-                    // Parse into a chain of string + expression concatenations
                     let expr = parse_interp_string(raw, t.line)?;
                     Ok(expr)
                 } else {
@@ -848,17 +877,10 @@ impl Parser {
                 "this" => { self.advance(); Ok(Expr { node: ExprNode::This, line }) },
                 "super" => {
                     self.advance();
-                    self.expect(".")?; 
+                    self.expect(".")?;
                     let method = self.expect("NAME")?.value;
                     self.expect("(")?;
-                    let mut args = Vec::new();
-                    if self.current().value != ")" {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if !self.match_token(",") { break; }
-                        }
-                    }
-                    self.expect(")")?;
+                    let args = self.parse_call_args()?;
                     Ok(Expr { node:ExprNode::Super(method, args), line})
                 },
                 "func" => {
@@ -866,11 +888,11 @@ impl Parser {
                     self.expect("(")?;
                     let mut params = Vec::new();
                     let mut default_inits = Vec::new();
-                    let mut req_params = 0; // FIX: Added
-                    
-                    if self.current().value != ")" {
+                    let mut req_params = 0;
+
+                    if !self.cur_is(")") {
                         loop {
-                            if self.current().value == "..." {
+                            if self.cur_is("...") {
                                 self.advance();
                                 let rest_name = self.expect("NAME")?.value;
                                 params.push((format!("...{}", rest_name), None));
@@ -884,7 +906,7 @@ impl Parser {
                                 p_type = Some(self.expect("NAME")?.value);
                             }
                             params.push((p_name.clone(), p_type));
-                            
+
                             if self.match_token("=") {
                                 let def_expr = self.parse_expr()?;
                                 let p_var = Expr { node: ExprNode::Var(p_name.clone()), line };
@@ -909,7 +931,6 @@ impl Parser {
                             }
                         }
                     }
-                    // FIX: Added req_params here!
                     Ok(Expr { node: ExprNode::FuncExpr(params, req_params, Box::new(body)), line })
                 },
                 _ => { self.advance(); Ok(Expr { node: ExprNode::Var(t.value), line }) }
@@ -919,14 +940,14 @@ impl Parser {
                 if t.value == "(" {
 
                     if self.is_lambda_start() {
-                        self.advance(); // consume '('
+                        self.advance();
                         let mut params = Vec::new();
                         let mut default_inits = Vec::new();
-                        let mut req_params = 0; // FIX: Added
-                        
-                        if self.current().value != ")" {
+                        let mut req_params = 0;
+
+                        if !self.cur_is(")") {
                             loop {
-                                if self.current().value == "..." {
+                                if self.cur_is("...") {
                                     self.advance();
                                     let rest_name = self.expect("NAME")?.value;
                                     params.push((format!("...{}", rest_name), None));
@@ -940,7 +961,7 @@ impl Parser {
                                     p_type = Some(self.expect("NAME")?.value);
                                 }
                                 params.push((p_name.clone(), p_type));
-                                
+
                                 if self.match_token("=") {
                                     let def_expr = self.parse_expr()?;
                                     let p_var = Expr { node: ExprNode::Var(p_name.clone()), line };
@@ -959,7 +980,7 @@ impl Parser {
                         self.expect(")")?;
                         self.expect("=>")?;
 
-                        let mut body = if self.current().value == "{" {
+                        let mut body = if self.cur_is("{") {
                             self.parse_block()?
                         } else {
                             let expr = self.parse_expr()?;
@@ -976,7 +997,6 @@ impl Parser {
                                 }
                             }
                         }
-                        // FIX: Added req_params here!
                         return Ok(Expr { node: ExprNode::FuncExpr(params, req_params, Box::new(body)), line });
                     }
 
@@ -987,7 +1007,7 @@ impl Parser {
                 } else if t.value == "[" {
                     self.advance();
                     let mut list = Vec::new();
-                    let is_end = self.current().typ == TokenType::Op && self.current().value == "]";
+                    let is_end = self.current().typ == TokenType::Op && self.cur_is("]");
                     if !is_end {
                         loop {
                             list.push(self.parse_expr()?);
@@ -999,7 +1019,7 @@ impl Parser {
                 } else if t.value == "{" {
                     self.advance();
                     let mut obj = Vec::new();
-                    let is_end = self.current().typ == TokenType::Op && self.current().value == "}";
+                    let is_end = self.current().typ == TokenType::Op && self.cur_is("}");
                     if !is_end {
                         loop {
                             let k = if self.current().typ == TokenType::String {
@@ -1023,4 +1043,3 @@ impl Parser {
         }
     }
 }
-

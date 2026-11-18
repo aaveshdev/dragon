@@ -7,7 +7,7 @@ fn collect_field_defaults(s: &Stmt, out: &mut Vec<Stmt>) {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
             for st in stmts { collect_field_defaults(st, out); }
         }
-        StmtNode::FuncDef(..) => { /* handled separately as a method */ }
+        StmtNode::FuncDef(..) => { }
         StmtNode::Expr(e) => {
             if let ExprNode::Assign(target, value) = &e.node {
                 if let ExprNode::Var(name) = &target.node {
@@ -38,53 +38,22 @@ struct Transpiler {
     lbl_counter: usize,
     declared: Vec<std::collections::HashSet<String>>,
     loop_ctx: Vec<(Option<String>, String)>,
+    try_frames: Vec<String>,
+
+    finally_at: Vec<(usize, Stmt)>,
+    loop_try_base: Vec<usize>,
     closure_vars: std::collections::HashSet<String>,
+    boxed_vars: std::collections::HashSet<String>,
+    closure_boxed: std::collections::HashSet<String>,
+    box_candidates: std::collections::HashSet<String>,
+    shadow_stack: Vec<std::collections::HashSet<String>>,
     hoisted_modules: std::collections::HashSet<String>,
-    // Mirrors `declared` 1:1 (pushed/popped alongside it in push_scope/
-    // pop_scope) but, unlike `declared`, ALWAYS records every name bound in
-    // a scope via `decl_var`, even when that name coincides with an
-    // already-known outer/global name. `declared`+`is_declared` exists to
-    // decide whether a *C* declaration needs a fresh `DgnVal` prefix or can
-    // reuse an existing local, and short-circuits when a name is already
-    // known anywhere (including globally) — which means a parameter that
-    // happens to share a name with a top-level function silently never gets
-    // registered as shadowing it there. `is_shadowed_locally` needs the
-    // unconditional version, so it's tracked separately here rather than by
-    // changing the semantics of `declared`/`decl_var` (which other codegen
-    // paths already depend on).
     local_names: Vec<std::collections::HashSet<String>>,
-    // Mangled names of top-level functions that are (a) defined exactly once
-    // as a top-level `func`, and (b) never reassigned/mutated anywhere in the
-    // whole program (verified by a whole-program scan — see
-    // `collect_all_mutated_names`). Call sites naming one of these directly,
-    // e.g. `fib(n - 1)`, can therefore skip the generic dynamic dispatch
-    // (`dgn_call_val`, which tag-checks a DgnVal, chases a heap-allocated
-    // DgnFunc pointer, then calls through a function pointer) and instead
-    // call the mangled C function directly — `_fn_fib(...)`. This is only
-    // applied when the name isn't shadowed by a local (param/let/for-var/
-    // catch-var) in the current scope chain; see `is_shadowed_locally`.
     direct_callable: std::collections::HashSet<String>,
-    // Mangled names of top-level functions proven safe for full int64_t
-    // specialization (see the "Integer fast-path specialization" section
-    // below for the exact soundness conditions). A strict subset of
-    // `direct_callable` — every numeric_callable function is also
-    // direct_callable, but not vice versa.
     numeric_callable: std::collections::HashSet<String>,
-    // Parameter names (unmangled) for each numeric_callable function, in
-    // declaration order — needed to emit both the boxed shell's unboxing
-    // and the raw _fnum_ function's C parameter list.
     numeric_params: std::collections::HashMap<String, Vec<String>>,
-    // Float-aware specialization (additive, separate set -- see the
-    // "Float-aware numeric specialization" section). Only ever contains
-    // functions numeric_callable (the int-only set) did NOT already claim.
     numeric_callable_float: std::collections::HashMap<String, FnSig>,
     numeric_params_float: std::collections::HashMap<String, Vec<String>>,
-    // Method-call devirtualization (see "Method-call devirtualization"
-    // section below). `classes` is the whole-program class hierarchy;
-    // `overridable_methods` holds (unmangled_class, unmangled_method) pairs
-    // that are UNSAFE to devirtualize because some descendant overrides
-    // them. `current_class` tracks which class's method body is currently
-    // being transpiled, so `this.foo(...)` call sites know their context.
     classes: std::collections::HashMap<String, ClassInfo>,
     overridable_methods: std::collections::HashSet<(String, String)>,
     current_class: Option<String>,
@@ -100,7 +69,14 @@ impl Transpiler {
             lbl_counter: 0,
             declared: vec![std::collections::HashSet::new()],
             loop_ctx: Vec::new(),
+            try_frames: Vec::new(),
+            finally_at: Vec::new(),
+            loop_try_base: Vec::new(),
             closure_vars: std::collections::HashSet::new(),
+            boxed_vars: std::collections::HashSet::new(),
+            closure_boxed: std::collections::HashSet::new(),
+            box_candidates: std::collections::HashSet::new(),
+            shadow_stack: Vec::new(),
             hoisted_modules: std::collections::HashSet::new(),
             local_names: vec![std::collections::HashSet::new()],
             direct_callable: std::collections::HashSet::new(),
@@ -147,16 +123,98 @@ impl Transpiler {
         self.declared.iter().any(|scope| scope.contains(c_name))
     }
 
-    // Like `is_declared`, but ignores scope 0 (the persistent top-level/global
-    // scope, pre-filled once in `transpile()` with every module-scope name),
-    // and — unlike `is_declared`/`declared` — is always accurate about local
-    // bindings even when a local name coincides with a global one (see the
-    // `local_names` field doc comment for why `declared` can't be reused for
-    // this check). Used to check whether a top-level function name is
-    // shadowed by a local binding (parameter, for-loop var, catch var, local
-    // const) in the current function's own scope chain.
+    fn user_defines(&self, name: &str) -> bool {
+        let c = mangle(name);
+        self.direct_callable.contains(&c) || self.is_shadowed_locally(&c) || self.is_declared(&c)
+    }
+
     fn is_shadowed_locally(&self, c_name: &str) -> bool {
         self.local_names.iter().skip(1).any(|scope| scope.contains(c_name))
+    }
+
+    fn var_read(&mut self, c_name: &str) -> (String, String) {
+        if self.closure_vars.contains(c_name) {
+            let tmp = self.fresh_tmp();
+            let indent = "    ".repeat(self.indent);
+            let mut pre = String::new();
+            if self.closure_boxed.contains(c_name) {
+                writeln!(pre, "{}DgnVal {} = (_cenv) ? dgn_box_get(dgn_map_get_raw(_cenv, \"{}\")) : dgn_null();", indent, tmp, c_name).unwrap();
+            } else {
+                writeln!(pre, "{}DgnVal {} = (_cenv) ? dgn_map_get_raw(_cenv, \"{}\") : dgn_null();", indent, tmp, c_name).unwrap();
+            }
+            (pre, tmp)
+        } else if self.boxed_vars.contains(c_name) {
+            (String::new(), format!("dgn_box_get({})", c_name))
+        } else {
+            (String::new(), c_name.to_string())
+        }
+    }
+
+    fn var_store(&self, c_name: &str, val: &str) -> String {
+        if self.closure_vars.contains(c_name) {
+            if self.closure_boxed.contains(c_name) {
+                format!("if (_cenv) dgn_box_set(dgn_map_get_raw(_cenv, \"{}\"), {});", c_name, val)
+            } else {
+                format!("if (_cenv) dgn_map_set_raw(_cenv, \"{}\", {});", c_name, val)
+            }
+        } else if self.boxed_vars.contains(c_name) {
+            format!("dgn_box_set({}, {});", c_name, val)
+        } else {
+            format!("{} = {};", c_name, val)
+        }
+    }
+
+    fn is_global_name(&self, c_name: &str) -> bool {
+        self.declared.first().map_or(false, |g| g.contains(c_name))
+            && !self.shadow_stack.iter().any(|s| s.contains(c_name))
+    }
+
+    fn fn_enter(&mut self, params: &[(String, Option<String>)], body: &Stmt)
+        -> (std::collections::HashSet<String>, std::collections::HashSet<String>, std::collections::HashSet<String>, std::collections::HashSet<String>)
+    {
+        let saved = (
+            std::mem::take(&mut self.closure_vars),
+            std::mem::take(&mut self.closure_boxed),
+            std::mem::take(&mut self.boxed_vars),
+            std::mem::take(&mut self.box_candidates),
+        );
+        let mut shadow = std::collections::HashSet::new();
+        for (p, _) in params.iter() {
+            let pname = p.split(':').next().unwrap_or(p).trim();
+            let actual = if pname.starts_with("...") { &pname[3..] } else { pname };
+            shadow.insert(mangle(actual.trim()));
+        }
+        self.shadow_stack.push(shadow);
+        let mut mutated = std::collections::HashSet::new();
+        collect_all_mutated_names(body, &mut mutated);
+        let captured = closure_captured_names(body);
+        self.box_candidates = mutated.intersection(&captured).cloned().collect();
+        saved
+    }
+
+    fn fn_leave(&mut self, saved: (std::collections::HashSet<String>, std::collections::HashSet<String>, std::collections::HashSet<String>, std::collections::HashSet<String>)) {
+        self.shadow_stack.pop();
+        self.closure_vars = saved.0;
+        self.closure_boxed = saved.1;
+        self.boxed_vars = saved.2;
+        self.box_candidates = saved.3;
+    }
+
+    fn box_params(&mut self, params: &[(String, Option<String>)]) {
+        let indent = "    ".repeat(self.indent);
+        for (p, _) in params.iter() {
+            let pname = p.split(':').next().unwrap_or(p).trim();
+            let actual = if pname.starts_with("...") { &pname[3..] } else { pname };
+            let c = mangle(actual.trim());
+            if self.box_candidates.contains(&c) && !self.closure_vars.contains(&c) {
+                writeln!(self.out, "{}{} = dgn_box_new({});", indent, c, c).unwrap();
+                self.boxed_vars.insert(c);
+            }
+        }
+    }
+
+    fn is_cell_var(&self, c_name: &str) -> bool {
+        self.closure_vars.contains(c_name) || self.boxed_vars.contains(c_name)
     }
 
     fn decl_var(&mut self, name: &str) -> String {
@@ -167,19 +225,13 @@ impl Transpiler {
         if !self.is_declared(&c_name) {
             if let Some(current) = self.declared.last_mut() {
                 current.insert(c_name.clone());
+                self.boxed_vars.remove(&c_name);
                 return format!("DgnVal {}", c_name);
             }
         }
         c_name
     }
 
-
-    // Tries the string-accumulator loop optimization for stmts[i..]: a
-    // `name = "literal"` seed immediately followed by a qualifying While/
-    // DoWhile/CFor loop. Returns how many statements it consumed (2) and
-    // emits the optimized form directly, or None (emits nothing) if the
-    // pattern doesn't apply -- callers fall back to normal per-statement
-    // emission in that case.
     fn try_emit_strbuf_loop(&mut self, stmts: &[Stmt], i: usize) -> Option<usize> {
         let seed_stmt = &stmts[i];
 
@@ -198,10 +250,6 @@ impl Transpiler {
             _ => return None,
         };
 
-        // Scan forward for the loop: any number of intervening statements
-        // are fine (e.g. `s = ""; i = 0; while (...) { s = s + x; i++ }`)
-        // as long as NONE of them reference `name` -- if one does, bail
-        // rather than guess what it means for the accumulator.
         let mut loop_idx = i + 1;
         while loop_idx < stmts.len() {
             match &stmts[loop_idx].node {
@@ -240,15 +288,6 @@ impl Transpiler {
         };
         let (accum_idx, pieces) = find_and_validate_accumulator(&body_stmts, &name)?;
 
-        // -- Safe to apply: emit the seed, then any intervening statements
-        // verbatim (normal codegen), then the strbuf-optimized loop,
-        // mirroring the real While/DoWhile/CFor codegen exactly (labels,
-        // scoping, braces) so break/continue inside the loop keep working
-        // identically -- the ONLY difference from the normal path is that
-        // wherever the real codegen would call `self.emit_stmt(body)`,
-        // this calls `emit_rewritten_body` instead, which is identical
-        // except the one matched accumulation statement becomes
-        // strbuf-append calls.
         self.emit_stmt(seed_stmt);
         for s in &stmts[i + 1..loop_idx] {
             self.emit_stmt(s);
@@ -282,7 +321,7 @@ impl Transpiler {
             LoopShape::While(c, _) => {
                 let cont_lbl = self.fresh_lbl();
                 let brk_lbl = self.fresh_lbl();
-                self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+                self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
 
                 let tmp = self.fresh_tmp();
                 let (pre, cval) = self.emit_expr(c);
@@ -308,12 +347,12 @@ impl Transpiler {
                 self.line("}");
 
                 writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-                self.loop_ctx.pop();
+                self.loop_ctx.pop(); self.loop_try_base.pop();
             }
             LoopShape::DoWhile(_, c) => {
                 let cont_lbl = self.fresh_lbl();
                 let brk_lbl = self.fresh_lbl();
-                self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+                self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
 
                 self.line("do {");
                 self.indent += 1;
@@ -330,12 +369,12 @@ impl Transpiler {
                 self.raw(&pre);
                 writeln!(self.out, "{}}} while (dgn_truthy({}));", indent, cval).unwrap();
                 writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-                self.loop_ctx.pop();
+                self.loop_ctx.pop(); self.loop_try_base.pop();
             }
             LoopShape::CFor(init, cond, step, _) => {
                 let cont_lbl = self.fresh_lbl();
                 let brk_lbl = self.fresh_lbl();
-                self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+                self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
 
                 self.line("{");
                 self.indent += 1;
@@ -403,7 +442,7 @@ impl Transpiler {
                 self.pop_scope();
                 self.indent -= 1;
                 self.line("}");
-                self.loop_ctx.pop();
+                self.loop_ctx.pop(); self.loop_try_base.pop();
             }
         }
 
@@ -445,15 +484,27 @@ impl Transpiler {
                 writeln!(self.out, "{}(void){};", indent, val).unwrap();
             }
             StmtNode::Return(maybe_expr) => match maybe_expr {
-                None => self.line("return dgn_null();"),
+                None => {
+                    self.unwind_try_frames(0);
+                    self.line("return dgn_null();")
+                }
                 Some(e) => {
                     let (pre, val) = self.emit_expr(e);
                     self.raw(&pre);
                     let indent = "    ".repeat(self.indent);
-                    writeln!(self.out, "{}return {};", indent, val).unwrap();
+                    if self.try_frames.is_empty() {
+                        writeln!(self.out, "{}return {};", indent, val).unwrap();
+                    } else {
+                        let r = self.fresh_tmp();
+                        writeln!(self.out, "{}DgnVal {} = {};", indent, r, val).unwrap();
+                        self.unwind_try_frames(0);
+                        let indent = "    ".repeat(self.indent);
+                        writeln!(self.out, "{}return {};", indent, r).unwrap();
+                    }
                 }
             },
             StmtNode::Break => {
+                self.pop_try_frames_to_loop();
                 if let Some((_, brk_lbl)) = self.loop_ctx.last() {
                     let indent = "    ".repeat(self.indent);
                     writeln!(self.out, "{}goto {};", indent, brk_lbl).unwrap();
@@ -462,6 +513,7 @@ impl Transpiler {
                 }
             }
             StmtNode::Continue => {
+                self.pop_try_frames_to_loop();
                 let mut found = false;
                 for (cont_opt, _) in self.loop_ctx.iter().rev() {
                     if let Some(cont_lbl) = cont_opt {
@@ -494,21 +546,12 @@ impl Transpiler {
                 let c_name = mangle(name);
 
                 if self.numeric_callable.contains(&c_name) {
-                    // Fully specialized path: the boxed function becomes a
-                    // thin shell — unbox params once, delegate to the raw
-                    // int64_t function, box the result once. No self-binding
-                    // needed here at all: the shell never dispatches
-                    // dynamically to itself, and the raw body's own
-                    // recursive/sibling calls go straight to other
-                    // _fnum_ functions (see IntSpecTranspiler), never through
-                    // dgn_call_val or a DgnVal self-reference.
                     let saved_indent = self.indent;
                     self.indent = 0;
                     let saved_out = std::mem::take(&mut self.out);
 
                     let pnames = self.numeric_params.get(&c_name).cloned().unwrap_or_default();
 
-                    // The raw int64_t function.
                     let sig = if pnames.is_empty() {
                         "void".to_string()
                     } else {
@@ -524,7 +567,6 @@ impl Transpiler {
                     self.line("}");
                     self.line("");
 
-                    // The boxed shell.
                     writeln!(
                         self.out,
                         "static DgnVal _fn_{}(DgnVal* _args, int _nargs, DgnEnv* _env) {{",
@@ -547,16 +589,12 @@ impl Transpiler {
                     self.hoisted.push_str(&generated_fn);
                     self.indent = saved_indent;
 
-                    // Runtime binding in the current scope (caller side) —
-                    // unchanged: dynamic callers (passing this function as a
-                    // value, e.g. to another function, or list.map(fib))
-                    // still go through the normal boxed _fn_ entry point.
                     let decl = self.decl_var(name);
                     let indent = "    ".repeat(self.indent);
                     writeln!(
                         self.out,
-                        "{}{} = dgn_func(_fn_{}, {});",
-                        indent, decl, c_name, params.len()
+                        "{}{} = dgn_func_n(_fn_{}, {}, \"{}\");",
+                        indent, decl, c_name, params.len(), param_csv(params)
                     ).unwrap();
                     return;
                 }
@@ -565,6 +603,9 @@ impl Transpiler {
                     let saved_indent = self.indent;
                     self.indent = 0;
                     let mut saved_out = std::mem::take(&mut self.out);
+                    let saved_tf = std::mem::take(&mut self.try_frames);
+                    let saved_lt = std::mem::take(&mut self.loop_try_base);
+                    let saved_fa = std::mem::take(&mut self.finally_at);
 
                     writeln!(
                         self.out,
@@ -574,7 +615,6 @@ impl Transpiler {
                     self.indent = 1;
                     self.push_scope();
 
-                    // Emit parameters
                     for (i, (pname, default_val)) in params.iter().enumerate() {
                         let pname_clean = pname.split(':').next().unwrap().trim();
                         let is_rest = pname_clean.starts_with("...");
@@ -592,19 +632,6 @@ impl Transpiler {
                         }
                     }
 
-                    // Self-binding: lets the function call itself by name
-                    // recursively via a bare value (e.g. passed as a
-                    // callback, stored, or called indirectly through a
-                    // variable). This is dead weight — an extra dgn_gc_alloc
-                    // on every single invocation — when the function is
-                    // direct_callable (so every "name(...)" call already
-                    // resolves statically to _fn_name(...) and never reads
-                    // this binding) AND nothing inside its body ever refers
-                    // to its own name except as that direct-call callee, AND
-                    // nothing inside the body redeclares/shadows the name
-                    // (which would make the shadowing-aware skip at call
-                    // sites diverge from this whole-body analysis). All three
-                    // must hold, or we conservatively keep the self-binding.
                     let elide_self_binding = self.direct_callable.contains(&c_name)
                         && !stmt_shadows_name(body, &c_name)
                         && !body_uses_name_as_value(body, &c_name);
@@ -615,7 +642,7 @@ impl Transpiler {
                             writeln!(self.out, "{}{} = dgn_null();  /* self-binding elided: never read as a value, only called directly */", ind, self_decl).unwrap();
                             writeln!(self.out, "{}(void){};", ind, c_name).unwrap();
                         } else {
-                            writeln!(self.out, "{}{} = dgn_func(_fn_{}, {});", ind, self_decl, c_name, params.len()).unwrap();
+                            writeln!(self.out, "{}{} = dgn_func_n(_fn_{}, {}, \"{}\");", ind, self_decl, c_name, params.len(), param_csv(params)).unwrap();
                         }
                     }
 
@@ -630,15 +657,17 @@ impl Transpiler {
                     self.out = saved_out;
                     self.hoisted.push_str(&generated_fn);
                     self.indent = saved_indent;
+                    self.try_frames = saved_tf;
+                    self.loop_try_base = saved_lt;
+                    self.finally_at = saved_fa;
                 }
 
-                // Runtime binding in the current scope (caller side)
                 let decl = self.decl_var(name);
                 let indent = "    ".repeat(self.indent);
                 writeln!(
                     self.out,
-                    "{}{} = dgn_func(_fn_{}, {});",
-                    indent, decl, c_name, params.len()
+                    "{}{} = dgn_func_n(_fn_{}, {}, \"{}\");",
+                    indent, decl, c_name, params.len(), param_csv(params)
                 ).unwrap();
             }
             StmtNode::ClassDef(name, parent, body) => {
@@ -650,7 +679,7 @@ impl Transpiler {
             StmtNode::While(cond, body) => {
                 let cont_lbl = self.fresh_lbl();
                 let brk_lbl = self.fresh_lbl();
-                self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+                self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
 
                 let tmp = self.fresh_tmp();
                 let (pre, cval) = self.emit_expr(cond);
@@ -660,13 +689,13 @@ impl Transpiler {
                 writeln!(self.out, "{}while (dgn_truthy({})) {{", indent, tmp).unwrap();
                 self.indent += 1;
                 self.push_scope();
-                
+
                 self.emit_stmt(body);
-                
+
                 self.indent -= 1;
                 writeln!(self.out, "    {}{}:;", indent, cont_lbl).unwrap();
                 self.indent += 1;
-                
+
                 let (pre2, cval2) = self.emit_expr(cond);
                 self.raw(&pre2);
                 let indent2 = "    ".repeat(self.indent);
@@ -674,36 +703,36 @@ impl Transpiler {
                 self.pop_scope();
                 self.indent -= 1;
                 self.line("}");
-                
+
                 writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-                self.loop_ctx.pop();
+                self.loop_ctx.pop(); self.loop_try_base.pop();
             }
             StmtNode::DoWhile(body, cond) => {
                 let cont_lbl = self.fresh_lbl();
                 let brk_lbl = self.fresh_lbl();
-                self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+                self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
 
                 self.line("do {");
                 self.indent += 1;
                 self.push_scope();
-                
+
                 self.emit_stmt(body);
-                
+
                 self.pop_scope();
                 self.indent -= 1;
                 let indent = "    ".repeat(self.indent);
                 writeln!(self.out, "    {}{}:;", indent, cont_lbl).unwrap();
-                
+
                 let (pre, cval) = self.emit_expr(cond);
                 self.raw(&pre);
                 writeln!(self.out, "{}}} while (dgn_truthy({}));", indent, cval).unwrap();
                 writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-                self.loop_ctx.pop();
+                self.loop_ctx.pop(); self.loop_try_base.pop();
             }
             StmtNode::CFor(init, cond, step, body) => {
                 let cont_lbl = self.fresh_lbl();
                 let brk_lbl = self.fresh_lbl();
-                self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+                self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
 
                 self.line("{");
                 self.indent += 1;
@@ -723,13 +752,13 @@ impl Transpiler {
                     writeln!(self.out, "{}while (dgn_truthy({})) {{", indent, tmp).unwrap();
                     self.indent += 1;
                     self.push_scope();
-                    
+
                     self.emit_stmt(body);
-                    
+
                     self.indent -= 1;
                     writeln!(self.out, "    {}{}:;", indent, cont_lbl).unwrap();
                     self.indent += 1;
-                    
+
                     if let Some(step_e) = step {
                         let (spre, sval) = self.emit_expr(step_e);
                         self.raw(&spre);
@@ -747,14 +776,14 @@ impl Transpiler {
                     self.line("while (1) {");
                     self.indent += 1;
                     self.push_scope();
-                    
+
                     self.emit_stmt(body);
-                    
+
                     self.indent -= 1;
                     let indent = "    ".repeat(self.indent);
                     writeln!(self.out, "    {}{}:;", indent, cont_lbl).unwrap();
                     self.indent += 1;
-                    
+
                     if let Some(step_e) = step {
                         let (spre, sval) = self.emit_expr(step_e);
                         self.raw(&spre);
@@ -767,11 +796,11 @@ impl Transpiler {
                 }
                 let indent = "    ".repeat(self.indent);
                 writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-                
+
                 self.pop_scope();
                 self.indent -= 1;
                 self.line("}");
-                self.loop_ctx.pop();
+                self.loop_ctx.pop(); self.loop_try_base.pop();
             }
             StmtNode::For(var, var2, iter_expr, body) => {
                 self.emit_for_in(var, var2.as_deref(), iter_expr, body);
@@ -791,13 +820,12 @@ impl Transpiler {
                 for m in methods {
                     if let StmtNode::FuncDef(mname, params, _req, body, _) = &m.node {
                         let fn_c = format!("{}_{}", mangle(type_name), mangle(mname));
-                        
-                        // FIX: Explicitly inject 'this' as the first parameter
+
                         let mut all_params = vec![("this".to_string(), None)];
                         all_params.extend(params.iter().cloned());
-                        
+
                         self.emit_named_fn(&fn_c, &all_params, body);
-                        
+
                         let indent = "    ".repeat(self.indent);
                         writeln!(
                             self.out,
@@ -811,7 +839,6 @@ impl Transpiler {
             StmtNode::Import(module, alias) => {
                 let bind_name = alias.as_deref().unwrap_or(module.as_str());
                 let c_name = mangle(bind_name);
-                // Already declared as a static global — just assign
                 let indent = "    ".repeat(self.indent);
                 writeln!(
                     self.out,
@@ -823,8 +850,6 @@ impl Transpiler {
             }
         }
     }
-
-    // ── expression codegen ────────────────────────────────────────────────────
 
     fn emit_expr(&mut self, expr: &Expr) -> (String, String) {
         match &expr.node {
@@ -842,27 +867,17 @@ impl Transpiler {
             }
             ExprNode::String(s) => {
                 let escaped = escape_c_string(s);
-                (String::new(), format!("dgn_str(\"{}\")", escaped))
+                (String::new(), format!("dgn_lit(\"{}\")", escaped))
             }
-            ExprNode::This => (
-                String::new(),
-                mangle("this"),
-            ),
+            ExprNode::This => {
+                let c_name = mangle("this");
+                self.var_read(&c_name)
+            }
             ExprNode::Var(name) => {
                 let c_name = mangle(name);
-                if self.closure_vars.contains(&c_name) {
-                    // Read from closure env
-                    let tmp = self.fresh_tmp();
-                    let indent = "    ".repeat(self.indent);
-                    let mut pre = String::new();
-                    writeln!(pre, "{}DgnVal {} = (_cenv) ? dgn_map_get_raw(_cenv, \"{}\") : dgn_null();",
-                        indent, tmp, c_name).unwrap();
-                    (pre, tmp)
-                } else {
-                    (String::new(), c_name)
-                }
+                self.var_read(&c_name)
             }
-           ExprNode::List(items) => {
+            ExprNode::List(items) => {
                 let mut pre = String::new();
                 let tmp = self.fresh_tmp();
                 let indent = "    ".repeat(self.indent);
@@ -923,28 +938,45 @@ impl Transpiler {
                 (pre, tmp)
             }
             ExprNode::Assign(target, value) => {
-                let (vpre, vval) = self.emit_expr(value);
+                let (mut vpre, mut vval) = self.emit_expr(value);
+                if vval.contains('(') {
+                    let t = self.fresh_tmp();
+                    let ind = "    ".repeat(self.indent);
+                    writeln!(vpre, "{}DgnVal {} = {};", ind, t, vval).unwrap();
+                    vval = t;
+                }
                 match &target.node {
                     ExprNode::Var(name) => {
                         let c_name = mangle(name);
                         let indent = "    ".repeat(self.indent);
                         let mut pre = vpre;
                         if self.closure_vars.contains(&c_name) {
-                            writeln!(pre, "{}if (_cenv) dgn_map_set_raw(_cenv, \"{}\", {});",
-                                indent, c_name, vval).unwrap();
+                            let st = self.var_store(&c_name, &vval);
+                            writeln!(pre, "{}{}", indent, st).unwrap();
+                            (pre, vval)
                         } else {
                             let decl = self.decl_var(name);
-                            writeln!(pre, "{}{} = {};", indent, decl, vval).unwrap();
+                            if decl.starts_with("DgnVal ") && self.box_candidates.contains(&c_name) {
+                                self.boxed_vars.insert(c_name.clone());
+                            }
+                            if self.boxed_vars.contains(&c_name) {
+                                if decl.starts_with("DgnVal ") {
+                                    writeln!(pre, "{}{} = dgn_box_new({});", indent, decl, vval).unwrap();
+                                } else {
+                                    writeln!(pre, "{}dgn_box_set({}, {});", indent, c_name, vval).unwrap();
+                                }
+                                (pre, vval)
+                            } else {
+                                writeln!(pre, "{}{} = {};", indent, decl, vval).unwrap();
+                                (pre, c_name.clone())
+                            }
                         }
-                        (pre, if self.closure_vars.contains(&c_name) { vval } else { c_name.clone() })
                     }
                     ExprNode::GetAttr(obj, attr) => {
                         let (opre, oval) = self.emit_expr(obj);
                         let mut pre = opre;
                         pre.push_str(&vpre);
                         let indent = "    ".repeat(self.indent);
-                        // FIX: if oval is a call expression (rvalue), materialise it into
-                        // an addressable temporary before taking its address.
                         let is_call = oval.contains('(');
                         if is_call {
                             let tmp = self.fresh_tmp();
@@ -978,11 +1010,6 @@ impl Transpiler {
                         pre.push_str(&ipre);
                         pre.push_str(&vpre);
                         let indent = "    ".repeat(self.indent);
-                        // MSVC C2102: '&' requires an l-value.
-                        // dgn_get_index() returns DgnVal by value (a temporary/rvalue),
-                        // so &dgn_get_index(...) is illegal under strict C rules.
-                        // If oval looks like a function call (contains '('), materialise
-                        // it into a named temporary first so we have an addressable lvalue.
                         let is_call = oval.contains('(');
                         if is_call {
                             let tmp = self.fresh_tmp();
@@ -1003,30 +1030,26 @@ impl Transpiler {
                         }
                         (pre, vval)
                     }
-                    
-                    // --- NEW DESTRUCTURING LOGIC LIVES HERE ---
-                   // --- NEW DESTRUCTURING LOGIC LIVES HERE ---
+
                     ExprNode::List(items) => {
                         let mut pre = vpre;
                         let rhs_tmp = self.fresh_tmp();
                         let indent = "    ".repeat(self.indent);
-                        
-                        // Store the evaluated right-hand side array in a temporary variable
+
                         writeln!(pre, "{}DgnVal {} = {};", indent, rhs_tmp, vval).unwrap();
 
                         for (i, item) in items.iter().enumerate() {
                             let mut var_name = String::new();
                             let mut current_node = &item.node;
-                            
-                            // Deep extraction loop: drill down through ANY wrappers to find the variable name
+
                             for _ in 0..5 {
                                 match current_node {
                                     ExprNode::Var(name) => { var_name = name.clone(); break; },
                                     ExprNode::String(name) => { var_name = name.clone(); break; },
-                                    ExprNode::PreOp(_, op) | ExprNode::Unary(_, op) | ExprNode::PostOp(_, op) => { 
-                                        current_node = &op.node; 
+                                    ExprNode::PreOp(_, op) | ExprNode::Unary(_, op) | ExprNode::PostOp(_, op) => {
+                                        current_node = &op.node;
                                     },
-                                    ExprNode::Binary(_, lhs, rhs) => { 
+                                    ExprNode::Binary(_, lhs, rhs) => {
                                         if let ExprNode::Var(n) = &lhs.node { var_name = n.clone(); break; }
                                         current_node = &rhs.node;
                                     },
@@ -1038,7 +1061,6 @@ impl Transpiler {
                                 }
                             }
 
-                            // If we couldn't find a variable name, or it's a blank slot `_`, skip it
                             if var_name.is_empty() || var_name == "_" {
                                 continue;
                             }
@@ -1046,7 +1068,7 @@ impl Transpiler {
                             let clean_name = var_name.trim();
                             let is_rest = clean_name.starts_with("...");
                             let actual_name = if is_rest { clean_name[3..].trim() } else { clean_name };
-                            
+
                             let decl = self.decl_var(actual_name);
                             let c_name = mangle(actual_name);
 
@@ -1057,7 +1079,7 @@ impl Transpiler {
                                     indent, decl, rhs_tmp, i
                                 ).unwrap();
                                 writeln!(pre, "{}(void){};", indent, c_name).unwrap();
-                                break; // Rest parameter must be the final element, stop iterating
+                                break;
                             } else {
                                 writeln!(
                                     pre,
@@ -1069,7 +1091,7 @@ impl Transpiler {
                         }
                         (pre, rhs_tmp)
                     }
-                    
+
                     _ => (vpre, vval),
                 }
             }
@@ -1115,12 +1137,14 @@ impl Transpiler {
                     let indent = "    ".repeat(self.indent);
                     let mut pre = String::new();
                     let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
-                    if self.closure_vars.contains(&c_name) {
+                    if self.is_cell_var(&c_name) {
                         let tmp = self.fresh_tmp();
-                        writeln!(pre, "{}DgnVal {} = (_cenv) ? dgn_map_get_raw(_cenv, \"{}\") : dgn_null();", indent, tmp, c_name).unwrap();
+                        let (rp, rv) = self.var_read(&c_name);
+                        pre.push_str(&rp);
                         let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
-                        writeln!(pre, "{}{} = {}({}, dgn_int(1));", indent, tmp, op_fn, tmp).unwrap();
-                        writeln!(pre, "{}if (_cenv) dgn_map_set_raw(_cenv, \"{}\", {});", indent, c_name, tmp).unwrap();
+                        writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, tmp, op_fn, rv).unwrap();
+                        let st = self.var_store(&c_name, &tmp);
+                        writeln!(pre, "{}{}", indent, st).unwrap();
                         (pre, tmp)
                     } else {
                         if is_inc {
@@ -1188,13 +1212,16 @@ impl Transpiler {
                     let indent = "    ".repeat(self.indent);
                     let mut pre = String::new();
                     let is_inc = op.contains('+') || op.to_lowercase().contains("inc");
-                    if self.closure_vars.contains(&c_name) {
-                        writeln!(pre, "{}DgnVal {} = (_cenv) ? dgn_map_get_raw(_cenv, \"{}\") : dgn_null();", indent, tmp, c_name).unwrap();
+                    if self.is_cell_var(&c_name) {
+                        let (rp, rv) = self.var_read(&c_name);
+                        pre.push_str(&rp);
+                        writeln!(pre, "{}DgnVal {} = {};", indent, tmp, rv).unwrap();
                         let new_tmp = self.fresh_tmp();
                         let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
                         writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, tmp).unwrap();
-                        writeln!(pre, "{}if (_cenv) dgn_map_set_raw(_cenv, \"{}\", {});", indent, c_name, new_tmp).unwrap();
-                        (pre, tmp) // PostOp returns old value
+                        let st = self.var_store(&c_name, &new_tmp);
+                        writeln!(pre, "{}{}", indent, st).unwrap();
+                        (pre, tmp)
                     } else {
                         writeln!(pre, "{}DgnVal {} = {};", indent, tmp, c_name).unwrap();
                         if is_inc {
@@ -1222,7 +1249,7 @@ impl Transpiler {
                     let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
                     writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, old_tmp).unwrap();
                     writeln!(pre, "{}dgn_set_attr(&{}, \"{}\", {});", indent, obj_lval, escape_c_string(attr), new_tmp).unwrap();
-                    (pre, old_tmp) // PostOp returns old value
+                    (pre, old_tmp)
                 }
                 ExprNode::Index(obj, idx) => {
                     let (opre, oval) = self.emit_expr(obj);
@@ -1245,7 +1272,7 @@ impl Transpiler {
                     let op_fn = if is_inc { "dgn_add" } else { "dgn_sub" };
                     writeln!(pre, "{}DgnVal {} = {}({}, dgn_int(1));", indent, new_tmp, op_fn, old_tmp).unwrap();
                     writeln!(pre, "{}dgn_set_index(&{}, {}, {});", indent, obj_lval, idx_tmp, new_tmp).unwrap();
-                    (pre, old_tmp) // PostOp returns old value
+                    (pre, old_tmp)
                 }
                 _ => {
                     let (pre, val) = self.emit_expr(operand);
@@ -1256,50 +1283,51 @@ impl Transpiler {
                 let fn_tag = self.fresh_tmp();
                 let fn_c = format!("anon_{}", fn_tag);
 
-                // ── free-variable analysis ──────────────────────────────────
                 let mut param_set = std::collections::HashSet::new();
                 for (p, _) in params.iter() {
                     let pname = p.split(':').next().unwrap_or(p).trim();
                     let actual = if pname.starts_with("...") { &pname[3..] } else { pname };
                     param_set.insert(mangle(actual));
                 }
-                // Also treat "this" as bound
-                param_set.insert("_v_this".to_string());
 
                 let mut free_c_names = std::collections::HashSet::new();
                 collect_free_vars(body, &param_set, &mut free_c_names);
 
-                // Only capture vars that are actually declared in an enclosing scope
                 let captured: Vec<String> = free_c_names
                     .into_iter()
-                    .filter(|cn| self.is_declared(cn))
+                    .filter(|cn| self.is_declared(cn) && !self.is_global_name(cn))
                     .collect();
+                let captured_boxed: std::collections::HashSet<String> = captured.iter()
+                    .filter(|cn| if self.closure_vars.contains(*cn) { self.closure_boxed.contains(*cn) } else { self.boxed_vars.contains(*cn) })
+                    .cloned().collect();
 
                 let has_closure = !captured.is_empty();
 
-                // Emit the hoisted C function (closure-aware)
-                self.emit_named_fn_closure(&fn_c, params, body, &captured);
+                self.emit_named_fn_closure(&fn_c, params, body, &captured, &captured_boxed);
 
                 let indent = "    ".repeat(self.indent);
                 let mut pre = String::new();
 
                 if has_closure {
                     let env_tmp = format!("{}_env", fn_tag);
-                    // Create env map and populate it with captured variable values
                     writeln!(pre, "{}DgnVal {} = dgn_map_new();", indent, env_tmp).unwrap();
                     for cn in &captured {
-                        writeln!(pre, "{}dgn_map_set(&{}, \"{}\", {});", indent, env_tmp, cn, cn).unwrap();
+                        if self.closure_vars.contains(cn) {
+                            writeln!(pre, "{}dgn_map_set(&{}, \"{}\", (_cenv) ? dgn_map_get_raw(_cenv, \"{}\") : dgn_null());", indent, env_tmp, cn, cn).unwrap();
+                        } else {
+                            writeln!(pre, "{}dgn_map_set(&{}, \"{}\", {});", indent, env_tmp, cn, cn).unwrap();
+                        }
                     }
                     writeln!(
                         pre,
-                        "{}DgnVal {} = dgn_closure(_fn_{}, {}, {}.map);",
-                        indent, fn_tag, fn_c, params.len(), env_tmp
+                        "{}DgnVal {} = dgn_closure_n(_fn_{}, {}, {}.map, \"{}\");",
+                        indent, fn_tag, fn_c, params.len(), env_tmp, param_csv(params)
                     ).unwrap();
                 } else {
                     writeln!(
                         pre,
-                        "{}DgnVal {} = dgn_func(_fn_{}, {});",
-                        indent, fn_tag, fn_c, params.len()
+                        "{}DgnVal {} = dgn_func_n(_fn_{}, {}, \"{}\");",
+                        indent, fn_tag, fn_c, params.len(), param_csv(params)
                     ).unwrap();
                 }
                 (pre, fn_tag)
@@ -1349,15 +1377,23 @@ impl Transpiler {
                     pre.push_str(&apre);
                     writeln!(pre, "{}{}[{}] = {};", indent, args_tmp, i, aval).unwrap();
                 }
-                (
-                    pre,
+                let call = if let Some(cur) = self.current_class.clone() {
+                    format!(
+                        "dgn_super_call_from(_v_this, {}, \"{}\", {}, {})",
+                        mangle(&cur),
+                        escape_c_string(method),
+                        args_tmp,
+                        args.len()
+                    )
+                } else {
                     format!(
                         "dgn_super_call(_v_this, \"{}\", {}, {})",
                         escape_c_string(method),
                         args_tmp,
                         args.len()
-                    ),
-                )
+                    )
+                };
+                (pre, call)
             }
             ExprNode::Await(inner) => {
                 let (pre, val) = self.emit_expr(inner);
@@ -1369,8 +1405,6 @@ impl Transpiler {
             }
         }
     }
-
-    // ── binary expressions ────────────────────────────────────────────────────
 
     fn emit_binary(&mut self, op: &str, lhs: &Expr, rhs: &Expr) -> (String, String) {
         if op == "and" || op == "&&" {
@@ -1398,11 +1432,14 @@ impl Transpiler {
             let (rpre, rval) = self.emit_expr(rhs);
             let indent = "    ".repeat(self.indent);
             let mut pre = lpre;
+
+            let lt = self.fresh_tmp();
+            writeln!(pre, "{}DgnVal {} = {};", indent, lt, lval).unwrap();
             writeln!(pre, "{}DgnVal {};", indent, tmp).unwrap();
             writeln!(
                 pre,
                 "{}if (dgn_truthy({})) {{ {} = {}; }}",
-                indent, lval, tmp, lval
+                indent, lt, tmp, lt
             )
             .unwrap();
             writeln!(pre, "{}else {{", indent).unwrap();
@@ -1417,11 +1454,13 @@ impl Transpiler {
             let (rpre, rval) = self.emit_expr(rhs);
             let indent = "    ".repeat(self.indent);
             let mut pre = lpre;
+            let lt = self.fresh_tmp();
+            writeln!(pre, "{}DgnVal {} = {};", indent, lt, lval).unwrap();
             writeln!(pre, "{}DgnVal {};", indent, tmp).unwrap();
             writeln!(
                 pre,
                 "{}if ({}.tag != DGN_NULL) {{ {} = {}; }}",
-                indent, lval, tmp, lval
+                indent, lt, tmp, lt
             )
             .unwrap();
             writeln!(pre, "{}else {{", indent).unwrap();
@@ -1463,11 +1502,6 @@ impl Transpiler {
         (pre, result)
     }
 
-    // ── function calls ────────────────────────────────────────────────────────
-
-    // Returns the mangled `ClassMangled_MethodMangled` target to call
-    // directly, if `method` called as `this.method(...)` from within a
-    // method of `from_class` is provably safe to devirtualize.
     fn resolve_devirtualized_method(&self, from_class: &str, method: &str) -> Option<String> {
         let resolved_class = resolve_method_owner(&self.classes, from_class, method)?;
         if self.overridable_methods.contains(&(resolved_class.clone(), method.to_string())) {
@@ -1480,15 +1514,8 @@ impl Transpiler {
         let mut pre = String::new();
         let indent = "    ".repeat(self.indent);
 
-        // Method-call devirtualization: `this.method(args)` inside a method
-        // of class C can skip dgn_call_method's hashmap lookup + malloc'd
-        // arg-array dance entirely IF we can prove the call always resolves
-        // to the same implementation regardless of `this`'s actual runtime
-        // subtype -- i.e. no descendant of the class that actually defines
-        // `method` (found by walking up C's ancestor chain) overrides it.
-        // See "Method-call devirtualization" section below for the analysis.
         if let ExprNode::GetAttr(obj, method) = &callee.node {
-            if matches!(obj.node, ExprNode::This) {
+            if matches!(obj.node, ExprNode::This) && !has_named_pack(args) {
                 if let Some(cur) = self.current_class.clone() {
                     if let Some(target_fn) = self.resolve_devirtualized_method(&cur, method) {
                         let (opre, oval) = self.emit_expr(obj);
@@ -1590,14 +1617,30 @@ impl Transpiler {
                         )
                     }
                 }
+                "class_name" if !self.user_defines(name) => format!("dgn_b_class_name({}[0])", args_tmp),
+                "is_a" if !self.user_defines(name) => format!("dgn_b_is_a({}[0], {}[1])", args_tmp, args_tmp),
+                "has_attr" if !self.user_defines(name) => format!("dgn_b_has_attr({}[0], {}[1])", args_tmp, args_tmp),
+                "set_attr" if !self.user_defines(name) => format!("dgn_b_set_attr({}[0], {}[1], {}[2])", args_tmp, args_tmp, args_tmp),
+                "same" if !self.user_defines(name) => format!("dgn_b_same({}[0], {}[1])", args_tmp, args_tmp),
+                "json_compact" if !self.user_defines(name) => format!("dgn_b_json_compact({}[0])", args_tmp),
+                "now_ms" if !self.user_defines(name) => "dgn_b_now_ms()".to_string(),
+                "floor_int" if !self.user_defines(name) => format!("dgn_b_floor_int({}[0])", args_tmp),
+                "round_int" if !self.user_defines(name) => format!("dgn_b_round_int({}[0])", args_tmp),
+                "min" if !self.user_defines(name) => format!("dgn_b_min({}, {})", args_tmp, args.len()),
+                "max" if !self.user_defines(name) => format!("dgn_b_max({}, {})", args_tmp, args.len()),
+                "abs" if !self.user_defines(name) => format!("dgn_b_abs({}[0])", args_tmp),
+                "pow" if !self.user_defines(name) => format!("dgn_b_pow({}[0], {}[1])", args_tmp, args_tmp),
+                "sin" if !self.user_defines(name) => format!("dgn_b_sin({}[0])", args_tmp),
                 _ => {
                     let c_name = mangle(name);
-                    if self.direct_callable.contains(&c_name)
+                    if self.closure_vars.contains(&c_name) {
+                        let (fpre, fval) = self.emit_expr(callee);
+                        pre.push_str(&fpre);
+                        format!("dgn_call_val({}, {}, {})", fval, args_tmp, args.len())
+                    } else if self.direct_callable.contains(&c_name)
                         && !self.is_shadowed_locally(&c_name)
+                        && !has_named_pack(args)
                     {
-                        // Statically-known, never-reassigned top-level function:
-                        // call the generated C function directly instead of
-                        // going through the generic dynamic dispatch path.
                         format!("_fn_{}({}, {}, NULL)", c_name, args_tmp, args.len())
                     } else {
                         format!("dgn_call_val({}, {}, {})", c_name, args_tmp, args.len())
@@ -1613,17 +1656,32 @@ impl Transpiler {
         (pre, result)
     }
 
-    // Like emit_named_fn but the generated C function reads/writes captured
-    // variables through the DgnEnv* _env parameter (a DgnMap).
     fn emit_named_fn_closure(
         &mut self,
         fn_c: &str,
         params: &[(String, Option<String>)],
         body: &Stmt,
         captured: &[String],
+        captured_boxed: &std::collections::HashSet<String>,
+    ) {
+        let saved_tf = std::mem::take(&mut self.try_frames);
+        let saved_lt = std::mem::take(&mut self.loop_try_base);
+        let saved_fa = std::mem::take(&mut self.finally_at);
+        self.emit_named_fn_closure_inner(fn_c, params, body, captured, captured_boxed);
+        self.try_frames = saved_tf;
+        self.loop_try_base = saved_lt;
+        self.finally_at = saved_fa;
+    }
+
+    fn emit_named_fn_closure_inner(
+        &mut self,
+        fn_c: &str,
+        params: &[(String, Option<String>)],
+        body: &Stmt,
+        captured: &[String],
+        captured_boxed: &std::collections::HashSet<String>,
     ) {
         if captured.is_empty() {
-            // No captures — delegate to regular emitter, nothing changes
             self.emit_named_fn(fn_c, params, body);
             return;
         }
@@ -1632,9 +1690,9 @@ impl Transpiler {
         self.indent = 0;
         let mut saved_out = std::mem::take(&mut self.out);
 
-        // Track which names are captured so emit_expr/emit_stmt can route reads/writes
-        let prev_closure_vars = std::mem::take(&mut self.closure_vars);
+        let saved_state = self.fn_enter(params, body);
         for cn in captured { self.closure_vars.insert(cn.clone()); }
+        self.closure_boxed = captured_boxed.clone();
 
         writeln!(
             self.out,
@@ -1644,7 +1702,6 @@ impl Transpiler {
         self.indent = 1;
         self.push_scope();
 
-        // Emit parameters normally
         for (i, (pname, default_val)) in params.iter().enumerate() {
             let pname_clean = pname.split(':').next().unwrap().trim();
             let is_rest = pname_clean.starts_with("...");
@@ -1663,14 +1720,9 @@ impl Transpiler {
             }
         }
 
-        // Load captured vars from env as local mutable aliases at function entry.
-        // All reads/writes in the body go through these locals, and we flush them
-        // back to the env at every return point by wrapping with a macro trick.
-        // Simpler: we emit proxy read/write helpers inline via the closure_vars set.
-        // The body emitter (emit_stmt/emit_expr) checks closure_vars and routes
-        // Var reads to dgn_env_get and Assign/PreOp/PostOp to dgn_env_set.
+        self.box_params(params);
+
         let indent = "    ".repeat(self.indent);
-        // Make env non-null safe
         writeln!(self.out, "{}DgnMap* _cenv = _env ? _env->map : 0;", indent).unwrap();
 
         self.emit_stmt(body);
@@ -1680,18 +1732,29 @@ impl Transpiler {
         self.line("}");
         self.line("");
 
-        // Restore
-        self.closure_vars = prev_closure_vars;
+        self.fn_leave(saved_state);
         let generated_fn = std::mem::take(&mut self.out);
         self.out = saved_out;
         self.hoisted.push_str(&generated_fn);
         self.indent = saved_indent;
     }
 
-
-    // ── function definition helpers ───────────────────────────────────────────
-
    fn emit_named_fn(
+        &mut self,
+        fn_c: &str,
+        params: &[(String, Option<String>)],
+        body: &Stmt,
+    ) {
+        let saved_tf = std::mem::take(&mut self.try_frames);
+        let saved_lt = std::mem::take(&mut self.loop_try_base);
+        let saved_fa = std::mem::take(&mut self.finally_at);
+        self.emit_named_fn_inner(fn_c, params, body);
+        self.try_frames = saved_tf;
+        self.loop_try_base = saved_lt;
+        self.finally_at = saved_fa;
+    }
+
+    fn emit_named_fn_inner(
         &mut self,
         fn_c: &str,
         params: &[(String, Option<String>)],
@@ -1700,14 +1763,8 @@ impl Transpiler {
         let saved_indent = self.indent;
         self.indent = 0;
 
-        // Swap out the current buffer so nested lambdas don't interrupt the current C scope
         let mut saved_out = std::mem::take(&mut self.out);
 
-        // Fully-specialized int64_t path (see "Integer fast-path
-        // specialization"): only ever true for a genuine top-level function
-        // name (hoist_top_level passes fn_c == mangle(name) for those; class
-        // methods and field-init get a composite fn_c that can never match
-        // an entry in numeric_callable, so this can't misfire onto a method).
         if self.numeric_callable.contains(fn_c) {
             let pnames = self.numeric_params.get(fn_c).cloned().unwrap_or_default();
 
@@ -1750,15 +1807,6 @@ impl Transpiler {
             return;
         }
 
-        // Float-aware specialized path (see "Float-aware numeric
-        // specialization"). Same shell-wraps-raw-function shape as the
-        // int-only path above, but the boxed shell defensively coerces
-        // each incoming argument based on its ACTUAL runtime tag rather
-        // than assuming it matches the statically-inferred type: nothing
-        // stops a dynamically-typed caller outside the whole-program
-        // evidence scan from passing an int where float was inferred (or
-        // vice versa), and blindly reading the wrong union field would
-        // read garbage bits, not a sane converted value.
         if let Some(sig) = self.numeric_callable_float.get(fn_c).cloned() {
             let pnames = self.numeric_params_float.get(fn_c).cloned().unwrap_or_default();
             let params_c: Vec<String> = pnames.iter().zip(sig.params.iter())
@@ -1817,19 +1865,18 @@ impl Transpiler {
         .unwrap();
         self.indent = 1;
         self.push_scope();
+        let saved_state = self.fn_enter(params, body);
 
         for (i, (pname, default_val)) in params.iter().enumerate() {
-            // Strip out type annotations and detect rest parameters
             let pname_clean = pname.split(':').next().unwrap().trim();
             let is_rest = pname_clean.starts_with("...");
             let actual_pname = if is_rest { pname_clean[3..].trim() } else { pname_clean };
-            
+
             let c_name = mangle(actual_pname);
             let _ = self.decl_var(actual_pname);
             let indent = "    ".repeat(self.indent);
 
             if is_rest {
-                // Collect remaining arguments into a list
                 writeln!(
                     self.out,
                     "{}DgnVal {} = dgn_list_new((_nargs > {}) ? (_nargs - {}) : 0);",
@@ -1861,22 +1908,21 @@ impl Transpiler {
             }
         }
 
+        self.box_params(params);
         self.emit_stmt(body);
         self.line("return dgn_null();");
+        self.fn_leave(saved_state);
         self.pop_scope();
         self.indent = 0;
         self.line("}");
         self.line("");
 
-        // Move the generated function to the global hoisted buffer and restore the previous scope buffer
         let generated_fn = std::mem::take(&mut self.out);
         self.out = saved_out;
         self.hoisted.push_str(&generated_fn);
 
         self.indent = saved_indent;
     }
-
-    // ── class definition ─────────────────────────────────────────────────────
 
     fn emit_classdef_body(&mut self, name: &str, parent: Option<&str>, body: &Stmt) {
         let indent = "    ".repeat(self.indent);
@@ -1900,12 +1946,13 @@ impl Transpiler {
                     let c_name = mangle(name);
                     writeln!(
                         self.out,
-                        "{}dgn_class_add_method(&{}, \"{}\", _fn_{}, {});",
+                        "{}dgn_class_add_method_n(&{}, \"{}\", _fn_{}, {}, \"{}\");",
                         indent,
                         c_name,
                         escape_c_string(mname),
                         fn_c,
-                        params.len()
+                        params.len(),
+                        param_csv(params)
                     )
                     .unwrap();
                 }
@@ -1936,12 +1983,12 @@ impl Transpiler {
             )
             .unwrap();
         }
+        writeln!(self.out, "{}dgn_class_init_statics(&{});", indent, mangle(name)).unwrap();
     }
-
-    // ── if-chain ─────────────────────────────────────────────────────────────
 
     fn emit_ifchain(&mut self, branches: &[(Option<Expr>, Stmt)]) {
         let mut first = true;
+        let mut extra_close = 0;
         for (cond, body) in branches {
             match cond {
                 None => {
@@ -1955,8 +2002,10 @@ impl Transpiler {
                 }
                 Some(c) => {
                     let (pre, cval) = self.emit_expr(c);
+                    let nest = !first && !pre.trim().is_empty();
+                    if nest { self.line("else {"); self.indent += 1; extra_close += 1; }
                     self.raw(&pre);
-                    let keyword = if first { "if" } else { "else if" };
+                    let keyword = if first || nest { "if" } else { "else if" };
                     first = false;
                     let indent = "    ".repeat(self.indent);
                     writeln!(
@@ -1974,9 +2023,8 @@ impl Transpiler {
                 }
             }
         }
+        for _ in 0..extra_close { self.indent -= 1; self.line("}"); }
     }
-
-    // ── for-in ───────────────────────────────────────────────────────────────
 
     fn emit_for_in(
         &mut self,
@@ -1987,8 +2035,8 @@ impl Transpiler {
     ) {
         let cont_lbl = self.fresh_lbl();
         let brk_lbl = self.fresh_lbl();
-        self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
-        
+        self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((Some(cont_lbl.clone()), brk_lbl.clone()));
+
         let (pre, ival) = self.emit_expr(iter_expr);
         self.raw(&pre);
         let iter_tmp = self.fresh_tmp();
@@ -2013,6 +2061,7 @@ impl Transpiler {
 
         let c_var = self.decl_var(var);
         let indent2 = "    ".repeat(self.indent);
+        writeln!(self.out, "{}DGN_SAFEPOINT();", indent2).unwrap();
 
         if let Some(v2) = var2 {
             writeln!(
@@ -2044,20 +2093,18 @@ impl Transpiler {
         }
 
         self.emit_stmt(body);
-        
+
         self.indent -= 1;
         writeln!(self.out, "    {}{}:;", indent2, cont_lbl).unwrap();
         self.indent += 1;
-        
+
         self.pop_scope();
         self.indent -= 1;
         self.line("}");
-        
-        writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-        self.loop_ctx.pop();
-    }
 
-    // ── switch ───────────────────────────────────────────────────────────────
+        writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
+        self.loop_ctx.pop(); self.loop_try_base.pop();
+    }
 
     fn emit_switch(
         &mut self,
@@ -2066,8 +2113,8 @@ impl Transpiler {
         default: Option<&Stmt>,
     ) {
         let brk_lbl = self.fresh_lbl();
-        self.loop_ctx.push((None, brk_lbl.clone()));
-        
+        self.loop_try_base.push(self.try_frames.len()); self.loop_ctx.push((None, brk_lbl.clone()));
+
         let (pre, sval) = self.emit_expr(val_expr);
         self.raw(&pre);
         let sw_tmp = self.fresh_tmp();
@@ -2107,14 +2154,40 @@ impl Transpiler {
         }
         self.indent -= 1;
         self.line("}");
-        
+
         let indent = "    ".repeat(self.indent);
         writeln!(self.out, "{}{}:;", indent, brk_lbl).unwrap();
-        
-        self.loop_ctx.pop();
+
+        self.loop_ctx.pop(); self.loop_try_base.pop();
     }
 
-    // ── try/catch/finally ────────────────────────────────────────────────────
+    fn pop_try_frames_to_loop(&mut self) {
+        let base = self.loop_try_base.last().copied().unwrap_or(0);
+        self.unwind_try_frames(base);
+    }
+
+    fn unwind_try_frames(&mut self, lo: usize) {
+        let frames: Vec<String> = self.try_frames.clone();
+        let saved_fa = self.finally_at.clone();
+        for i in (lo..frames.len()).rev() {
+            let line = format!("dgn_try_pop(&{});", frames[i]);
+            self.line(&line);
+            if let Some((_, fb)) = saved_fa.iter().find(|(idx, _)| *idx == i) {
+
+                self.try_frames.truncate(i);
+                self.finally_at.retain(|(idx, _)| *idx < i);
+                self.line("{");
+                self.indent += 1;
+                self.push_scope();
+                self.emit_stmt(fb);
+                self.pop_scope();
+                self.indent -= 1;
+                self.line("}");
+            }
+        }
+        self.try_frames = frames;
+        self.finally_at = saved_fa;
+    }
 
     fn emit_try(
         &mut self,
@@ -2123,10 +2196,47 @@ impl Transpiler {
         catch_body: Option<&Stmt>,
         finally_body: Option<&Stmt>,
     ) {
+        if let Some(fb) = finally_body {
+
+            let outer = self.fresh_tmp();
+            let pend = self.fresh_tmp();
+            let has = self.fresh_tmp();
+            let indent = "    ".repeat(self.indent);
+            writeln!(self.out, "{}DgnTryFrame {}; {}.thrown = dgn_null();", indent, outer, outer).unwrap();
+            writeln!(self.out, "{}DgnVal {} = dgn_null(); volatile int {} = 0;", indent, pend, has).unwrap();
+            writeln!(self.out, "{}dgn_try_push(&{});", indent, outer).unwrap();
+            writeln!(self.out, "{}if (setjmp({}.buf) == 0) {{", indent, outer).unwrap();
+            self.indent += 1;
+            self.push_scope();
+            self.try_frames.push(outer.clone());
+            self.finally_at.push((self.try_frames.len() - 1, fb.clone()));
+            if catch_body.is_some() {
+                self.emit_try(try_body, catch_var, catch_body, None);
+            } else {
+                self.emit_stmt(try_body);
+            }
+            self.finally_at.pop();
+            self.try_frames.pop();
+            let indent_inner = "    ".repeat(self.indent);
+            writeln!(self.out, "{}dgn_try_pop(&{});", indent_inner, outer).unwrap();
+            self.pop_scope();
+            self.indent -= 1;
+            writeln!(self.out, "{}}} else {{ {} = {}.thrown; {} = 1; }}", indent, pend, outer, has).unwrap();
+            self.line("/* finally */");
+            self.line("{");
+            self.indent += 1;
+            self.push_scope();
+            self.emit_stmt(fb);
+            self.pop_scope();
+            self.indent -= 1;
+            self.line("}");
+            let rethrow = format!("if ({}) dgn_raise({});", has, pend);
+            self.line(&rethrow);
+            return;
+        }
         let jmp_tmp = self.fresh_tmp();
         let indent = "    ".repeat(self.indent);
-        
-        // 1. Declare and push the try frame
+
         writeln!(
             self.out,
             "{}DgnTryFrame {}; {}.thrown = dgn_null();",
@@ -2134,28 +2244,27 @@ impl Transpiler {
         )
         .unwrap();
         writeln!(self.out, "{}dgn_try_push(&{});", indent, jmp_tmp).unwrap();
-        
-        // 2. setjmp returns 0 initially, and > 0 when longjmp occurs
+
         writeln!(
             self.out,
             "{}if (setjmp({}.buf) == 0) {{",
             indent, jmp_tmp
         )
         .unwrap();
-        
+
         self.indent += 1;
         self.push_scope();
+        self.try_frames.push(jmp_tmp.clone());
         self.emit_stmt(try_body);
-        
-        // Pop the try frame if try_body finishes without raising an exception
+        self.try_frames.pop();
+
         let indent_inner = "    ".repeat(self.indent);
         writeln!(self.out, "{}dgn_try_pop(&{});", indent_inner, jmp_tmp).unwrap();
-        
+
         self.pop_scope();
         self.indent -= 1;
         self.line("}");
 
-        // 3. Emitting the catch block
         if let (Some(cv), Some(cb)) = (catch_var, catch_body) {
             let c_name = mangle(cv);
             writeln!(self.out, "{}else {{", indent).unwrap();
@@ -2179,7 +2288,6 @@ impl Transpiler {
             self.line("}");
         }
 
-        // 4. Emitting the finally block
         if let Some(fb) = finally_body {
             self.line("/* finally */");
             self.push_scope();
@@ -2189,9 +2297,6 @@ impl Transpiler {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Top-level transpile driver
-// ─────────────────────────────────────────────────────────────────────────────
 fn collect_assign_targets(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match &expr.node {
         ExprNode::Var(name) => { out.insert(mangle(name)); }
@@ -2251,10 +2356,6 @@ fn collect_top_level_decls(stmt: &Stmt, out: &mut std::collections::HashSet<Stri
         _ => {}
     }
 }
-// ── Direct static-call analysis ─────────────────────────────────────────────
-// Collects the mangled names of every function defined with a top-level
-// `func name(...)` statement (not nested inside another function/lambda, not
-// a class method — those are dispatched differently already).
 fn collect_top_level_funcs(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
     match &stmt.node {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
@@ -2265,14 +2366,6 @@ fn collect_top_level_funcs(stmt: &Stmt, out: &mut std::collections::HashSet<Stri
     }
 }
 
-// Whole-program scan for every name that is ever reassigned or incremented/
-// decremented as a bare identifier — i.e. `name = ...`, `name++`, `--name`,
-// anywhere in the entire program, including inside function bodies, nested
-// lambdas, and class methods (unlike `collect_free_vars`, this does NOT stop
-// at nested function boundaries: a reassignment inside a nested function
-// still means the outer name is mutable). A name that never appears here
-// can never change value after its initial binding, so it's safe to resolve
-// statically at every call site.
 fn collect_all_mutated_names(stmt: &Stmt, out: &mut std::collections::HashSet<String>) {
     match &stmt.node {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
@@ -2370,23 +2463,6 @@ fn scan_expr_mutations(expr: &Expr, out: &mut std::collections::HashSet<String>)
     }
 }
 
-// ── Self-binding elision analysis ───────────────────────────────────────────
-// A recursive top-level function normally binds its own name to a fresh
-// `dgn_func()` value (heap-allocated) on every single call, purely so the
-// body *could* reference itself as a plain value. When the function is
-// direct_callable, every "name(...)" call inside it already resolves
-// statically to the C function (see `direct_callable`), so that binding goes
-// completely unread — except it still pays for a GC-tracked allocation on
-// every invocation. These two checks tell us whether it's safe to skip it:
-// `mangled` is the already-mangled C name being searched for.
-
-// True if `name` is redeclared/shadowed anywhere inside the body (as a
-// param, local const, for-loop var, catch var, or a nested function's own
-// name/params). If so we conservatively keep the self-binding, since the
-// call-site shadowing check (`is_shadowed_locally`) is scope-position-aware
-// in a way this whole-body pass isn't, and diverging between the two could
-// silently make a shadowed inner call try to read the (now-missing) outer
-// binding.
 pub(crate) fn stmt_shadows_name(stmt: &Stmt, mangled: &str) -> bool {
     match &stmt.node {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
@@ -2451,11 +2527,6 @@ pub(crate) fn expr_shadows_name(expr: &Expr, mangled: &str) -> bool {
     }
 }
 
-// True if `name` is ever referenced as a plain value anywhere in the body —
-// i.e. any `Var(name)` that is NOT exactly the callee of a `Call(Var(name),
-// args)` node. Passing the function itself around (as a callback, stored in
-// a list, compared, returned bare, etc.) all count as "used as a value" and
-// force us to keep the real self-binding.
 pub(crate) fn body_uses_name_as_value(stmt: &Stmt, mangled: &str) -> bool {
     match &stmt.node {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
@@ -2500,8 +2571,6 @@ pub(crate) fn expr_uses_name_as_value(expr: &Expr, mangled: &str) -> bool {
     match &expr.node {
         ExprNode::Var(n) => mangle(n) == mangled,
         ExprNode::Call(callee, args) => {
-            // The callee slot is exempt ONLY when it's exactly `name` — that's
-            // the direct-call pattern that never needs the bound value.
             let callee_is_bare_self = matches!(&callee.node, ExprNode::Var(n) if mangle(n) == mangled);
             (!callee_is_bare_self && expr_uses_name_as_value(callee, mangled))
                 || args.iter().any(|a| expr_uses_name_as_value(a, mangled))
@@ -2524,28 +2593,6 @@ pub(crate) fn expr_uses_name_as_value(expr: &Expr, mangled: &str) -> bool {
         ExprNode::Number(_) | ExprNode::String(_) | ExprNode::Bool(_) | ExprNode::Null | ExprNode::This => false,
     }
 }
-
-
-// ── Method-call devirtualization ────────────────────────────────────────────
-// `obj.method(args)` normally goes through dgn_call_method, which does a
-// hashmap lookup by string AND an unconditional malloc/memcpy/free to
-// prepend `obj` onto the argument array -- real cost on every single call.
-// For the common, safe case of `this.method(...)` called from within a
-// method body, we can often prove the call always resolves to exactly one
-// implementation no matter what `this`'s actual runtime subtype is, and
-// call that C function directly with no allocation and no lookup.
-//
-// Soundness: `this` inside a method literally written on class C could, at
-// runtime, be an instance of C or of any subclass of C that doesn't itself
-// override the CURRENTLY EXECUTING method (if it did, this code wouldn't
-// run for it -- a different override would run instead). `method` itself
-// resolves, starting from C, to the nearest ancestor-or-self that defines
-// it (`resolve_method_owner`). It's then safe to call that resolved class's
-// implementation directly as long as NO descendant of it overrides
-// `method` (`overridable_methods`) -- checking descendants of the
-// resolving class rather than of C is deliberately the broader, safer
-// check (a superset of what's strictly necessary), not the tightest
-// possible one.
 
 struct ClassInfo {
     parent: Option<String>,
@@ -2572,16 +2619,13 @@ fn collect_classes(stmt: &Stmt, out: &mut std::collections::HashMap<String, Clas
     }
 }
 
-// Walks up the ancestor chain starting at `start_class` (inclusive) looking
-// for the nearest class that defines `method` directly. This mirrors the
-// runtime's own resolution order (dgn_call_method's parent-chain walk).
 fn resolve_method_owner(
     classes: &std::collections::HashMap<String, ClassInfo>,
     start_class: &str,
     method: &str,
 ) -> Option<String> {
     let mut cur = Some(start_class.to_string());
-    let mut guard = 0; // defends against a malformed/cyclic parent chain
+    let mut guard = 0;
     while let Some(name) = cur {
         guard += 1;
         if guard > 1000 { return None; }
@@ -2621,76 +2665,6 @@ fn compute_overridable_methods(
     overridable
 }
 
-
-// For a top-level function where every parameter, local, and return value is
-// PROVABLY a plain integer (no strings/lists/maps/closures/floats/division/
-// exceptions/dynamic each-loops anywhere in the body, and every code path
-// definitely returns an int-shaped value), we emit a second, fully unboxed
-// C function operating on raw int64_t alongside the normal boxed DgnVal
-// entry point (_fn_<name>). The boxed entry point becomes a thin shell:
-// unbox params once, delegate to the raw function (_fnum_<name>), box the
-// result once. Calls between two specializable functions route directly
-// through the raw path, so a whole call tree of numeric recursion (fib,
-// factorial, gcd, ...) pays the boxing tax exactly once at the outer
-// boundary instead of on every single operation and every call.
-//
-// This is conservative BY CONSTRUCTION: anything the analysis can't prove
-// safe disqualifies the WHOLE function, which then falls back to the
-// existing, unchanged, fully-boxed codegen. In particular:
-//   - No floats or "/" (true division can produce a float; unsafe to assume
-//     int without knowing divisibility at compile time).
-//   - No strings, lists, maps, attribute/index access, closures (FuncExpr),
-//     exceptions (Try/Raise), new/super/await, switch, import, class,
-//     augment, or "each" for-loops (dynamic iterable type).
-//   - No default or rest parameters.
-//   - Boolean-shaped values (comparisons, &&/||/and/or, `!`/`not`, bool
-//     literals) are only permitted in condition position (if/while/ternary
-//     conditions) — never stored in a local, passed as an argument, or
-//     returned — because DGN_BOOL and DGN_INT are different runtime tags,
-//     and comparing a wrongly-tagged result against `true`/`false` from
-//     outside would silently give the wrong answer. See `cond_safe_expr`
-//     vs `int_safe_expr` below.
-//   - Every `Var` reference must resolve to a parameter or a local this
-//     same pass has already seen declared (params pre-seed the set; a
-//     ConstDecl adds to it as the walk proceeds) — anything else (globals,
-//     a name from an enclosing/unrelated scope) disqualifies. This tracking
-//     is deliberately flat/conservative rather than precisely scope-aware;
-//     if it's ever too permissive for some corner case, the raw C emitted
-//     from it would reference an undeclared C identifier and fail to
-//     *compile* — a loud build-time failure, not a silent runtime bug.
-//   - A function must have at least one branch that provably returns on
-//     every path (see `block_definitely_returns`) — no implicit "falls off
-//     the end returning null" allowed, since that's not representable as
-//     an int64_t.
-//   - Whole-program fixpoint: a function that's otherwise structurally safe
-//     but calls a function that ISN'T (transitively) numeric-safe is also
-//     excluded, so mutual recursion is only fast-pathed when every function
-//     in the cycle is provably numeric.
-
-// ── String-building loop optimization ───────────────────────────────────────
-// `s = s + x` inside a loop, via the ordinary boxed path, does a full
-// malloc+strcpy+strcat+free EVERY iteration (dgn_add's string-concat
-// branch has to build a brand new buffer big enough for the WHOLE
-// accumulated string so far, every single time) -- the classic O(n^2)
-// string-building antipattern for n concatenations. When we can prove a
-// loop's body does nothing to a variable except this exact accumulation
-// pattern, we rewrite it to append into a growable DgnStrBuf instead
-// (amortized O(1) per append) and materialize back into a real Dragon
-// string exactly once, after the loop.
-//
-// Soundness hinges entirely on `name` not being observably read as a
-// "live" Dragon string anywhere inside the loop except as the immediate
-// left operand of the accumulation itself -- if it were, that read would
-// see a stale pre-loop value once we stop keeping the DgnVal itself
-// updated each iteration. `find_and_validate_accumulator` enforces this by
-// requiring `name` doesn't appear ANYWHERE else in the loop body (a full,
-// conservative scan) -- and only fires on a variable already known to be a
-// plain string (seeded immediately before the loop by a literal), never on
-// something whose type could be anything else.
-
-// True if `expr` is a left-associative chain of `+` whose leftmost operand
-// is exactly `Var(name)` -- e.g. `s + a + "_" + b`. Returns the ordered
-// list of appended pieces (a, "_", b) if so.
 fn extract_accum_chain(expr: &Expr, name: &str) -> Option<Vec<Expr>> {
     if let ExprNode::Binary(op, l, r) = &expr.node {
         if op == "+" {
@@ -2723,7 +2697,7 @@ fn expr_references_var(expr: &Expr, name: &str) -> bool {
         ExprNode::Super(_, args) => args.iter().any(|a| expr_references_var(a, name)),
         ExprNode::List(items) => items.iter().any(|i| expr_references_var(i, name)),
         ExprNode::Obj(pairs) => pairs.iter().any(|(_, v)| expr_references_var(v, name)),
-        ExprNode::FuncExpr(_, _, body) => stmt_references_var(body, name), // a closure capturing `name`: bail
+        ExprNode::FuncExpr(_, _, body) => stmt_references_var(body, name),
         _ => false,
     }
 }
@@ -2761,12 +2735,6 @@ fn stmt_references_var(stmt: &Stmt, name: &str) -> bool {
     }
 }
 
-// Scans the loop body's top-level statements for exactly one accumulation
-// of `name` in the required shape, and verifies `name` doesn't appear
-// anywhere else in the body at all. The accumulation must be a direct
-// top-level statement of the loop body (not nested inside an inner if/
-// loop) -- deliberately conservative: it means some real accumulator loops
-// won't qualify, but every one that DOES is unambiguously safe.
 fn find_and_validate_accumulator(body_stmts: &[Stmt], name: &str) -> Option<(usize, Vec<Expr>)> {
     let mut found: Option<(usize, Vec<Expr>)> = None;
     for (i, s) in body_stmts.iter().enumerate() {
@@ -2775,9 +2743,9 @@ fn find_and_validate_accumulator(body_stmts: &[Stmt], name: &str) -> Option<(usi
             if let ExprNode::Assign(target, val) = &e.node {
                 if let ExprNode::Var(n) = &target.node {
                     if n == name {
-                        let chain = extract_accum_chain(val, name)?; // wrong shape assignment to name -> bail entirely
+                        let chain = extract_accum_chain(val, name)?;
                         if chain.iter().any(|p| expr_references_var(p, name)) { return None; }
-                        if found.is_some() { return None; } // more than one assignment to name -> bail
+                        if found.is_some() { return None; }
                         found = Some((i, chain));
                         matched_here = true;
                     }
@@ -2792,19 +2760,15 @@ fn find_and_validate_accumulator(body_stmts: &[Stmt], name: &str) -> Option<(usi
 fn int_param_names(params: &[(String, Option<String>)]) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for (p, default) in params {
-        if default.is_some() { return None; } // default params: out of scope for v1
+        if default.is_some() { return None; }
         let clean = p.split(':').next().unwrap_or(p).trim();
-        if clean.starts_with("...") { return None; } // rest params: out of scope for v1
+        if clean.starts_with("...") { return None; }
         if clean.is_empty() { return None; }
         out.push(clean.to_string());
     }
     Some(out)
 }
 
-// True if `e`'s value is safe to use as a plain integer: stored in a local,
-// passed as an argument, returned, or combined arithmetically. Comparisons,
-// logical ops, and bool literals are deliberately EXCLUDED here — they only
-// ever appear via `cond_safe_expr` (see above).
 fn int_safe_expr(expr: &Expr, locals: &std::collections::HashSet<String>, called: &mut std::collections::HashSet<String>) -> bool {
     match &expr.node {
         ExprNode::Number(n) => n.fract() == 0.0,
@@ -2813,7 +2777,7 @@ fn int_safe_expr(expr: &Expr, locals: &std::collections::HashSet<String>, called
             "+" | "-" | "*" | "%" | "&" | "|" | "^" | "<<" | ">>" => {
                 int_safe_expr(l, locals, called) && int_safe_expr(r, locals, called)
             }
-            _ => false, // "/" excluded (may produce float); comparisons/logical excluded (bool-shaped)
+            _ => false,
         },
         ExprNode::Unary(op, e) => (op == "-" || op == "~") && int_safe_expr(e, locals, called),
         ExprNode::Ternary(cond, t, e) => {
@@ -2829,17 +2793,10 @@ fn int_safe_expr(expr: &Expr, locals: &std::collections::HashSet<String>, called
                 false
             }
         }
-        // Everything else (strings, lists, maps, attr/index, assign-as-expr,
-        // pre/post-op-as-expr, closures, new/super/await, bools, null, this)
-        // is out of scope for v1.
         _ => false,
     }
 }
 
-// True if `e` is safe to use in a CONDITION position (if/while/ternary
-// condition): either a genuine boolean-shaped expression built recursively
-// from other condition-safe pieces, or a plain int used via C truthiness
-// (matching dgn_truthy's "nonzero is truthy" rule for ints).
 fn cond_safe_expr(expr: &Expr, locals: &std::collections::HashSet<String>, called: &mut std::collections::HashSet<String>) -> bool {
     match &expr.node {
         ExprNode::Binary(op, l, r) => match op.as_str() {
@@ -2857,10 +2814,6 @@ fn cond_safe_expr(expr: &Expr, locals: &std::collections::HashSet<String>, calle
     }
 }
 
-// Structural walk of a statement. Threads `locals` forward (params pre-seed
-// it; ConstDecl grows it) and accumulates every top-level function name
-// called (for the whole-program fixpoint). Returns false anywhere the body
-// contains something this pass can't prove safe.
 fn int_safe_stmt(stmt: &Stmt, locals: &mut std::collections::HashSet<String>, called: &mut std::collections::HashSet<String>) -> bool {
     match &stmt.node {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
@@ -2874,10 +2827,10 @@ fn int_safe_stmt(stmt: &Stmt, locals: &mut std::collections::HashSet<String>, ca
             ExprNode::PreOp(op, inner) | ExprNode::PostOp(op, inner) => {
                 (op == "++" || op == "--") && matches!(&inner.node, ExprNode::Var(n) if locals.contains(n))
             }
-            _ => false, // bare-statement calls (e.g. print(...)) and anything else: bail
+            _ => false,
         },
         StmtNode::Return(Some(e)) => int_safe_expr(e, locals, called),
-        StmtNode::Return(None) => false, // "returns null" isn't representable as int64_t
+        StmtNode::Return(None) => false,
         StmtNode::Break | StmtNode::Continue => true,
         StmtNode::ConstDecl(name, e) => {
             if int_safe_expr(e, locals, called) {
@@ -2900,14 +2853,10 @@ fn int_safe_stmt(stmt: &Stmt, locals: &mut std::collections::HashSet<String>, ca
                 && step.as_ref().map_or(true, |e| int_safe_stmt_expr_toplevel(e, locals, called))
                 && int_safe_stmt(body, locals, called)
         }
-        // For-each (dynamic iterable), Switch, Try, nested FuncDef, ClassDef,
-        // Augment, Import, Raise: all disqualify.
         _ => false,
     }
 }
 
-// CFor's init/step slots are bare Exprs (usually an Assign or a PreOp/PostOp,
-// same shapes allowed at statement level) rather than full Stmts.
 fn int_safe_stmt_expr_toplevel(e: &Expr, locals: &mut std::collections::HashSet<String>, called: &mut std::collections::HashSet<String>) -> bool {
     match &e.node {
         ExprNode::Assign(target, val) => {
@@ -2921,10 +2870,6 @@ fn int_safe_stmt_expr_toplevel(e: &Expr, locals: &mut std::collections::HashSet<
     }
 }
 
-// True if every path through `stmts` (as a sequence at this block level)
-// definitely reaches a `Return`. Loops are conservatively assumed NOT to
-// guarantee a return by themselves (they might not execute, or exit via
-// break) — that's fine as long as a later statement in the same block does.
 fn block_definitely_returns(stmts: &[Stmt]) -> bool {
     for st in stmts {
         match &st.node {
@@ -2953,8 +2898,6 @@ fn stmt_definitely_returns(stmt: &Stmt) -> bool {
     }
 }
 
-// Collects (mangled_name, unmangled_param_names, body) for every top-level
-// `func` — only used as input to the numeric-specialization fixpoint below.
 fn collect_top_level_funcdefs(stmt: &Stmt, out: &mut Vec<(String, Vec<(String, Option<String>)>, Stmt)>) {
     match &stmt.node {
         StmtNode::Block(stmts) | StmtNode::Multi(stmts) => {
@@ -2967,12 +2910,6 @@ fn collect_top_level_funcdefs(stmt: &Stmt, out: &mut Vec<(String, Vec<(String, O
     }
 }
 
-// Whole-program fixpoint: which top-level functions are safe to fully
-// specialize to raw int64_t? Only considers functions already known to be
-// `direct_callable` (never reassigned) — specializing a function whose name
-// might be rebound to something else entirely doesn't make sense anyway,
-// since the boxed shell's identity is what a rebinding would replace.
-// Returns (numeric_callable set, param-name map) keyed by mangled name.
 fn compute_numeric_callable(
     ast: &Stmt,
     direct_callable: &std::collections::HashSet<String>,
@@ -2980,9 +2917,6 @@ fn compute_numeric_callable(
     let mut funcdefs = Vec::new();
     collect_top_level_funcdefs(ast, &mut funcdefs);
 
-    // Structural pass: for each direct_callable function with no default/
-    // rest params, check the body is int-safe and definitely returns.
-    // Candidates map: mangled name -> (param names, set of mangled names it calls).
     let mut candidates: std::collections::HashMap<String, (Vec<String>, std::collections::HashSet<String>)> =
         std::collections::HashMap::new();
     let mut param_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -2994,15 +2928,12 @@ fn compute_numeric_callable(
         let mut locals: std::collections::HashSet<String> = pnames.iter().cloned().collect();
         let mut called = std::collections::HashSet::new();
         if int_safe_stmt(body, &mut locals, &mut called) && stmt_definitely_returns(body) {
-            called.remove(&c_name); // self-calls don't constrain the fixpoint
+            called.remove(&c_name);
             candidates.insert(c_name.clone(), (pnames.clone(), called));
             param_map.insert(c_name, pnames);
         }
     }
 
-    // Fixpoint: drop any candidate that calls something outside the
-    // surviving candidate set (a function we couldn't prove safe, or one
-    // that isn't even a plain top-level function call).
     loop {
         let mut to_remove = Vec::new();
         for (name, (_, called)) in &candidates {
@@ -3019,27 +2950,6 @@ fn compute_numeric_callable(
     (numeric_callable, param_map)
 }
 
-// ── Float-aware numeric specialization (additive, separate from the int-only
-// path above) ────────────────────────────────────────────────────────────
-//
-// The int-only specializer above is left completely untouched — every
-// function it already handles keeps generating byte-identical code. This
-// section ONLY looks at functions the int-only pass rejected, and tries a
-// broader analysis that allows float-typed parameters/locals too. If it
-// can't prove a function safe, that function simply falls back to the
-// ordinary boxed path, exactly as it did before this section existed.
-//
-// Why this needs real type inference, not just a bigger "safe op" list:
-// Dragon's own dgn_div is RUNTIME-VALUE-dependent when both operands are
-// int (exact division stays int, e.g. 10/2 -> int 5; 10/3 -> float 3.33),
-// so "/" can only be specialized when we can PROVE at least one operand is
-// float (in which case dgn_div is always float, deterministically -- see
-// runtime.rs). Bitwise ops (&,|,^,<<,>>,~) read the DgnVal union's .i field
-// unconditionally regardless of tag, so giving them a float operand would
-// reinterpret its bits as garbage; they're only sound with Int operands.
-// Getting this right requires knowing each value's type, not just "is this
-// numeric".
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NumType { Int, Float }
 
@@ -3047,13 +2957,6 @@ fn num_c_type(t: NumType) -> &'static str {
     match t { NumType::Int => "int64_t", NumType::Float => "double" }
 }
 
-// ── Phase 1: parameter-type evidence ────────────────────────────────────
-// A parameter's type can't be inferred from a "declaration" the way a local
-// can (ConstDecl has an RHS to look at; a parameter doesn't) -- so instead
-// we gather evidence for it from two places: how it's used inside the
-// function body, and what literal types are passed to it at call sites
-// elsewhere in the whole program. If evidence conflicts (e.g. used with a
-// fractional literal AND with a bitwise op), the function is disqualified.
 #[derive(Default)]
 struct TypeEvidence {
     float_ev: std::collections::HashSet<String>,
@@ -3113,11 +3016,6 @@ fn collect_evidence_stmt(stmt: &Stmt, ev: &mut TypeEvidence) {
     }
 }
 
-// Whole-program scan: does any call site `fn_name(...)` anywhere pass a
-// fractional literal in a given argument position? That's independent
-// evidence the corresponding parameter is float-typed, covering the very
-// common case of a function whose body alone gives no hint (e.g.
-// `func avg(a,b) { return (a+b)/2 }` called as `avg(3.5, 2.5)`).
 fn collect_call_site_evidence_expr(expr: &Expr, fn_name: &str, pnames: &[String], ev: &mut TypeEvidence) {
     if let ExprNode::Call(callee, args) = &expr.node {
         if let ExprNode::Var(n) = &callee.node {
@@ -3183,14 +3081,12 @@ fn resolve_param_types(pnames: &[String], ev: &TypeEvidence) -> Option<Vec<NumTy
     for p in pnames {
         let is_float = ev.float_ev.contains(p);
         let is_int_only = ev.int_only_ev.contains(p);
-        if is_float && is_int_only { return None; } // contradiction: bail, safe fallback
+        if is_float && is_int_only { return None; }
         out.push(if is_float { NumType::Float } else { NumType::Int });
     }
     Some(out)
 }
 
-// ── Phase 2: full type-checking walk, given resolved types for every
-// candidate function's params/return (built up by the fixpoint below). ──
 #[derive(Clone)]
 struct FnSig { params: Vec<NumType>, ret: Option<NumType> }
 
@@ -3213,12 +3109,6 @@ fn num_cond_safe(
     }
 }
 
-// Returns the expression's type if every subexpression type-checks under
-// Dragon's real runtime promotion rules (see the module doc comment above),
-// or None if anything is unprovable/unsafe. `sigs` gives the (possibly
-// still-partial, mid-fixpoint) known signatures of other candidate
-// functions -- a None `ret` there means "not resolved yet", which makes any
-// call to it fail for this round (the fixpoint driver just retries later).
 fn num_infer_expr_type(
     expr: &Expr,
     types: &std::collections::HashMap<String, NumType>,
@@ -3330,9 +3220,6 @@ fn num_safe_toplevel_expr(
     }
 }
 
-// Same "no implicit fall-through" requirement as the int-only path; reuses
-// `block_definitely_returns`/`stmt_definitely_returns` from that section.
-
 fn compute_numeric_callable_float(
     ast: &Stmt,
     direct_callable: &std::collections::HashSet<String>,
@@ -3341,7 +3228,6 @@ fn compute_numeric_callable_float(
     let mut funcdefs = Vec::new();
     collect_top_level_funcdefs(ast, &mut funcdefs);
 
-    // Only consider functions the int-only pass didn't already claim.
     let mut param_types: std::collections::HashMap<String, Vec<NumType>> = std::collections::HashMap::new();
     let mut param_names: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let mut bodies: std::collections::HashMap<String, Stmt> = std::collections::HashMap::new();
@@ -3363,7 +3249,6 @@ fn compute_numeric_callable_float(
         bodies.insert(c_name, body.clone());
     }
 
-    // Fixpoint over return types: round-robin retry until stable.
     let mut sigs: std::collections::HashMap<String, FnSig> = param_types
         .iter()
         .map(|(k, v)| (k.clone(), FnSig { params: v.clone(), ret: None }))
@@ -3380,10 +3265,6 @@ fn compute_numeric_callable_float(
             let mut types: std::collections::HashMap<String, NumType> =
                 pnames.iter().cloned().zip(ptypes.iter().copied()).collect();
             let body = &bodies[name];
-            // Try to resolve a consistent return type from every Return in
-            // the body using currently-known signatures (others may still
-            // be unresolved -- that's fine, we just won't make progress on
-            // THIS function until they are, and we retry next round).
             let mut collected_returns: Vec<NumType> = Vec::new();
             if collect_return_types(body, &mut types.clone(), &sigs, &mut collected_returns) {
                 if let Some(&first) = collected_returns.first() {
@@ -3397,12 +3278,6 @@ fn compute_numeric_callable_float(
     }
     sigs.retain(|_, s| s.ret.is_some());
 
-    // Final full-body verification with the now-fully-resolved signature
-    // set, plus the same whole-program-fixpoint idea as the int-only path:
-    // drop anything that, on full inspection, doesn't actually type-check
-    // (covers cases the return-type-only pass above couldn't see, like a
-    // stray operation whose result is discarded) or that calls something
-    // outside the surviving set.
     loop {
         let mut to_remove = Vec::new();
         for name in sigs.keys() {
@@ -3424,12 +3299,6 @@ fn compute_numeric_callable_float(
     (sigs, param_names)
 }
 
-// Walks a body collecting the inferred type of every `return` reachable
-// from it, using a *local copy* of `types` per branch so branches don't
-// leak declarations into each other (mirrors how num_safe_stmt would see
-// it during the real verification pass). Returns false if any return
-// fails to type-check with current knowledge (caller treats that as "try
-// again once more signatures are known", not a permanent failure).
 fn collect_return_types(
     stmt: &Stmt,
     types: &mut std::collections::HashMap<String, NumType>,
@@ -3466,11 +3335,10 @@ fn collect_return_types(
             collect_return_types(body, &mut sub, sigs, out)
         }
         StmtNode::Expr(_) | StmtNode::Break | StmtNode::Continue => true,
-        _ => true, // anything else disqualifies via num_safe_stmt's later full pass, not here
+        _ => true,
     }
 }
 
-// ── Raw emitter for float-aware specialized functions ──────────────────────
 struct NumSpecTranspiler {
     out: String,
     indent: usize,
@@ -3586,14 +3454,6 @@ impl NumSpecTranspiler {
                 let lv = self.emit_expr(l, sigs);
                 let rv = self.emit_expr(r, sigs);
                 if op == "/" {
-                    // Safety net matches the analysis: "/" only ever gets
-                    // here when at least one operand is float, so plain C
-                    // division already does float division (mixed int/
-                    // double operands promote to double automatically);
-                    // cast defensively in case both sides happen to render
-                    // as int-typed subexpressions that still resolved float
-                    // overall (shouldn't happen given the analysis, but the
-                    // cast is free insurance against a C-level int/int trunc).
                     format!("((double)({}) / (double)({}))", lv, rv)
                 } else {
                     format!("({} {} {})", lv, op, rv)
@@ -3638,13 +3498,6 @@ impl NumSpecTranspiler {
     }
 }
 
-// Mirrors the shape of NativeTranspiler in native.rs but is deliberately
-// separate: call routing here goes through _fnum_<name> for calls to other
-// numeric_callable functions (proven safe by the fixpoint above), which
-// NativeTranspiler has no notion of. Every expression shape this emitter
-// encounters was already validated by int_safe_expr/cond_safe_expr, so
-// there's no fallback path here — anything unexpected is a bug in the
-// analysis above, not something this emitter tries to paper over.
 struct IntSpecTranspiler {
     out: String,
     indent: usize,
@@ -3659,10 +3512,6 @@ impl IntSpecTranspiler {
     }
     fn emit_body(&mut self, body: &Stmt) {
         self.emit_stmt(body);
-        // Belt-and-suspenders default return: block_definitely_returns
-        // already proved every real path returns, so this is unreachable,
-        // but the C compiler can't see that and would otherwise warn/UB on
-        // a function that (as far as it can tell) might fall off the end.
         self.line("return 0; /* unreachable */");
     }
     fn emit_stmt(&mut self, stmt: &Stmt) {
@@ -3735,11 +3584,9 @@ impl IntSpecTranspiler {
                 self.indent += 1; self.emit_stmt(body); self.indent -= 1;
                 self.line("}");
             }
-            _ => {} // unreachable given int_safe_stmt already validated the body
+            _ => {}
         }
     }
-    // CFor's init/step slots are bare Exprs (Assign or PreOp/PostOp),
-    // rendered without a trailing semicolon for use in a C `for(...)` clause.
     fn emit_bare_expr(&mut self, e: &Expr) -> String {
         match &e.node {
             ExprNode::Assign(target, val) => {
@@ -3822,47 +3669,42 @@ impl IntSpecTranspiler {
     }
 }
 
+pub(crate) static APP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String {
     let mut out = String::new();
     out.push_str(RUNTIME_HEADER);
 
     let mut t = Transpiler::new();
-    
-    // 1. Collect all top-level variables, functions, and imports
+
     let mut top_level_vars = std::collections::HashSet::new();
     collect_top_level_decls(ast, &mut top_level_vars);
-    
-    // Ensure standard system globals are included
+
     top_level_vars.insert("_v_PI".into());
     top_level_vars.insert("_v_E".into());
     top_level_vars.insert("_v_argv".into());
-    
-    // Pre-fill the global transpiler scope so `decl_var` knows they exist!
+
     if let Some(scope) = t.declared.last_mut() {
         for v in &top_level_vars {
             scope.insert(v.clone());
         }
     }
 
-    // Work out which top-level functions are safe to call directly (see
-    // `direct_callable` field doc comment): defined once at module scope,
-    // and never reassigned/incremented anywhere in the whole program.
     let mut top_fns = std::collections::HashSet::new();
     collect_top_level_funcs(ast, &mut top_fns);
     let mut mutated = std::collections::HashSet::new();
     collect_all_mutated_names(ast, &mut mutated);
     t.direct_callable = top_fns.difference(&mutated).cloned().collect();
 
-    // Work out which of those are further safe to fully specialize to raw
-    // int64_t (see "Integer fast-path specialization" above).
-    let (numeric_callable, numeric_params) = compute_numeric_callable(ast, &t.direct_callable);
+    let app_mode = APP_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let (numeric_callable, numeric_params) = if app_mode {
+        (std::collections::HashSet::new(), std::collections::HashMap::new())
+    } else {
+        compute_numeric_callable(ast, &t.direct_callable)
+    };
     t.numeric_callable = numeric_callable;
     t.numeric_params = numeric_params;
 
-    // Forward-declare those functions' C signatures so direct calls type-check
-    // regardless of the (arbitrary, possibly mutually-recursive) order the
-    // functions are hoisted in below.
     if !t.direct_callable.is_empty() {
         let mut sorted_direct: Vec<&String> = t.direct_callable.iter().collect();
         sorted_direct.sort();
@@ -3889,11 +3731,11 @@ pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String
         out.push_str("\n");
     }
 
-    // Float-aware specialization: only looks at functions the int-only
-    // pass above didn't already claim (see "Float-aware numeric
-    // specialization").
-    let (numeric_callable_float, numeric_params_float) =
-        compute_numeric_callable_float(ast, &t.direct_callable, &t.numeric_callable);
+    let (numeric_callable_float, numeric_params_float) = if app_mode {
+        (std::collections::HashMap::new(), std::collections::HashMap::new())
+    } else {
+        compute_numeric_callable_float(ast, &t.direct_callable, &t.numeric_callable)
+    };
     t.numeric_callable_float = numeric_callable_float;
     t.numeric_params_float = numeric_params_float;
 
@@ -3911,16 +3753,11 @@ pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String
         out.push_str("\n");
     }
 
-    // Method-call devirtualization analysis (whole-program class hierarchy).
     let mut classes = std::collections::HashMap::new();
     collect_classes(ast, &mut classes);
     t.overridable_methods = compute_overridable_methods(&classes);
     t.classes = classes;
 
-    // Forward-declare every method of every class: a devirtualized call
-    // (see resolve_devirtualized_method) can now reference a method's C
-    // function from another class defined earlier in the source, which
-    // otherwise wouldn't compile without a prior declaration.
     if !t.classes.is_empty() {
         let mut sorted_classes: Vec<&String> = t.classes.keys().collect();
         sorted_classes.sort();
@@ -3941,7 +3778,7 @@ pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String
 
     t.indent = 0;
     hoist_top_level(ast, &mut t, base_dir);
-    
+
     t.indent = 1;
     t.push_scope();
 
@@ -3952,28 +3789,20 @@ pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String
     emit_top_level_body(ast, &mut t, base_dir);
     t.pop_scope();
 
-    // -- Assemble the final C file --
-
-    // Emit the true C globals — NOT static, so dgn_gc_collect can root them.
-    // Static globals live in BSS/data which the conservative stack scanner
-    // never sees; they must be explicitly marked or the GC frees them.
     let mut sorted_globals: Vec<String> = top_level_vars.into_iter().collect();
     sorted_globals.sort();
 
-    // Extern forward declarations consumed by the GC root block in RUNTIME_HEADER
     out.push_str("/* GC extern forward declarations */\n");
     for g in &sorted_globals {
         out.push_str(&format!("extern DgnVal {};\n", g));
     }
     out.push_str("\n");
 
-    // Actual definitions — no static, so extern linkage is satisfied
     for g in &sorted_globals {
         out.push_str(&format!("DgnVal {};\n", g));
     }
     out.push_str("\n");
 
-    // Emit the sentinel-terminated global roots array for dgn_gc_collect
     out.push_str("/* Sentinel-terminated array of all top-level globals for GC rooting */\n");
     out.push_str("DgnVal* _dgn_global_roots[] = {\n");
     for g in &sorted_globals {
@@ -3981,7 +3810,6 @@ pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String
     }
     out.push_str("    NULL\n};\n\n");
 
-    // Emit the hoisted functions
     out.push_str(&t.hoisted);
 
     out.push_str("int main(int argc, char** argv) {\n");
@@ -4000,12 +3828,18 @@ pub(crate) fn transpile(ast: &Stmt, _is_lib: bool, base_dir: &PathBuf) -> String
     out
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ── Free-variable analysis ────────────────────────────────────────────────────
-// Collects all variable names *used* in `body` that are not bound by `params`.
-// "Used" means appearing as ExprNode::Var, including as targets of assignments,
-// pre/post-ops, etc. Recurses into nested lambdas but does NOT collect variables
-// that are only defined inside a deeper lambda (they are local to that lambda).
+fn has_named_pack(args: &[Expr]) -> bool {
+    matches!(args.last().map(|a| &a.node), Some(ExprNode::Obj(pairs)) if pairs.first().map(|(k, _)| k == "__named__").unwrap_or(false))
+}
+
+fn param_csv(params: &[(String, Option<String>)]) -> String {
+    params.iter().map(|(p, _)| {
+        let n = p.split(':').next().unwrap_or(p).trim();
+        let n = n.strip_prefix("...").unwrap_or(n);
+        n.to_string()
+    }).collect::<Vec<_>>().join(",")
+}
+
 fn collect_free_vars(
     body: &Stmt,
     params: &std::collections::HashSet<String>,
@@ -4029,7 +3863,6 @@ fn collect_free_vars_stmt(
         StmtNode::Return(None) | StmtNode::Break | StmtNode::Continue => {}
         StmtNode::ConstDecl(_, e) => { collect_free_vars_expr(e, bound, out); }
         StmtNode::FuncDef(_, params, _, body, _) => {
-            // Don't descend into nested named functions — they form their own scope
             let _ = (params, body);
         }
         StmtNode::IfChain(branches) => {
@@ -4079,7 +3912,11 @@ fn collect_free_vars_expr(
     match &expr.node {
         ExprNode::Var(name) => {
             let c = mangle(name);
-            if !bound.contains(&c) { out.insert(c); }
+            if !bound.contains(&c) && !skip_outside_closure() { out.insert(c); }
+        }
+        ExprNode::This => {
+            let c = mangle("this");
+            if !bound.contains(&c) && !skip_outside_closure() { out.insert(c); }
         }
         ExprNode::Assign(target, val) => {
             collect_free_vars_expr(target, bound, out);
@@ -4103,7 +3940,6 @@ fn collect_free_vars_expr(
             for a in args { collect_free_vars_expr(a, bound, out); }
         }
         ExprNode::List(items) | ExprNode::New(_, items) => {
-            // For New, the first sub-expr is the class - handle both uniformly
             if let ExprNode::New(cls, args) = &expr.node {
                 collect_free_vars_expr(cls, bound, out);
                 for a in args { collect_free_vars_expr(a, bound, out); }
@@ -4114,8 +3950,6 @@ fn collect_free_vars_expr(
         ExprNode::Obj(pairs) => {
             for (_, v) in pairs { collect_free_vars_expr(v, bound, out); }
         }
-        // FuncExpr: collect free vars of the *inner* lambda relative to *its* params,
-        // then anything that inner lambda captures from OUR scope is a free var for us too
         ExprNode::FuncExpr(params, _, body) => {
             let mut inner_bound = bound.clone();
             for (p, _) in params {
@@ -4123,7 +3957,9 @@ fn collect_free_vars_expr(
                 let actual = if pname.starts_with("...") { &pname[3..] } else { pname };
                 inner_bound.insert(mangle(actual));
             }
+            IN_CLOSURE.with(|c| c.set(c.get() + 1));
             collect_free_vars_stmt(body, &inner_bound, out);
+            IN_CLOSURE.with(|c| c.set(c.get() - 1));
         }
         _ => {}
     }
@@ -4159,7 +3995,6 @@ fn hoist_top_level(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
                 t.current_class = None;
             }
         }
-        // ── NEW: hoist functions from user .dgn modules ──────────────────
         StmtNode::Import(module, _alias) if !is_builtin_module(module) => {
             if !t.hoisted_modules.contains(module) {
                 if let Some(mod_ast) = load_user_module(module, base_dir) {
@@ -4172,7 +4007,6 @@ fn hoist_top_level(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
     }
 }
 
-/// Resolve and parse a user .dgn module file. Returns None if not found.
 pub(crate) fn load_user_module(module: &str, base_dir: &PathBuf) -> Option<Stmt> {
     let candidates = [
         base_dir.join(format!("{}.dgn", module)),
@@ -4192,8 +4026,6 @@ pub(crate) fn load_user_module(module: &str, base_dir: &PathBuf) -> Option<Stmt>
     None
 }
 
-/// Hoist all functions from a user module with namespaced C names:
-/// square() in math_tools → _fn__v_math_tools__v_square
 fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
 
     let stmts = match &ast.node {
@@ -4203,11 +4035,10 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
 
     let mod_prefix = format!("_mod_{}", mangle(module));
 
-    // 1. Collect module-scope names: vars, consts, imports, AND functions
     let mut mod_vars: Vec<(String, String)> = Vec::new();
     for s in stmts {
         match &s.node {
-            StmtNode::FuncDef(fname, _, _, _, _) => {                    // ← FIX 3
+            StmtNode::FuncDef(fname, _, _, _, _) => {
                 let m = mangle(fname);
                 if !mod_vars.iter().any(|(k,_)| k == &m) {
                     mod_vars.push((m, fname.clone()));
@@ -4234,12 +4065,6 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
         }
     }
 
-     // 1b. PRE-PASS: recursively hoist user sub-modules BEFORE emitting anything
-    //     for this module. This ensures sub-modules complete their full
-    //     #define → function bodies → #undef cycle before this module's
-    //     step 3 (#define) runs, preventing macro redefinition warnings.
-    //     Also resolves sub-modules relative to the containing module's directory
-    //     (e.g. providers/ollama.dgn when processing providers/router.dgn).
     let module_dir = base_dir.join(
         std::path::Path::new(module).parent().unwrap_or(std::path::Path::new(""))
     );
@@ -4260,17 +4085,15 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
         }
     }
 
-    // 2. Emit static storage for every module-scope name
     for (var, _) in &mod_vars {
         writeln!(t.hoisted, "static DgnVal {}_{};", mod_prefix, var).unwrap();
     }
 
-    // 3. #define short names → namespaced statics
     writeln!(t.hoisted, "/* {}: map short names → namespaced statics */", module).unwrap();
     for (var, _) in &mod_vars {
         writeln!(t.hoisted, "#define {} {}_{}", var, mod_prefix, var).unwrap();
     }
-    
+
     t.push_scope();
     if let Some(scope) = t.declared.last_mut() {
         for (var, _) in &mod_vars {
@@ -4303,7 +4126,6 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
             }
         }
     }
-    // 5. Emit _init_<module>() BEFORE #undef so it can use the #defined names  ← FIX 1
     writeln!(t.hoisted, "static int _init_{}_done = 0;", mangle(module)).unwrap();
     writeln!(t.hoisted, "static void _init_{}(void) {{", mangle(module)).unwrap();
     writeln!(t.hoisted, "    if (_init_{}_done) return; _init_{}_done = 1;",
@@ -4317,10 +4139,7 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
                 if is_builtin_module(dep) {
                     writeln!(t.hoisted, "    {}_{} = dgn_load_module(\"{}\");",
                              mod_prefix, var, dep).unwrap();
-                // AFTER (fixed):
 } else {
-                    // Sub-module was already hoisted in the pre-pass above.
-                    // Build the module map inside _init_<module>().
                     writeln!(t.hoisted, "    {}_{} = dgn_map_new();", mod_prefix, var).unwrap();
                     writeln!(t.hoisted, "    _init_{}();", mangle(dep)).unwrap();
                     if let Some(sub_ast) = load_user_module(dep, base_dir) {
@@ -4385,7 +4204,7 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
                     }
                 }
             }
-            StmtNode::FuncDef(fname, params, _, _, _) => {               // ← FIX 3
+            StmtNode::FuncDef(fname, params, _, _, _) => {
                 let var = mangle(fname);
                 let fn_c = format!("{}_{}", mangle(module), var);
                 writeln!(t.hoisted,
@@ -4398,13 +4217,11 @@ fn hoist_module_decls(module: &str, ast: &Stmt, t: &mut Transpiler, base_dir: &P
     }
     writeln!(t.hoisted, "}}").unwrap();
 
-    // 6. #undef AFTER _init_ closes                                      ← FIX 1
     for (var, _) in &mod_vars {
         writeln!(t.hoisted, "#undef {}", var).unwrap();
     }
 }
 
-/// Emit dgn_map_set calls to populate the module map from its exported symbols.
 fn emit_module_map_entries(module: &str, bind: &str, ast: &Stmt, t: &mut Transpiler) {
     let stmts = match &ast.node {
         StmtNode::Block(s) | StmtNode::Multi(s) => s,
@@ -4413,7 +4230,6 @@ fn emit_module_map_entries(module: &str, bind: &str, ast: &Stmt, t: &mut Transpi
     let indent = "    ".repeat(t.indent);
     let c_name = mangle(bind);
 
-    // Run the module initializer first (idempotent — guarded by _done flag)
     writeln!(t.out, "{}    _init_{}();", indent, mangle(module)).unwrap();
 
     for s in stmts {
@@ -4435,7 +4251,6 @@ fn emit_module_map_entries(module: &str, bind: &str, ast: &Stmt, t: &mut Transpi
                     }
                     ExprNode::Bool(b) => format!("dgn_bool({})", if *b { 1 } else { 0 }),
                     _ => {
-                        // Non-literal const: read from the namespaced static after init
                         format!("_mod_{}_{}", mangle(module), mangle(cname))
                     }
                 };
@@ -4455,7 +4270,7 @@ fn emit_top_level_body(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
             let c_name = mangle(name);
             let decl = t.decl_var(name);
             let indent = "    ".repeat(t.indent);
-            writeln!(t.out, "{}{} = dgn_func(_fn_{}, {});", indent, decl, c_name, params.len()).unwrap();
+            writeln!(t.out, "{}{} = dgn_func_n(_fn_{}, {}, \"{}\");", indent, decl, c_name, params.len(), param_csv(params)).unwrap();
         }
         StmtNode::ClassDef(name, parent, body) => {
             let indent = "    ".repeat(t.indent);
@@ -4466,7 +4281,7 @@ fn emit_top_level_body(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
                     if let StmtNode::FuncDef(mname, params, _req, _, _) = &s.node {
                         let fn_c = format!("{}_{}", mangle(name), mangle(mname));
                         let c_name = mangle(name);
-                        writeln!(t.out, "{}dgn_class_add_method(&{}, \"{}\", _fn_{}, {});", indent, c_name, escape_c_string(mname), fn_c, params.len()).unwrap();
+                        writeln!(t.out, "{}dgn_class_add_method_n(&{}, \"{}\", _fn_{}, {}, \"{}\");", indent, c_name, escape_c_string(mname), fn_c, params.len(), param_csv(params)).unwrap();
                     }
                 }
             }
@@ -4479,6 +4294,7 @@ fn emit_top_level_body(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
                 let c_name = mangle(name);
                 writeln!(t.out, "{}dgn_class_set_parent(&{}, {});", indent, c_name, mangle(p)).unwrap();
             }
+            writeln!(t.out, "{}dgn_class_init_statics(&{});", indent, mangle(name)).unwrap();
         }
         StmtNode::Import(module, alias) if !is_builtin_module(module) => {
             let bind = alias.as_deref().unwrap_or(module.as_str());
@@ -4486,7 +4302,7 @@ fn emit_top_level_body(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
             let indent = "    ".repeat(t.indent);
             writeln!(t.out, "{}{} = dgn_map_new();", indent, c_name).unwrap();
             if let Some(mod_ast) = load_user_module(module, base_dir) {
-                emit_module_map_entries(module, bind, &mod_ast, t);  // already calls _init_
+                emit_module_map_entries(module, bind, &mod_ast, t);
             }
             writeln!(t.out, "{}(void){};", indent, c_name).unwrap();
         }
@@ -4496,3 +4312,20 @@ fn emit_top_level_body(ast: &Stmt, t: &mut Transpiler, base_dir: &PathBuf) {
     }
 }
 
+thread_local! {
+    static CLOSURE_ONLY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static IN_CLOSURE: std::cell::Cell<i32> = std::cell::Cell::new(0);
+}
+
+fn closure_captured_names(body: &Stmt) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    CLOSURE_ONLY.with(|c| c.set(true));
+    IN_CLOSURE.with(|c| c.set(0));
+    collect_free_vars_stmt(body, &std::collections::HashSet::new(), &mut out);
+    CLOSURE_ONLY.with(|c| c.set(false));
+    out
+}
+
+fn skip_outside_closure() -> bool {
+    CLOSURE_ONLY.with(|c| c.get()) && IN_CLOSURE.with(|c| c.get()) == 0
+}

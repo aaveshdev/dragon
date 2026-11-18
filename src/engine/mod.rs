@@ -49,7 +49,6 @@ use fontdb;
 use image::GenericImageView;
 
 lazy_static! {
-    // static ref GC_STATE: Mutex<GcState> = Mutex::new(GcState::new());
     static ref FFI_SIGNATURES: Mutex<HashMap<String, (String, Vec<String>)>> = Mutex::new(HashMap::new());
 static ref FFI_STRUCTS: Mutex<HashMap<String, FfiStructDef>> = Mutex::new(HashMap::new());
 
@@ -57,17 +56,17 @@ static ref BUILTIN_MODULE_CACHE: Mutex<HashMap<String, DgnValue>> =
         Mutex::new(HashMap::new());
 
     static ref TOKEN_REGEXES: Vec<(&'static str, Regex)> = vec![
-        ("INC", Regex::new(r"^\+\+").unwrap()), 
-        ("DEC", Regex::new(r"^--").unwrap()), 
-        ("COMMENT_ML", Regex::new(r"(?s)^/\*.*?\*/").unwrap()), 
-        ("COMMENT_SL", Regex::new(r"^//[^\n]*").unwrap()), 
+        ("INC", Regex::new(r"^\+\+").unwrap()),
+        ("DEC", Regex::new(r"^--").unwrap()),
+        ("COMMENT_ML", Regex::new(r"(?s)^/\*.*?\*/").unwrap()),
+        ("COMMENT_SL", Regex::new(r"^//[^\n]*").unwrap()),
         ("HEX", Regex::new(r"^0x[0-9a-fA-F]+").unwrap()),
         ("NUMBER", Regex::new(r"^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?").unwrap()),
-        ("STRING", Regex::new(r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)+'"#).unwrap()), 
+        ("STRING", Regex::new(r#"^"([^"\\]|\\.)*"|^'([^'\\]|\\.)+'"#).unwrap()),
         ("NAME", Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*").unwrap()),
         ("OP", Regex::new(r"^(==|!=|<=|>=|=>|<<|>>|\?\?|\.\.\.|[!+\-*/%<>=?:;,&|^~(){}\[\].])").unwrap()),
         ("NEWLINE", Regex::new(r"^\n").unwrap()),
-        ("SKIP", Regex::new(r"^[ \t\r\u{FEFF}\x00]+").unwrap()), 
+        ("SKIP", Regex::new(r"^[ \t\r\u{FEFF}\x00]+").unwrap()),
         ("MISMATCH", Regex::new(r"^.").unwrap()),
     ];
 }
@@ -78,19 +77,15 @@ task_local! {
 
 struct FfiStructDef {
     size: usize,
-    fields: Vec<(String, usize, Type)>, // Name, Offset, LibFFI Type"
-    libffi_type: Type, // The constructed Type::structure
+    fields: Vec<(String, usize, Type)>,
+    libffi_type: Type,
 }
-// We need Send/Sync to store Type in a global Mutex, forcing unsafe impl if necessary
-// (libffi Types are generally thread-safe as they are read-only descriptors)
 #[cfg(not(any(target_arch = "wasm32")))]
 unsafe impl Send for FfiStructDef {}
 #[cfg(not(any(target_arch = "wasm32")))]
 unsafe impl Sync for FfiStructDef {}
 
 pub const BUNDLE_SIGNATURE: &[u8; 16] = b"DRAGON_BUNDLE_v1";
-
-
 
 mod ast;
 mod value;

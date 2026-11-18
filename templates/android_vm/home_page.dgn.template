@@ -1,0 +1,18 @@
+import "dragon/ui" as *
+
+class HomePage extends Component {
+    func state() { return {count: 0} }
+
+    func build(ctx, s) {
+        add = func() { ctx.set({count: s.count + 1}) }
+        return Screen(
+            topBar: TopBar(title: Text("__DRAGON_APP_NAME__")),
+            body: Col([
+                Text("You have tapped the button this many times:"),
+                Text(str(s.count), size: 48, bold: True),
+                Button("Add one", icon: Icons.add, onTap: add)
+            ], gap: 16, main: "center").centered(),
+            actionButton: ActionButton(onTap: add, child: Icon(Icons.add))
+        )
+    }
+}

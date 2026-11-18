@@ -1,0 +1,24 @@
+{
+  "name": "dragon_web",
+  "version": "1.0.0",
+  "description": "Browser tabs: WebView widget and Web service",
+  "main": "lib/dragon_web.dgn",
+  "android": {
+    "plugin": "org.dragonlang.runtime.DragonWebPlugin",
+    "permissions": [
+      "android.permission.INTERNET"
+    ],
+    "gradle": [
+      "implementation(\"androidx.webkit:webkit:1.12.1\")"
+    ]
+  },
+  "ios": {
+    "plugin": "DragonWebPlugin"
+  },
+  "windows": {
+    "plugin": "DragonWebPlugin",
+    "nuget": [
+      "Microsoft.Web.WebView2:1.0.2592.51"
+    ]
+  }
+}

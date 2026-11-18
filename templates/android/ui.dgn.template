@@ -1,4 +1,3 @@
-
 func widget_array(children: strlist) {
     out = "";
     first = True;
@@ -13,15 +12,52 @@ func widget_array(children: strlist) {
     return "[" + out + "]";
 }
 
+func widget_array_of_strings(items: strlist) {
+    out = "";
+    first = True;
+    for item in items {
+        piece = "\"" + json_escape(item) + "\"";
+        if (first) {
+            out = piece;
+            first = False;
+        } else {
+            out = out + "," + piece;
+        }
+    }
+    return "[" + out + "]";
+}
+
+func bool_str(value: bool) {
+    if (value) {
+        return "true";
+    }
+    return "false";
+}
+
+func Empty() {
+    return "{\"type\":\"empty\"}";
+}
+
 
 func Text(content: str) {
     return "{\"type\":\"text\",\"text\":\"" + json_escape(content) + "\"}";
 }
 
-
 func StyledText(content: str, color: str, size: int, align: str) {
     return "{\"type\":\"text\",\"text\":\"" + json_escape(content) + "\",\"color\":\"" + json_escape(color)
         + "\",\"size\":" + size + ",\"align\":\"" + json_escape(align) + "\"}";
+}
+
+func Heading(content: str) {
+    return StyledText(content, "", 26, "");
+}
+
+func Subheading(content: str) {
+    return StyledText(content, "", 18, "");
+}
+
+func Caption(content: str) {
+    return StyledText(content, "#8A8F9E", 12, "");
 }
 
 func Icon(name: str) {
@@ -30,12 +66,28 @@ func Icon(name: str) {
 func StyledIcon(name: str, color: str) {
     return "{\"type\":\"icon\",\"name\":\"" + json_escape(name) + "\",\"color\":\"" + json_escape(color) + "\"}";
 }
+func SizedIcon(name: str, color: str, size_dp: int) {
+    return "{\"type\":\"icon\",\"name\":\"" + json_escape(name) + "\",\"color\":\"" + json_escape(color)
+        + "\",\"size\":" + size_dp + "}";
+}
 
 func Image(url: str) {
     return "{\"type\":\"image\",\"url\":\"" + json_escape(url) + "\"}";
 }
 func SizedImage(url: str, height_dp: int) {
     return "{\"type\":\"image\",\"url\":\"" + json_escape(url) + "\",\"height\":" + height_dp + "}";
+}
+func RoundedImage(url: str, height_dp: int, radius_dp: int) {
+    return "{\"type\":\"image\",\"url\":\"" + json_escape(url) + "\",\"height\":" + height_dp
+        + ",\"radius\":" + radius_dp + "}";
+}
+
+func Avatar(label: str, size_dp: int, bg: str) {
+    return "{\"type\":\"avatar\",\"label\":\"" + json_escape(label) + "\",\"size\":" + size_dp
+        + ",\"bg\":\"" + json_escape(bg) + "\"}";
+}
+func AvatarImage(url: str, size_dp: int) {
+    return "{\"type\":\"avatar\",\"url\":\"" + json_escape(url) + "\",\"size\":" + size_dp + "}";
 }
 
 
@@ -48,11 +100,38 @@ func ColoredButton(label: str, event: str, bg: str, fg: str) {
         + "\",\"bg\":\"" + json_escape(bg) + "\",\"fg\":\"" + json_escape(fg) + "\"}";
 }
 
-
 func LongPressButton(label: str, event: str, long_event: str, bg: str, fg: str) {
     return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
         + "\",\"longEvent\":\"" + json_escape(long_event) + "\",\"bg\":\"" + json_escape(bg)
         + "\",\"fg\":\"" + json_escape(fg) + "\"}";
+}
+
+func TextButton(label: str, event: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
+        + "\",\"variant\":\"text\"}";
+}
+
+func OutlinedButton(label: str, event: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
+        + "\",\"variant\":\"outlined\"}";
+}
+
+func IconButton(icon_name: str, event: str) {
+    return "{\"type\":\"button\",\"label\":\"\",\"event\":\"" + json_escape(event) + "\",\"variant\":\"icon\""
+        + ",\"icon\":\"" + json_escape(icon_name) + "\"}";
+}
+
+func WideButton(label: str, event: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
+        + "\",\"fullWidth\":true}";
+}
+
+func DisabledButton(label: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"\",\"enabled\":false}";
+}
+
+func LoadingButton(label: str) {
+    return "{\"type\":\"button\",\"label\":\"" + json_escape(label) + "\",\"event\":\"\",\"enabled\":false,\"loading\":true}";
 }
 
 func TextField(value: str, placeholder: str, event: str) {
@@ -66,21 +145,75 @@ func FocusTextField(value: str, placeholder: str, change_event: str, focus_event
         + "\",\"blurEvent\":\"" + json_escape(blur_event) + "\"}";
 }
 
+func PasswordField(value: str, placeholder: str, event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"obscured\":true}";
+}
+
+func MultilineTextField(value: str, placeholder: str, event: str, lines: int) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"lines\":" + lines + "}";
+}
+
+func IconTextField(value: str, placeholder: str, event: str, prefix_icon: str, suffix_icon: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"prefixIcon\":\"" + json_escape(prefix_icon)
+        + "\",\"suffixIcon\":\"" + json_escape(suffix_icon) + "\"}";
+}
+
+func ClearableTextField(value: str, placeholder: str, event: str, prefix_icon: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"prefixIcon\":\"" + json_escape(prefix_icon)
+        + "\",\"clearable\":true}";
+}
+
+func NumberField(value: str, placeholder: str, event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"keyboardType\":\"number\"}";
+}
+
+func DecimalField(value: str, placeholder: str, event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"keyboardType\":\"decimal\"}";
+}
+
+func EmailField(value: str, placeholder: str, event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"keyboardType\":\"email\",\"prefixIcon\":\"person\"}";
+}
+
+func PhoneField(value: str, placeholder: str, event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"keyboardType\":\"phone\"}";
+}
+
+func SubmitTextField(value: str, placeholder: str, event: str, submit_event: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"submitEvent\":\"" + json_escape(submit_event) + "\"}";
+}
+
+func ValidatedTextField(value: str, placeholder: str, event: str, error_text: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"errorText\":\"" + json_escape(error_text) + "\"}";
+}
+
+func LimitedTextField(value: str, placeholder: str, event: str, max_length: int) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"" + json_escape(event) + "\",\"maxLength\":" + max_length + "}";
+}
+
+func DisabledTextField(value: str, placeholder: str) {
+    return "{\"type\":\"textfield\",\"value\":\"" + json_escape(value) + "\",\"placeholder\":\"" + json_escape(placeholder)
+        + "\",\"event\":\"\",\"enabled\":false}";
+}
+
 func Checkbox(checked: bool, label: str, event: str) {
-    checked_str = "false";
-    if (checked) {
-        checked_str = "true";
-    }
-    return "{\"type\":\"checkbox\",\"checked\":" + checked_str + ",\"label\":\"" + json_escape(label)
+    return "{\"type\":\"checkbox\",\"checked\":" + bool_str(checked) + ",\"label\":\"" + json_escape(label)
         + "\",\"event\":\"" + json_escape(event) + "\"}";
 }
 
 func Switch(checked: bool, event: str) {
-    checked_str = "false";
-    if (checked) {
-        checked_str = "true";
-    }
-    return "{\"type\":\"switch\",\"checked\":" + checked_str + ",\"event\":\"" + json_escape(event) + "\"}";
+    return "{\"type\":\"switch\",\"checked\":" + bool_str(checked) + ",\"event\":\"" + json_escape(event) + "\"}";
 }
 
 func Slider(value: float, min_val: float, max_val: float, event: str) {
@@ -92,9 +225,18 @@ func Slider(value: float, min_val: float, max_val: float, event: str) {
 func Column(children: strlist) {
     return "{\"type\":\"column\",\"children\":" + widget_array(children) + "}";
 }
+func ColoredColumn(children: strlist, bg: str) {
+    return "{\"type\":\"column\",\"children\":" + widget_array(children) + ",\"bg\":\"" + json_escape(bg) + "\"}";
+}
+func CenteredColumn(children: strlist) {
+    return "{\"type\":\"column\",\"children\":" + widget_array(children) + ",\"align\":\"center\"}";
+}
 
 func Row(children: strlist) {
     return "{\"type\":\"row\",\"children\":" + widget_array(children) + "}";
+}
+func SpacedRow(children: strlist) {
+    return "{\"type\":\"row\",\"children\":" + widget_array(children) + ",\"justify\":\"space_between\"}";
 }
 
 func Stack(children: strlist) {
@@ -109,8 +251,21 @@ func GridView(children: strlist, columns: int) {
     return "{\"type\":\"grid\",\"children\":" + widget_array(children) + ",\"columns\":" + columns + "}";
 }
 
+func RefreshableListView(children: strlist, refreshing: bool, event: str) {
+    return "{\"type\":\"refreshable_list\",\"children\":" + widget_array(children)
+        + ",\"refreshing\":" + bool_str(refreshing) + ",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+func TabView(labels: strlist, selected_index: int, event: str, pages: strlist) {
+    return "{\"type\":\"tab_view\",\"labels\":" + widget_array_of_strings(labels) + ",\"selected\":" + selected_index
+        + ",\"event\":\"" + json_escape(event) + "\",\"pages\":" + widget_array(pages) + "}";
+}
+
 func Divider() {
     return "{\"type\":\"divider\"}";
+}
+func StyledDivider(color: str, thickness_dp: int) {
+    return "{\"type\":\"divider\",\"color\":\"" + json_escape(color) + "\",\"thickness\":" + thickness_dp + "}";
 }
 
 
@@ -130,10 +285,41 @@ func Padding(child: str, all: int) {
     return "{\"type\":\"padding\",\"all\":" + all + ",\"child\":" + child + "}";
 }
 
+func EdgePadding(child: str, left: int, top: int, right: int, bottom: int) {
+    return "{\"type\":\"padding\",\"left\":" + left + ",\"top\":" + top + ",\"right\":" + right
+        + ",\"bottom\":" + bottom + ",\"child\":" + child + "}";
+}
 
-func Container(child: str, width_dp: int, height_dp: int, bg: str) {
+func SymmetricPadding(child: str, horizontal: int, vertical: int) {
+    return EdgePadding(child, horizontal, vertical, horizontal, vertical);
+}
+
+
+func Container(child: str, width_dp: int, height_dp: int, bg: str, radius_dp: int, border_color: str, border_width_dp: int, elevation_dp: int) {
     return "{\"type\":\"container\",\"width\":" + width_dp + ",\"height\":" + height_dp
-        + ",\"bg\":\"" + json_escape(bg) + "\",\"child\":" + child + "}";
+        + ",\"bg\":\"" + json_escape(bg) + "\",\"radius\":" + radius_dp
+        + ",\"borderColor\":\"" + json_escape(border_color) + "\",\"borderWidth\":" + border_width_dp
+        + ",\"elevation\":" + elevation_dp + ",\"child\":" + child + "}";
+}
+
+func Box(width_dp: int, height_dp: int, bg: str, radius_dp: int) {
+    return Container(Empty(), width_dp, height_dp, bg, radius_dp, "", 0, 0);
+}
+
+func Circle(diameter_dp: int, bg: str) {
+    return Container(Empty(), diameter_dp, diameter_dp, bg, diameter_dp, "", 0, 0);
+}
+
+func GradientBox(width_dp: int, height_dp: int, color_from: str, color_to: str, radius_dp: int) {
+    return "{\"type\":\"container\",\"width\":" + width_dp + ",\"height\":" + height_dp
+        + ",\"gradientFrom\":\"" + json_escape(color_from) + "\",\"gradientTo\":\"" + json_escape(color_to)
+        + "\",\"radius\":" + radius_dp + ",\"child\":" + Empty() + "}";
+}
+
+func GradientContainer(child: str, width_dp: int, height_dp: int, color_from: str, color_to: str, radius_dp: int) {
+    return "{\"type\":\"container\",\"width\":" + width_dp + ",\"height\":" + height_dp
+        + ",\"gradientFrom\":\"" + json_escape(color_from) + "\",\"gradientTo\":\"" + json_escape(color_to)
+        + "\",\"radius\":" + radius_dp + ",\"child\":" + child + "}";
 }
 
 func Expanded(child: str) {
@@ -155,17 +341,32 @@ func Card(children: strlist) {
 func ColoredCard(children: strlist, bg: str) {
     return "{\"type\":\"card\",\"children\":" + widget_array(children) + ",\"bg\":\"" + json_escape(bg) + "\"}";
 }
+func FlatCard(children: strlist) {
+    return "{\"type\":\"card\",\"children\":" + widget_array(children) + ",\"elevation\":0}";
+}
 
 func AppBar(title: str) {
     return "{\"type\":\"app_bar\",\"title\":\"" + json_escape(title) + "\"}";
+}
+func BackAppBar(title: str, back_event: str) {
+    return "{\"type\":\"app_bar\",\"title\":\"" + json_escape(title) + "\",\"backEvent\":\"" + json_escape(back_event) + "\"}";
 }
 
 func FloatingActionButton(label: str, event: str) {
     return "{\"type\":\"fab\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event) + "\"}";
 }
+func IconFloatingActionButton(icon_name: str, event: str) {
+    return "{\"type\":\"fab\",\"label\":\"\",\"icon\":\"" + json_escape(icon_name) + "\",\"event\":\"" + json_escape(event) + "\"}";
+}
 
 func WebView(url: str) {
     return "{\"type\":\"webview\",\"url\":\"" + json_escape(url) + "\"}";
+}
+
+func BrowserWebView(url: str, load_seq: int, nav_command: str, nav_seq: int, state_event: str) {
+    return "{\"type\":\"webview\",\"url\":\"" + json_escape(url) + "\",\"loadSeq\":" + load_seq
+        + ",\"navCommand\":\"" + json_escape(nav_command) + "\",\"navSeq\":" + nav_seq
+        + ",\"stateEvent\":\"" + json_escape(state_event) + "\"}";
 }
 
 func Scaffold(drawer_children: strlist, body: str, open_event: str) {
@@ -174,7 +375,7 @@ func Scaffold(drawer_children: strlist, body: str, open_event: str) {
 }
 
 func MenuButton() {
-    return ElevatedButton("=", "__toggle_drawer__");
+    return IconButton("menu", "__toggle_drawer__");
 }
 
 
@@ -221,6 +422,107 @@ func asset_exists(filename: str) {
 }
 
 
+theme_primary = "#E8935B";
+theme_secondary = "#4FB0A5";
+theme_background = "";
+theme_surface = "";
+theme_dark = True;
+
+func theme() {
+    dark_str = "false";
+    if (theme_dark) {
+        dark_str = "true";
+    }
+    return "{\"primary\":\"" + json_escape(theme_primary) + "\",\"secondary\":\"" + json_escape(theme_secondary)
+        + "\",\"background\":\"" + json_escape(theme_background) + "\",\"surface\":\"" + json_escape(theme_surface)
+        + "\",\"dark\":" + dark_str + "}";
+}
+
+func set_theme(primary: str, secondary: str, background: str, surface: str, dark: bool) {
+    theme_primary = primary;
+    theme_secondary = secondary;
+    theme_background = background;
+    theme_surface = surface;
+    theme_dark = dark;
+    return 0;
+}
+
+func toggle_dark_mode() {
+    if (theme_dark) {
+        theme_dark = False;
+    } else {
+        theme_dark = True;
+    }
+    return 0;
+}
+
+
+__http_url = "";
+__http_event = "";
+__http_method = "GET";
+__http_body = "";
+__http_seq = 0;
+
+func http_get(url: str, event: str) {
+    __http_url = url;
+    __http_event = event;
+    __http_method = "GET";
+    __http_body = "";
+    __http_seq = __http_seq + 1;
+    return 0;
+}
+
+func http_post(url: str, event: str, body: str) {
+    __http_url = url;
+    __http_event = event;
+    __http_method = "POST";
+    __http_body = body;
+    __http_seq = __http_seq + 1;
+    return 0;
+}
+
+func http_request_seq() {
+    return __http_seq;
+}
+func http_request_url() {
+    return __http_url;
+}
+func http_request_event() {
+    return __http_event;
+}
+func http_request_method() {
+    return __http_method;
+}
+func http_request_body() {
+    return __http_body;
+}
+
+func str_after_prefix(s: str, prefix: str) {
+    return substr(s, len(prefix), len(s) - len(prefix));
+}
+
+func http_status_of(evt: str, event_prefix: str) {
+    rest = str_after_prefix(evt, event_prefix);
+    return parse_int(substr(rest, 0, 3));
+}
+
+func http_body_of(evt: str, event_prefix: str) {
+    rest = str_after_prefix(evt, event_prefix);
+    return substr(rest, 4, len(rest) - 4);
+}
+
+func http_ok(evt: str, event_prefix: str) {
+    status = http_status_of(evt, event_prefix);
+    if (status < 200) {
+        return False;
+    }
+    if (status >= 300) {
+        return False;
+    }
+    return True;
+}
+
+
 func GestureDetector(child: str, event: str) {
     return "{\"type\":\"gesture_detector\",\"event\":\"" + json_escape(event) + "\",\"child\":" + child + "}";
 }
@@ -247,121 +549,129 @@ func AspectRatio(child: str, width_ratio: int, height_ratio: int) {
         + ",\"child\":" + child + "}";
 }
 
-// percent: 0-100. 0 = fully invisible, 100 = fully opaque (default).
 func Opacity(child: str, percent: int) {
     return "{\"type\":\"opacity\",\"percent\":" + percent + ",\"child\":" + child + "}";
 }
 
 func Visibility(child: str, visible: bool) {
-    visible_str = "false";
-    if (visible) {
-        visible_str = "true";
-    }
-    return "{\"type\":\"visibility\",\"visible\":" + visible_str + ",\"child\":" + child + "}";
+    return "{\"type\":\"visibility\",\"visible\":" + bool_str(visible) + ",\"child\":" + child + "}";
 }
 
-// A small rounded pill, typically for tags/filters/categories.
 func Chip(label: str, event: str) {
     return "{\"type\":\"chip\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event) + "\"}";
 }
+func SelectableChip(label: str, event: str, selected: bool) {
+    return "{\"type\":\"chip\",\"label\":\"" + json_escape(label) + "\",\"event\":\"" + json_escape(event)
+        + "\",\"selected\":" + bool_str(selected) + "}";
+}
 
-// A small numbered overlay pinned to the top-right corner of `child` --
-// e.g. an unread-count badge on a notification Icon(). count <= 0 hides
-// the badge entirely (shows just `child`, unbadged).
 func Badge(child: str, count: int) {
     return "{\"type\":\"badge\",\"count\":" + count + ",\"child\":" + child + "}";
 }
 
-// ── Selection ────────────────────────────────────────────────────────────
-
-// A single-select group, rendered as a column of radio options. `options`
-// are the labels shown; `selected` is which one is currently checked
-// (must match one of `options` exactly, or none will show checked); fires
-// "<event>:<label>" when a different option is tapped -- same convention
-// as TextField's change event.
 func RadioGroup(options: strlist, selected: str, event: str) {
     return "{\"type\":\"radio_group\",\"options\":" + widget_array_of_strings(options)
         + ",\"selected\":\"" + json_escape(selected) + "\",\"event\":\"" + json_escape(event) + "\"}";
 }
 
-// A tap-to-open list of options. `selected` is the currently shown value
-// (must match one of `options`, or the field just shows blank); fires
-// "<event>:<label>" when a different option is chosen.
 func DropdownButton(options: strlist, selected: str, event: str) {
     return "{\"type\":\"dropdown\",\"options\":" + widget_array_of_strings(options)
         + ",\"selected\":\"" + json_escape(selected) + "\",\"event\":\"" + json_escape(event) + "\"}";
 }
 
-// Shared plumbing for RadioGroup()/DropdownButton() -- a JSON array of
-// plain (escaped) strings, as opposed to widget_array()'s array of
-// already-built widget JSON objects.
-func widget_array_of_strings(items: strlist) {
-    out = "";
-    first = True;
-    for item in items {
-        piece = "\"" + json_escape(item) + "\"";
-        if (first) {
-            out = piece;
-            first = False;
-        } else {
-            out = out + "," + piece;
-        }
-    }
-    return "[" + out + "]";
+func IconMenuButton(icon_name: str, options: strlist, event: str) {
+    return "{\"type\":\"icon_menu\",\"icon\":\"" + json_escape(icon_name) + "\",\"options\":" + widget_array_of_strings(options)
+        + ",\"event\":\"" + json_escape(event) + "\"}";
 }
 
-// ── Feedback ─────────────────────────────────────────────────────────────
-
-// A spinning, indeterminate loading indicator.
 func CircularProgress() {
     return "{\"type\":\"circular_progress\"}";
 }
 
-// value: 0.0-1.0. A determinate horizontal progress bar (e.g. a download
-// or upload's actual percentage) -- use CircularProgress() instead for
-// "working, but no known duration/percentage" states.
 func LinearProgress(value: float) {
     return "{\"type\":\"linear_progress\",\"value\":" + value + "}";
 }
 
-// A modal popup, found anywhere in your tree (like FloatingActionButton,
-// it doesn't need to be a direct child of anything specific) and shown
-// when `visible` is True, blocking interaction with the rest of the
-// screen until dismissed. confirm_event/dismiss_event fire when their
-// respective button is tapped -- your on_event should set `visible` back
-// to False in response to whichever one fires (the dialog doesn't close
-// itself; Dragon's state is always the source of truth for what's on
-// screen, same as everything else in this schema).
 func AlertDialog(visible: bool, title: str, message: str, confirm_label: str, confirm_event: str, dismiss_label: str, dismiss_event: str) {
-    visible_str = "false";
-    if (visible) {
-        visible_str = "true";
-    }
-    return "{\"type\":\"alert_dialog\",\"visible\":" + visible_str + ",\"title\":\"" + json_escape(title)
+    return "{\"type\":\"alert_dialog\",\"visible\":" + bool_str(visible) + ",\"title\":\"" + json_escape(title)
         + "\",\"message\":\"" + json_escape(message) + "\",\"confirmLabel\":\"" + json_escape(confirm_label)
         + "\",\"confirmEvent\":\"" + json_escape(confirm_event) + "\",\"dismissLabel\":\"" + json_escape(dismiss_label)
         + "\",\"dismissEvent\":\"" + json_escape(dismiss_event) + "\"}";
 }
 
-// A transient bottom message, found anywhere in your tree. Same
-// visible-is-the-source-of-truth convention as AlertDialog -- your
-// on_event should set `visible` back to False when action_event fires (or
-// on a timer via whatever periodic-tick mechanism your app already uses,
-// if you want it to auto-dismiss).
 func Snackbar(visible: bool, message: str, action_label: str, action_event: str) {
-    visible_str = "false";
-    if (visible) {
-        visible_str = "true";
-    }
-    return "{\"type\":\"snackbar\",\"visible\":" + visible_str + ",\"message\":\"" + json_escape(message)
+    return "{\"type\":\"snackbar\",\"visible\":" + bool_str(visible) + ",\"message\":\"" + json_escape(message)
         + "\",\"actionLabel\":\"" + json_escape(action_label) + "\",\"actionEvent\":\"" + json_escape(action_event) + "\"}";
 }
 
-
-// A bottom tab bar. `labels` are the tab names; `selected_index` is which
-// one is currently active; fires "<event>:<index>" when a different tab
-// is tapped.
 func BottomNavigationBar(labels: strlist, selected_index: int, event: str) {
     return "{\"type\":\"bottom_nav\",\"labels\":" + widget_array_of_strings(labels)
         + ",\"selected\":" + selected_index + ",\"event\":\"" + json_escape(event) + "\"}";
+}
+
+
+__nav_depth = 1;
+__nav_0 = "/";
+__nav_1 = "";
+__nav_2 = "";
+__nav_3 = "";
+__nav_4 = "";
+
+func nav_push(route: str) {
+    if (__nav_depth == 1) { __nav_1 = route; __nav_depth = 2; }
+    else if (__nav_depth == 2) { __nav_2 = route; __nav_depth = 3; }
+    else if (__nav_depth == 3) { __nav_3 = route; __nav_depth = 4; }
+    else if (__nav_depth == 4) { __nav_4 = route; __nav_depth = 5; }
+    return 0;
+}
+
+func nav_pop() {
+    if (__nav_depth > 1) {
+        __nav_depth = __nav_depth - 1;
+    }
+    return 0;
+}
+
+func nav_replace(route: str) {
+    if (__nav_depth == 1) { __nav_0 = route; }
+    else if (__nav_depth == 2) { __nav_1 = route; }
+    else if (__nav_depth == 3) { __nav_2 = route; }
+    else if (__nav_depth == 4) { __nav_3 = route; }
+    else if (__nav_depth == 5) { __nav_4 = route; }
+    return 0;
+}
+
+func nav_reset(route: str) {
+    __nav_depth = 1;
+    __nav_0 = route;
+    return 0;
+}
+
+func nav_route() {
+    if (__nav_depth == 1) { return __nav_0; }
+    else if (__nav_depth == 2) { return __nav_1; }
+    else if (__nav_depth == 3) { return __nav_2; }
+    else if (__nav_depth == 4) { return __nav_3; }
+    return __nav_4;
+}
+
+func nav_can_pop() {
+    return __nav_depth > 1;
+}
+
+func nav_depth() {
+    return __nav_depth;
+}
+
+func str_starts_with(s: str, prefix: str) {
+    return index_of(s, prefix) == 0;
+}
+
+func str_after(s: str, prefix_len: int) {
+    return substr(s, prefix_len, len(s) - prefix_len);
+}
+
+func Page(content: str) {
+    key = nav_route() + ":" + nav_depth();
+    return "{\"type\":\"page\",\"key\":\"" + json_escape(key) + "\",\"content\":" + content + "}";
 }

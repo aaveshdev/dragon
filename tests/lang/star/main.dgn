@@ -1,0 +1,4 @@
+import "b" as *
+import "a" as *
+func main() { showln("star imports: " + str(bf(3)) + " " + str(af(1))) }
+main()

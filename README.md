@@ -1,98 +1,92 @@
-# Dragon Programming Language
+# Dragon
 
-**Dragon** is an innovative, practical, general-purpose programming language. It's designed to be simple, small, flexible, and fast, with an expressive, readable syntax that's easy to pick up. Dragon supports multiple programming paradigms (imperative, object-oriented, functional, and declarative) and is portable across Windows, Linux, and macOS, and can be used to build console applications.
+Dragon is a general-purpose programming language with a readable syntax. It supports imperative, object-oriented and
+functional styles, and runs on Windows, Linux and macOS.
 
-This repository contains the official Rust implementation of Dragon: a lexer, parser, bytecode compiler, and virtual machine, plus a C transpiler for native/AOT-style builds, a batteries-included standard library, and a terminal-based IDE ("TurboDragon IDE").
+This repository is the Rust implementation: lexer, parser, bytecode compiler and VM, a C transpiler for native builds, a
+standard library, a terminal IDE (TurboDragon), a UI framework for Android, iOS and Windows apps, and a bare-metal target
+that can host an operating system written in Dragon. Vaelis is one, and lives in its own project.
 
-> Official website & documentation: [dragon-lang.org](https://www.dragon-lang.org/)
+Website and docs: [dragon-lang.org](https://www.dragon-lang.org/). Build steps are in [BUILD.md](BUILD.md).
 
 ## Features
 
-- **Simple, readable syntax** — spend less time fighting the language, more time solving problems.
+- **Readable syntax** that is quick to pick up.
 - **Dynamic typing** with first-class functions, closures, and classes (`func`, `class`, `extends`, `this`, `super`, `new`).
-- **Familiar control flow** — `if` / `elif` / `else`, `while`, `for ... in`, `switch` / `case`, `try` / `catch` / `finally` / `raise`.
-- **Async/await & threading** — built-in `async` / `await` support plus a `thread` module for spawning concurrent work.
-- **Rich standard library** available via `import`, including:
-  - `math` — numeric and math utilities
-  - `json` — encode/decode JSON
-  - `file` / `path` — filesystem access
-  - `os` — environment and system info
-  - `time` — dates, timers, sleeping
-  - `net` — HTTP client/server utilities
-  - `crypto` — hashing (SHA-2, MD5), HMAC, PBKDF2, AES-GCM
-  - `zip` — archive creation/extraction
-  - `xml` — XML parsing
-  - `uuid` — UUID generation
-  - `pdf` / `font` — PDF and font/text rendering
-  - `ffi` / `struct` / `mem` — native interop with C libraries
-- **Bytecode VM** for fast interpreted execution.
-- **Native compilation (experimental)** — transpile Dragon source to C and build it with your system's C compiler (gcc/clang/MSVC).
-- **Self-contained executables** — bundle a script (and its dependencies) into a single encrypted, distributable binary.
-- **Shared library builds** — compile Dragon scripts into a `.dll` / `.so` / `.dylib` for embedding in other applications.
-- **TurboDragon IDE** — a built-in terminal UI editor/runner, launched with `--ide`.
-- **Package-based projects** — run a project directly from a `package.json` manifest with `dragon run`.
+- **Familiar control flow**: `if` / `elif` / `else`, `while`, `for ... in`, `switch` / `case`, `try` / `catch` / `finally` / `raise`.
+- **Async/await & threading**: built-in `async` / `await` support plus a `thread` module for spawning concurrent work.
+- **Standard library** available via `import`, including:
+  - `math`: numeric and math utilities
+  - `json`: encode/decode JSON
+  - `file` / `path`: filesystem access
+  - `os`: environment and system info
+  - `time`: dates, timers, sleeping
+  - `net`: HTTP client/server utilities
+  - `crypto`: hashing (SHA-2, MD5), HMAC, PBKDF2, AES-GCM
+  - `zip`: archive creation/extraction
+  - `xml`: XML parsing
+  - `uuid`: UUID generation
+  - `pdf` / `font`: PDF and font/text rendering
+  - `ffi` / `struct` / `mem`: native interop with C libraries
+- **Bytecode VM** for running scripts directly.
+- **Native compilation (experimental)**: translate Dragon source to C and build it with your system's C compiler (gcc/clang/MSVC).
+- **Self-contained executables**: bundle a script (and its dependencies) into a single encrypted, distributable binary.
+- **Shared library builds**: compile Dragon scripts into a `.dll` / `.so` / `.dylib` for embedding in other applications.
+- **TurboDragon IDE**: a built-in terminal UI editor/runner, launched with `--ide`.
+- **Bare metal**: build a freestanding image for x86-64, RISC-V 64 or AArch64 (`--baremetal`) and run it in QEMU, with no operating system underneath. See [baremetal/README.md](baremetal/README.md).
+- **Package-based projects**: run a project directly from a `package.json` manifest with `dragon run`.
 
-## Android app development (experimental)
+## Platforms
 
-Dragon can compile to a real Android `.so` via `dragon --native --lib
---target android-all`, callable directly from Kotlin via generated JNI
-bindings (`--jni-package` / `--jni-class`) — no hand-written JNI bridge
-required. On top of that, `dragon`, `ui.dgn`, and a small generic Jetpack
-Compose renderer together let you build an app's entire UI and logic in
-`.dgn` files: layouts (row, column, stack, grid, list_view), components
-(text, button, textfield, checkbox, switch, slider, icon, image, card,
-app_bar, fab, webview), navigation (`drawer_scaffold`), per-widget
-styling, file storage (documents and assets), and app state — all driven
-from Dragon.
+One project can target several platforms. `package.json` lists them:
 
-`dragon create <name> [--package <id>]` scaffolds a full project — a
-`package.json` manifest, `lib/main.dgn` + `lib/ui.dgn` (the only files you
-should need to touch day to day), and a complete Android Gradle project.
-`dragon build` and `dragon run` (from inside a generated project)
-compile your `.dgn` app to native `.so`s, build the Android project, and
-— for `run` — install and launch on a connected device or emulator.
+```json
+{ "platforms": ["android", "ios", "windows"] }
+```
 
-This is genuinely experimental and young, not a finished framework:
+`dragon create <name>` generates all three (`--platforms android,windows` to choose). `dragon run [--platform p]` and
+`dragon build [--platform p|all]` act on the platforms in that list; with no flag, `run` picks the one that matches your
+OS and `build` builds all. The older single `"platform": "android"` key still works.
 
-- **Verified rigorously, with real confidence**: the native compilation
-  pipeline itself — the C transpiler, the JNI wrapper generation, the
-  string/list memory-ownership model, and the file-storage builtins —
-  stress-tested with AddressSanitizer across several real apps (a stateful
-  to-do list, a calculator, a multi-page app with a sidebar drawer and a
-  floating action button) through many rounds of finding and fixing
-  genuine use-after-free and leak bugs. `dragon create`'s project
-  scaffolding is real, tested output too — every generated file was
-  inspected, and the generated `lib/main.dgn` was compiled and run.
-- **Not yet verified on real hardware/toolchains by us**: the Android/
-  Kotlin side of the example integration (`examples/android/*.kt`) is
-  hand-written and reviewed, not compiled here — you are the first real
-  test of any given change to it. `dragon build`/`dragon run`'s Gradle and
-  ADB steps are similarly written carefully but never executed end to end
-  (no Gradle/ADB/emulator available in the environment this was built in)
-  — treat your first real run as a genuine first test. `dragon create`
-  does not generate a Gradle wrapper (a binary jar with no way to vendor
-  it here); open the generated project in Android Studio once, or run
-  `gradle wrapper` yourself, before `dragon build`/`dragon run` will work.
-  iOS is not supported at all yet: the `--target ios-*` cross-compilation
-  flags work, but no SwiftUI renderer exists, so there's currently no way
-  to actually display a Dragon UI on iOS.
-- **Language limits that matter for real apps**: `--native --lib` has
-  scalar types plus a single collection type (`strlist`, a list of
-  strings) — no structs/records, no closures, no generics, single-
-  threaded only. State that would naturally be a struct (e.g. a to-do
-  item) has to be encoded as a delimited string and parsed by hand today.
-  Identifiers that collide with C keywords (e.g. a Dragon function named
-  `goto`) currently produce invalid C rather than a clear error — rename
-  around it for now.
-- **No network access**: implementing HTTPS/TLS safely from scratch in
-  plain C is a large, security-sensitive undertaking not worth rushing.
-  The documented pattern instead: the host app performs the request and
-  calls a Dragon function with the result, the same way `on_event()`
-  already works.
+| Platform | Renderer | Status |
+| --- | --- | --- |
+| Android | Jetpack Compose | Kotlin type-checks; not yet run on a device |
+| iOS | SwiftUI (`docs/IOS.md`) | untested |
+| Windows | WPF (`docs/WINDOWS.md`) | `counter` and `components` run on Windows; other screens untested |
 
-See `examples/android/UI_BRIDGE_README.md` for the full integration guide,
-and `CROSS_COMPILE_TESTING.md` for cross-compilation setup (NDK, and the
-Android-specific 16KB page-size linking requirement).
+## App development
+
+Apps are written with a class-based widget framework (`import "dragon/ui" as *`: `App`, `Screen`, `Col`, `Button`,
+`Component` and so on) and compiled to a native library, so no interpreter or source ships with the app. `dragon preview`
+shows the UI in a browser while you work. Apps can be split over many files with `import`, and extras such as audio or web
+views come as packages that may carry Kotlin or Swift plugins.
+
+Docs: `docs/FRAMEWORK.md` (start here), `docs/COMPONENTS.md` (what exists and what doesn't), `docs/PACKAGES.md`,
+`docs/RENDERER_PROTOCOL.md`, `docs/IOS.md`, `docs/WINDOWS.md`, `ANDROID_DEVELOPMENT.md`. Samples are in `examples/`:
+`counter`, `components`, `music_player`, `browser`, `desktop_browser`. If you have code from before the 2.0 vocabulary change,
+`dragon migrate` renames it for you.
+
+`dragon create <name> [--package <id>]` sets up a project: a `package.json`, `lib/main.dgn`, and the Android, iOS and
+Windows project files. `dragon build` and `dragon run` compile the app, build the platform project and, for `run`, install
+and launch it.
+
+Still young. What has and hasn't been checked:
+
+- **Tested:** the C transpiler, JNI wrapper generation, string and list memory handling and the file-storage builtins were
+  run under AddressSanitizer on several apps (a to-do list, a calculator, a multi-page app with drawer and FAB), and the
+  leaks and use-after-free bugs that turned up were fixed. The files `dragon create` writes were checked, and the generated
+  `lib/main.dgn` compiles and runs.
+- **Not tested yet:** Gradle and ADB steps of `dragon build` / `dragon run` have never run end to end, and the Kotlin
+  renderer has only been type-checked, not run on a device. `dragon create` doesn't generate a Gradle wrapper; open the
+  project in Android Studio once, or run `gradle wrapper`, before `dragon build` will work. The iOS renderer is a Swift
+  skeleton that has not been compiled.
+- **Limits of `--native --lib`:** scalar types and one collection type (`strlist`, a list of strings). No structs, closures,
+  generics or threads. Something like a to-do item has to be packed into a delimited string. A Dragon function named after a
+  C keyword (`goto`, say) produces invalid C instead of an error, so rename it.
+- **No networking in native libraries.** The host app makes the request and calls a Dragon function with the result, the
+  same way `on_event()` works.
+
+`CROSS_COMPILE_TESTING.md` covers cross-compiling (NDK, and the 16KB page-size linking Android requires).
 
 ## Example
 
@@ -126,7 +120,7 @@ showln("All tasks started");
 
 ## Building
 
-Dragon is built with Cargo and requires a recent stable [Rust toolchain](https://www.rust-lang.org/tools/install) (edition 2021).
+Dragon builds with Cargo and needs a recent stable [Rust toolchain](https://www.rust-lang.org/tools/install) (edition 2021).
 
 ```bash
 # Clone the repository
@@ -136,17 +130,17 @@ cd dragon
 # Build the CLI in debug mode
 cargo build
 
-# Build an optimized release binary (recommended)
+# Release build (recommended)
 cargo build --release
 ```
 
-The compiled CLI binary is produced as `dragon` (or `dragon.exe` on Windows) at:
+The binary ends up at:
 
 ```
 target/release/dragon
 ```
 
-Dragon also builds a shared library (`dragon_lib`, i.e. `dragon_lib.dll` / `libdragon_lib.so` / `libdragon_lib.dylib`) from `src/lib.rs`, since the `[lib]` target uses `crate-type = ["cdylib", "rlib"]`. This is produced automatically alongside the CLI whenever you run `cargo build`.
+`cargo build` also produces a shared library (`dragon_lib`, from `src/lib.rs`) next to the CLI.
 
 ### Optional: install the CLI globally
 
@@ -154,18 +148,17 @@ Dragon also builds a shared library (`dragon_lib`, i.e. `dragon_lib.dll` / `libd
 cargo install --path .
 ```
 
-This installs the `dragon` binary onto your `PATH`.
-
 ### Feature/target notes
 
-- **Native codegen** (`--native`) shells out to a system C compiler (`gcc`, `clang`, or `cl` on Windows), so one of these must be available on your `PATH` for that feature to work.
-- **Android** targets pull in `jni` / `ndk` dependencies automatically via the `cfg(target_os = "android")` block in `Cargo.toml`.
-- **WASM** targets pull in `wasm-bindgen` / `web-sys` / `getrandom` (`js` feature) automatically.
-- On `aarch64-unknown-linux-gnu`, OpenSSL is vendored and built from source, so a C toolchain is required there as well.
+- **Native codegen** (`--native`) shells out to a system C compiler (`gcc`, `clang`, or `cl` on Windows), so one of them has to be on your `PATH`.
+- **Android** targets add the `jni` / `ndk` dependencies through a `cfg(target_os = "android")` block in `Cargo.toml`.
+- **WASM** targets add `wasm-bindgen`, `web-sys` and `getrandom` (`js` feature).
+- **Windows apps** (`dragon build --platform windows`) need a Windows-capable C compiler to build the DLL. On Linux or macOS that means Zig (`pip install ziglang` works) or mingw-w64; on Windows, MinGW-w64 or LLVM clang. Native builds for other targets use the system `gcc` or `clang`.
+- On `aarch64-unknown-linux-gnu`, OpenSSL is vendored and built from source, so you need a C toolchain there too.
 
 ## Running
 
-Once built, invoke the binary directly (or via `cargo run --`) followed by a command:
+Run the binary directly, or through `cargo run --`:
 
 ```bash
 dragon <file.dgn> [args...]        # Run a Dragon script
@@ -181,7 +174,7 @@ dragon -v | --version              # Print version info
 dragon hello.dgn
 ```
 
-Any extra arguments after the filename are passed through to the script and are accessible as `argv` inside Dragon code.
+Extra arguments are passed to the script as `argv`.
 
 ### Interactive REPL
 
@@ -189,7 +182,7 @@ Any extra arguments after the filename are passed through to the script and are 
 dragon --repl
 ```
 
-Starts a persistent session — variables and functions defined on one line remain available on the next. Type `exit` to quit.
+Variables and functions you define stay available on later lines. Type `exit` to quit.
 
 ### Run a project via `package.json`
 
@@ -197,7 +190,7 @@ Starts a persistent session — variables and functions defined on one line rema
 dragon run
 ```
 
-Looks for a `package.json` in the current directory and runs the file referenced by its `"main"` (or `"entry"`) field, e.g.:
+Reads `package.json` in the current directory and runs the file named by `"main"` (or `"entry"`):
 
 ```json
 {
@@ -209,24 +202,53 @@ Looks for a `package.json` in the current directory and runs the file referenced
 ### Compile a script
 
 ```bash
-# Bundle a script (and any included files) into a single distributable executable
+# Bundle a script and its files into one executable
 dragon -c input.dgn -o output
 
-# Same, but hide the console window on Windows (background/GUI mode)
+# Same, without a console window on Windows
 dragon -c input.dgn -o output --window
 
 # Compile into a shared library (.dll / .so / .dylib)
 dragon -c input.dgn -o output.dll --lib
 
-# (Experimental) Transpile to C and build a native binary via gcc/clang/MSVC
+# (Experimental) Translate to C and build a native binary
 dragon -c input.dgn -o output --native
 
 # (Experimental) Native shared library
 dragon -c input.dgn -o output --native --lib
 
-# Keep the intermediate generated C source when using --native
+# Keep the generated C source
 dragon -c input.dgn -o output --native --keep-c
 ```
+
+### Bare-metal images
+
+```bash
+# Bootable image for QEMU (x86_64, riscv64 or aarch64); --qemu runs it straight away
+dragon -c kernel.dgn -o kernel.elf --native --baremetal x86_64 --qemu
+
+# Ring-3 program for an OS that loads .dxe files
+dragon -c prog.dgn -o prog.dxe --native --baremetal dxe
+```
+
+Needs `clang`, `ld.lld` and the matching `qemu-system-*`. What works and what doesn't is in [baremetal/README.md](baremetal/README.md).
+
+Bare-metal programs get extra built-in modules that don't exist in the interpreter or other builds:
+
+| Module | What it does |
+| --- | --- |
+| `hw` | `peek`/`poke` (8 to 64 bit), port I/O, `alloc`, clock and tick counters, heap stats, `halt` |
+| `con` | text console |
+| `gfx` | framebuffer drawing, back buffer, blit, rounded rectangles, blur |
+| `input` | raw keyboard and pointer events, `poll`, `cursor`, `inject` for drivers written in Dragon |
+| `disk` | the built-in ATA / virtio block device |
+| `task` | preemptive multitasking: `spawn`, `sleep`, `pause`, `wait`, `atomic` |
+| `proc` | ring-3 processes (x86-64 only) |
+| `blob` | files embedded in the image with `--embed FILE` |
+
+`--sdk DIR` overlays your own copy of the embedded kernel sources. This is enough to write an operating system in Dragon; Vaelis
+is one, in a separate project. Limits (64 tasks, single core, no files or sockets from the language itself) are in
+[baremetal/README.md](baremetal/README.md).
 
 ### TurboDragon IDE
 
@@ -234,13 +256,13 @@ dragon -c input.dgn -o output --native --keep-c
 dragon --ide
 ```
 
-Launches a lightweight, keyboard-driven terminal IDE (built with `crossterm`) for editing and running Dragon scripts without leaving the terminal.
+A keyboard-driven terminal editor and runner, built on `crossterm`.
 
 ## Project Structure
 
 ```
 src/
-├── main.rs           # CLI entry point (run, repl, compile, bundle, ide)
+├── main.rs           # CLI (run, repl, compile, bundle, ide)
 ├── lib.rs             # Library entry point (cdylib/rlib target)
 ├── tui.rs             # TurboDragon terminal IDE
 ├── engine/            # Core language implementation
@@ -267,4 +289,4 @@ src/
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).

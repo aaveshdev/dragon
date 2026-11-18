@@ -1,0 +1,482 @@
+import "dragon/ui" as *
+import "package:dragon_web" as *
+import "util" as *
+import "store" as *
+import "widgets" as *
+
+class NewTabPage extends LiveView {
+    func init(priv = False, key = null) {
+        super.init(key: key)
+        this.priv = priv
+    }
+    func createState() { return NewTabState() }
+}
+
+class NewTabState extends Live {
+    func onInit() {
+        me = this
+        this.ctl = TextController()
+        this.onS = func() { me.update(func() { }) }
+        B.version.addListener(this.onS)
+    }
+    func onExit() { B.version.removeListener(this.onS) }
+
+    func sites() {
+        out = []
+        seen = {}
+        counts = {}
+        last = {}
+        for h in B.history {
+            k = hostOf(h.url)
+            if (k == "") { continue }
+            counts[k] = counts[k] == null ? 1 : counts[k] + 1
+            if (last[k] == null) { last[k] = h }
+        }
+        hosts = counts.keys()
+        hosts.sort_by(func(k) { return 0 - counts[k] })
+        for k in hosts {
+            if (out.length < 8 and seen[k] == null) { seen[k] = True; out.push({title: last[k].title == "" ? k : last[k].title, url: last[k].url}) }
+        }
+        for b in B.bookmarks {
+            k = hostOf(b.url)
+            if (out.length < 8 and seen[k] == null) { seen[k] = True; out.push(b) }
+        }
+        for q in QUICK_SITES {
+            k = hostOf(q.url)
+            if (out.length < 8 and seen[k] == null) { seen[k] = True; out.push(q) }
+        }
+        return out
+    }
+
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        me = this
+        if (this.widget.priv) {
+            return Scroll(child: Center(child: Limit(Limits(maxWidth: 560), child: Pad(padding: Insets.all(32), child: Col(mainSize: "min", children: [
+                Box(width: 72, height: 72, alignment: Alignment.center,
+                    decoration: Look(color: cs.primaryContainer, borderRadius: Corners.circular(36)),
+                    child: Icon(Icons.vpn_lock, size: 34, color: cs.primary)),
+                Space(height: 18),
+                Text("Private browsing", style: Font(fontSize: 26, fontWeight: Weight.w700)),
+                Space(height: 12),
+                Text("Pages you view in private tabs aren't saved to history, and their cookies and site data are removed when the tab is closed.",
+                    textAlign: "center", style: Font(color: cs.onSurfaceVariant, height: 1.45)),
+                Space(height: 12),
+                Text("Your network, the sites you visit and your employer or school can still see your activity.",
+                    textAlign: "center", style: Font(fontSize: 12, color: cs.onSurfaceVariant, height: 1.45))
+            ])))))
+        }
+        tiles = []
+        for s in this.sites() {
+            u = s.url
+            tiles.push(Tap(onTap: act(func(x) { B.go(x) }, u), borderRadius: Corners.circular(14),
+                child: Box(width: 112, padding: Insets.symmetric(vertical: 10), child: Col(children: [
+                    Box(width: 56, height: 56, alignment: Alignment.center,
+                        decoration: Look(color: cs.surfaceVariant.withOpacity(0.6), borderRadius: Corners.circular(28)),
+                        child: SiteIcon(hostOf(u), size: 30)),
+                    Space(height: 8),
+                    Text(s.title, maxLines: 1, overflow: "ellipsis", textAlign: "center", style: Font(fontSize: 12))
+                ]))))
+        }
+        search = Box(height: 52, padding: Insets.symmetric(horizontal: 18),
+            decoration: Look(color: cs.surfaceVariant.withOpacity(0.55), borderRadius: Corners.circular(26)),
+            child: Row(children: [
+                Icon(Icons.search, color: cs.onSurfaceVariant),
+                Space(width: 12),
+                Grow(child: Input(controller: this.ctl, autofocus: False,
+                    decoration: FieldLook(hintText: "Search " + engine().name + " or type a URL", border: FieldBorder.none),
+                    onSubmit: func(v) { me.ctl.setText(""); B.go(resolveInput(v)) }))
+            ]))
+        return Scroll(child: Center(child: Limit(Limits(maxWidth: 760), child: Pad(padding: Insets.fromLTRB(32, 72, 32, 32), child: Col(mainSize: "min", cross: "stretch", children: [
+            Row(main: "center", children: [
+                Box(width: 44, height: 44, alignment: Alignment.center,
+                    decoration: Look(color: cs.primary, borderRadius: Corners.circular(14)),
+                    child: Icon(Icons.language, color: cs.onPrimary, size: 26)),
+                Space(width: 14),
+                Text("Ember", style: Font(fontSize: 38, fontWeight: Weight.w700, letterSpacing: -1))
+            ]),
+            Space(height: 34),
+            search,
+            Space(height: 36),
+            Flow(gap: 8, lineGap: 8, alignment: "center", children: tiles)
+        ])))))
+    }
+}
+
+class SectionHeader extends View {
+    func init(title, trailing = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.trailing = trailing
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Row(children: [
+            Grow(child: Text(this.title, style: Font(fontSize: 22, fontWeight: Weight.w600))),
+            this.trailing == null ? Space(width: 0) : this.trailing
+        ])
+    }
+}
+
+class SearchBox extends View {
+    func init(ctl, hint, onChange, key = null) {
+        super.init(key: key)
+        this.ctl = ctl
+        this.hint = hint
+        this.onChange = onChange
+    }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        return Box(height: 44, padding: Insets.symmetric(horizontal: 14),
+            decoration: Look(color: cs.surfaceVariant.withOpacity(0.55), borderRadius: Corners.circular(22)),
+            child: Row(children: [
+                Icon(Icons.search, size: 20, color: cs.onSurfaceVariant),
+                Space(width: 10),
+                Grow(child: Input(controller: this.ctl, onChange: this.onChange,
+                    decoration: FieldLook(hintText: this.hint, isDense: True, border: FieldBorder.none)))
+            ]))
+    }
+}
+
+class ListPage extends View {
+    func init(title, trailing, searchCtl, hint, onQuery, body, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.trailing = trailing
+        this.searchCtl = searchCtl
+        this.hint = hint
+        this.onQuery = onQuery
+        this.body = body
+    }
+    func build(context) {
+        return Center(child: Limit(Limits(maxWidth: 860), child: Pad(padding: Insets.fromLTRB(28, 24, 28, 0), child: Col(cross: "stretch", children: [
+            SectionHeader(this.title, trailing: this.trailing),
+            Space(height: 14),
+            SearchBox(this.searchCtl, this.hint, this.onQuery),
+            Space(height: 10),
+            Grow(child: this.body)
+        ]))))
+    }
+}
+
+class HistoryPage extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return HistoryState() }
+}
+
+class HistoryState extends Live {
+    func onInit() {
+        me = this
+        this.q = ""
+        this.ctl = TextController()
+        this.onS = func() { me.update(func() { }) }
+        B.version.addListener(this.onS)
+    }
+    func onExit() { B.version.removeListener(this.onS) }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        me = this
+        low = this.q.lower()
+        rows = []
+        lastLabel = ""
+        n = 0
+        for e in B.history {
+            if (n >= 400) { break }
+            if (low != "" and not ((e.title != null and e.title.lower().contains(low)) or e.url.lower().contains(low))) { continue }
+            lab = dayLabel(e.t)
+            if (lab != lastLabel) {
+                lastLabel = lab
+                rows.push(Pad(padding: Insets.fromLTRB(4, 16, 4, 6), child: Text(lab, style: Font(fontSize: 13, fontWeight: Weight.w700, color: cs.primary))))
+            }
+            u = e.url
+            rows.push(Item(leading: SiteIcon(hostOf(u), size: 20), title: Text(e.title == null or e.title == "" ? hostOf(u) : e.title, maxLines: 1, overflow: "ellipsis"),
+                subtitle: Text(u, maxLines: 1, overflow: "ellipsis"), dense: True,
+                trailing: Glyph(Icons.close, act(func(x) { B.removeHistory(x) }, u), size: 16),
+                onTap: act(func(x) { B.go(x) }, u)))
+            n = n + 1
+        }
+        body = null
+        if (n == 0) {
+            body = Center(child: Col(mainSize: "min", children: [
+                Icon(Icons.history, size: 44, color: cs.onSurfaceVariant),
+                Space(height: 10),
+                Text(low != "" ? "Nothing matches your search" : "Your browsing history appears here", style: Font(color: cs.onSurfaceVariant))
+            ]))
+        } else { body = Feed(children: rows) }
+        clear = Button("Clear browsing data", kind: "line", icon: Icons.delete_outline, onTap: func() { showClearDialog() })
+        return ListPage("History", clear, this.ctl, "Search history", func(v) { me.update(func() { me.q = v }) }, body)
+    }
+}
+
+class BookmarksPage extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return BookmarksState() }
+}
+
+class BookmarksState extends Live {
+    func onInit() {
+        me = this
+        this.q = ""
+        this.ctl = TextController()
+        this.onS = func() { me.update(func() { }) }
+        B.version.addListener(this.onS)
+    }
+    func onExit() { B.version.removeListener(this.onS) }
+
+    func rename(b) {
+        ctl = TextController(text: b.title)
+        u = b.url
+        showDialog(context: null, builder: func(c) {
+            return Alert(title: Text("Rename bookmark"),
+                content: Input(controller: ctl, autofocus: True, onSubmit: func(v) { B.renameBookmark(u, v.trim()); Nav.pop(c) }),
+                actions: [
+                    FlatButton("Cancel", onTap: func() { Nav.pop(c) }),
+                    SolidButton("Save", onTap: func() { B.renameBookmark(u, ctl.text.trim()); Nav.pop(c) })
+                ])
+        })
+    }
+
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        me = this
+        low = this.q.lower()
+        rows = []
+        for b in B.bookmarks {
+            if (low != "" and not (b.title.lower().contains(low) or b.url.lower().contains(low))) { continue }
+            u = b.url
+            item = b
+            rows.push(Item(leading: SiteIcon(hostOf(u), size: 20), title: Text(b.title, maxLines: 1, overflow: "ellipsis"),
+                subtitle: Text(u, maxLines: 1, overflow: "ellipsis"), dense: True,
+                trailing: Row(mainSize: "min", children: [
+                    Glyph(Icons.edit, act(func(x) { me.rename(x) }, item), size: 16),
+                    Glyph(Icons.close, act(func(x) { B.toggleBookmark(x, "") }, u), size: 16)
+                ]),
+                onTap: act(func(x) { B.go(x) }, u)))
+        }
+        body = null
+        if (rows.length == 0) {
+            body = Center(child: Col(mainSize: "min", children: [
+                Icon(Icons.star_border, size: 44, color: cs.onSurfaceVariant),
+                Space(height: 10),
+                Text(low != "" ? "Nothing matches your search" : "Bookmark a page with the star in the address bar", style: Font(color: cs.onSurfaceVariant))
+            ]))
+        } else { body = Feed(children: rows) }
+        return ListPage("Bookmarks", null, this.ctl, "Search bookmarks", func(v) { me.update(func() { me.q = v }) }, body)
+    }
+}
+
+class DownloadsPage extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return DownloadsState() }
+}
+
+class DownloadsState extends Live {
+    func onInit() {
+        me = this
+        this.q = ""
+        this.ctl = TextController()
+        this.onS = func() { me.update(func() { }) }
+        B.version.addListener(this.onS)
+    }
+    func onExit() { B.version.removeListener(this.onS) }
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        me = this
+        low = this.q.lower()
+        rows = []
+        for d in B.downloads {
+            if (low != "" and not d.name.lower().contains(low)) { continue }
+            rows.push(Item(leading: Icon(d.ok ? Icons.insert_drive_file : Icons.error_outline, color: d.ok ? cs.primary : cs.error),
+                title: Text(d.name, maxLines: 1, overflow: "ellipsis"),
+                subtitle: Text(d.ok ? (d.url == "" ? "" : hostOf(d.url)) : "Failed", maxLines: 1, overflow: "ellipsis"), dense: True))
+        }
+        body = null
+        if (rows.length == 0) {
+            body = Center(child: Col(mainSize: "min", children: [
+                Icon(Icons.file_download, size: 44, color: cs.onSurfaceVariant),
+                Space(height: 10),
+                Text("Files you download appear here", style: Font(color: cs.onSurfaceVariant))
+            ]))
+        } else { body = Feed(children: rows) }
+        clear = B.downloads.length == 0 ? null : Button("Clear all", kind: "line", onTap: func() { B.downloads = []; B.savePrefs(); B.bump() })
+        return ListPage("Downloads", clear, this.ctl, "Search downloads", func(v) { me.update(func() { me.q = v }) }, body)
+    }
+}
+
+func showClearDialog() {
+    showDialog(context: null, builder: func(c) { return ClearDialog() })
+}
+
+class ClearDialog extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return ClearDialogState() }
+}
+
+class ClearDialogState extends Live {
+    func onInit() { this.opts = {history: True, cookies: True, cache: True, downloads: False} }
+    func build(context) {
+        me = this
+        o = this.opts
+        box = func(key, label) {
+            return CheckItem(value: o[key], title: Text(label), onChange: func(v) { me.update(func() { me.opts[key] = v }) })
+        }
+        return Alert(title: Text("Clear browsing data"), content: Col(mainSize: "min", cross: "stretch", children: [
+            box("history", "Browsing history"),
+            box("cookies", "Cookies and other site data"),
+            box("cache", "Cached images and files"),
+            box("downloads", "Download list")
+        ]), actions: [
+            FlatButton("Cancel", onTap: func() { Nav.pop(context) }),
+            SolidButton("Clear data", onTap: func() {
+                if (me.opts.history) { B.clearHistory(); Prefs.set("session", []) }
+                if (me.opts.downloads) { B.downloads = []; B.savePrefs(); B.bump() }
+                if (me.opts.cookies or me.opts.cache) { Web.clearData({cookies: me.opts.cookies, cache: me.opts.cache, storage: me.opts.cookies}) }
+                Nav.pop(context)
+                Toast.show("Browsing data cleared")
+            })
+        ])
+    }
+}
+
+class SettingsPage extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return SettingsState() }
+}
+
+class SettingsState extends Live {
+    func onInit() {
+        me = this
+        this.section = "appearance"
+        this.home = TextController(text: S.v.homepage)
+        this.custom = TextController(text: S.v.customSearch)
+        this.onS = func() { me.update(func() { }) }
+        S.version.addListener(this.onS)
+    }
+    func onExit() { S.version.removeListener(this.onS) }
+
+    func choice(label, selected, onPick) {
+        return ChoiceTag(label: Text(label), selected: selected, onSelected: func(v) { onPick() })
+    }
+    func group(title, children, cs) {
+        return Pad(padding: Insets.only(bottom: 22), child: Col(cross: "stretch", children: [
+            Text(title, style: Font(fontSize: 13, fontWeight: Weight.w700, color: cs.primary)),
+            Space(height: 8),
+            Col(cross: "stretch", children: children)
+        ]))
+    }
+
+    func appearance(cs) {
+        me = this
+        themes = [["system", "Device"], ["light", "Light"], ["dark", "Dark"]]
+        chips = []
+        for t in themes {
+            id = t[0]
+            chips.push(this.choice(t[1], S.v.theme == id, act(func(x) { S.set("theme", x) }, id)))
+            chips.push(Space(width: 8))
+        }
+        return [
+            this.group("Theme", [Row(children: chips)], cs),
+            this.group("Toolbar", [
+                SwitchItem(value: S.v.showBookmarksBar, title: Text("Show bookmarks bar"), onChange: func(v) { S.set("showBookmarksBar", v) }),
+                SwitchItem(value: S.v.showHome, title: Text("Show Home button"), onChange: func(v) { S.set("showHome", v) })
+            ], cs),
+            this.group("Home page", [
+                Input(controller: this.home, decoration: FieldLook(hintText: "dragon://newtab or https://example.com", isDense: True),
+                    onChange: func(v) { S.set("homepage", v.trim() == "" ? "dragon://newtab" : v.trim()) })
+            ], cs)
+        ]
+    }
+
+    func searchSection(cs) {
+        me = this
+        rows = []
+        for e in ENGINES {
+            id = e.id
+            rows.push(RadioItem(value: id, groupValue: S.v.engine, title: Text(e.name), onChange: func(v) { S.set("engine", v) }))
+        }
+        out = [this.group("Search engine used in the address bar", rows, cs)]
+        if (S.v.engine == "custom") {
+            out.push(this.group("Custom search URL (use %s for the query)", [
+                Input(controller: this.custom, decoration: FieldLook(hintText: "https://example.com/search?q=%s", isDense: True),
+                    onChange: func(v) { S.set("customSearch", v.trim()) })
+            ], cs))
+        }
+        out.push(this.group("Suggestions", [
+            SwitchItem(value: S.v.suggestions, title: Text("Show search suggestions"),
+                subtitle: Text("Sent to your search engine as you type. Never sent from private tabs."), onChange: func(v) { S.set("suggestions", v) })
+        ], cs))
+        return out
+    }
+
+    func startup(cs) {
+        opts = [["restore", "Continue where you left off"], ["newtab", "Open the New tab page"], ["page", "Open the home page"]]
+        rows = []
+        for o in opts {
+            id = o[0]
+            rows.push(RadioItem(value: id, groupValue: S.v.startup, title: Text(o[1]), onChange: func(v) { S.set("startup", v) }))
+        }
+        return [this.group("When Ember starts", rows, cs)]
+    }
+
+    func privacy(cs) {
+        return [
+            this.group("Browsing data", [
+                Item(leading: Icon(Icons.delete_outline), title: Text("Clear browsing data"),
+                    subtitle: Text("History, cookies and cached files"), onTap: func() { showClearDialog() })
+            ], cs),
+            this.group("Private tabs", [
+                Text("Private tabs use a separate temporary profile. Cookies and site data are deleted when the tab closes, and pages aren't added to history.",
+                    style: Font(fontSize: 13, color: cs.onSurfaceVariant, height: 1.45))
+            ], cs)
+        ]
+    }
+
+    func about(cs) {
+        return [
+            this.group("Ember", [
+                Text("Version 1.0", style: Font(fontSize: 14)),
+                Space(height: 6),
+                Text("Made with Dragon. Ember is written in the Dragon language and compiled to native code. Web pages are rendered by Microsoft Edge WebView2.",
+                    style: Font(fontSize: 13, color: cs.onSurfaceVariant, height: 1.45))
+            ], cs),
+            this.group("Keyboard shortcuts", [
+                Text("Ctrl+T new tab · Ctrl+W close tab · Ctrl+Shift+T reopen tab · Ctrl+Tab next tab · Ctrl+L address bar · Ctrl+F find · Ctrl+D bookmark · Ctrl+H history · Ctrl+J downloads · Ctrl+R / F5 reload · Alt+Left / Alt+Right back / forward · Ctrl+Plus / Minus / 0 zoom · Ctrl+Shift+N private tab · F12 developer tools",
+                    style: Font(fontSize: 13, color: cs.onSurfaceVariant, height: 1.6))
+            ], cs)
+        ]
+    }
+
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        me = this
+        sections = [["appearance", "Appearance", Icons.palette], ["search", "Search", Icons.search], ["startup", "On startup", Icons.power_settings_new],
+                    ["privacy", "Privacy", Icons.lock], ["about", "About Ember", Icons.info]]
+        nav = []
+        for s in sections {
+            id = s[0]
+            sel = this.section == id
+            nav.push(Tap(onTap: act(func(x) { me.update(func() { me.section = x }) }, id), borderRadius: Corners.circular(20),
+                child: Box(height: 42, padding: Insets.symmetric(horizontal: 14), alignment: Alignment.centerLeft,
+                    decoration: Look(color: sel ? cs.primaryContainer.withOpacity(0.6) : null, borderRadius: Corners.circular(20)),
+                    child: Row(children: [
+                        Icon(s[2], size: 18, color: sel ? cs.primary : cs.onSurfaceVariant),
+                        Space(width: 12),
+                        Text(s[1], style: Font(fontSize: 14, fontWeight: sel ? Weight.w600 : Weight.w400))
+                    ]))))
+        }
+        content = []
+        if (this.section == "appearance") { content = this.appearance(cs) }
+        elif (this.section == "search") { content = this.searchSection(cs) }
+        elif (this.section == "startup") { content = this.startup(cs) }
+        elif (this.section == "privacy") { content = this.privacy(cs) }
+        else { content = this.about(cs) }
+        return Row(cross: "stretch", children: [
+            Box(width: 240, padding: Insets.fromLTRB(12, 24, 12, 12), child: Col(cross: "stretch", children: [
+                Pad(padding: Insets.fromLTRB(10, 0, 0, 14), child: Text("Settings", style: Font(fontSize: 22, fontWeight: Weight.w600))),
+                Col(cross: "stretch", gap: 4, children: nav)
+            ])),
+            Grow(child: Scroll(child: Center(child: Limit(Limits(maxWidth: 680), child: Pad(padding: Insets.fromLTRB(24, 30, 24, 40),
+                child: Col(mainSize: "min", cross: "stretch", children: content))))))
+        ])
+    }
+}

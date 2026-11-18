@@ -1,0 +1,80 @@
+func urlEncode(s) {
+    safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+    marks = {" ": "%20", "!": "%21", "\"": "%22", "#": "%23", "$": "%24", "%": "%25", "&": "%26", "'": "%27", "(": "%28", ")": "%29",
+             "*": "%2A", "+": "%2B", ",": "%2C", "/": "%2F", ":": "%3A", ";": "%3B", "<": "%3C", "=": "%3D", ">": "%3E", "?": "%3F",
+             "@": "%40", "[": "%5B", "\\": "%5C", "]": "%5D", "^": "%5E", "`": "%60", "{": "%7B", "|": "%7C", "}": "%7D"}
+    out = ""
+    i = 0
+    n = len(s)
+    while (i < n) {
+        c = s.substring(i, i + 1)
+        if (safe.contains(c)) { out = out + c }
+        elif (marks[c] != null) { out = out + marks[c] }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+func hostOf(url) {
+    if (url == null) { return "" }
+    u = url
+    k = u.index_of("://")
+    if (k >= 0) { u = u.substring(k + 3, len(u)) }
+    for sep in ["/", "?", "#"] {
+        j = u.index_of(sep)
+        if (j >= 0) { u = u.substring(0, j) }
+    }
+    at = u.index_of("@")
+    if (at >= 0) { u = u.substring(at + 1, len(u)) }
+    if (u.starts_with("www.")) { u = u.substring(4, len(u)) }
+    return u
+}
+
+func looksLikeUrl(t) {
+    if (t.contains(" ")) { return False }
+    if (t.starts_with("http://") or t.starts_with("https://") or t.starts_with("about:") or t.starts_with("file://") or t.starts_with("dragon://")) { return True }
+    if (t.starts_with("localhost")) { return True }
+    if (t.contains(".")) {
+        host = hostOf(t)
+        if (host.ends_with(".") or host.starts_with(".")) { return False }
+        return len(host) > 2
+    }
+    return False
+}
+
+func hueOf(s) {
+    h = 7
+    i = 0
+    while (i < len(s)) {
+        h = (h * 31 + i * 17 + len(s.substring(0, i + 1))) % 360
+        i = i + 1
+    }
+    return h
+}
+
+func letterOf(host) {
+    if (host == null or host == "") { return "?" }
+    return host.substring(0, 1).upper()
+}
+
+func plural(n, one, many) { return str(n) + " " + (n == 1 ? one : many) }
+func clampNum(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v) }
+func act(fn, a) { return func() { fn(a) } }
+func act1(fn, a) { return func(v) { fn(a, v) } }
+
+func dayLabel(t) {
+    day = floor_int(t / 86400000)
+    today = floor_int(now_ms() / 86400000)
+    d = today - day
+    if (d <= 0) { return "Today" }
+    if (d == 1) { return "Yesterday" }
+    if (d < 7) { return str(d) + " days ago" }
+    return "Earlier"
+}
+
+func sizeLabel(bytes) {
+    if (bytes == null or bytes <= 0) { return "" }
+    if (bytes >= 1048576) { return str(floor_int(bytes / 104857.6) / 10.0) + " MB" }
+    return str(floor_int(bytes / 1024)) + " KB"
+}

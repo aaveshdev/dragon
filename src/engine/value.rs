@@ -22,7 +22,7 @@ pub enum DgnValue {
     #[cfg(not(any(target_arch = "wasm32")))]
     NativeLib(Arc<Mutex<Library>>),
     Regex(Arc<Regex>),
-    Thread(Arc<thread::JoinHandle<()>>), 
+    Thread(Arc<thread::JoinHandle<()>>),
    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     Socket(Arc<Mutex<TcpStream>>),
     Promise(Arc<AsyncMutex<PromiseState>>),
@@ -37,7 +37,6 @@ impl std::fmt::Debug for DgnValue {
         }
     }
 }
-
 
 impl DgnValue {
     pub fn as_number(&self) -> Option<f64> {
@@ -67,8 +66,6 @@ pub struct DgnFunc {
     pub is_native: bool,
     pub is_async: bool,
     pub native_fn: Option<Arc<dyn Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send + Sync>>,
-    /// Compiled bytecode for this function. When Some, the VM executes this
-    /// instead of tree-walking `body`.
     pub compiled_chunk: Option<Arc<Chunk>>,
 }
 
@@ -114,7 +111,7 @@ pub fn val_to_string(v: &DgnValue) -> String {
         DgnValue::Map(m) => {
             let m = m.lock().unwrap();
             let mut parts: Vec<String> = m.iter().map(|(k,v)| format!("{}: {}", k, val_to_string(v))).collect();
-            parts.sort(); 
+            parts.sort();
             format!("{{ {} }}", parts.join(", "))
         },
         DgnValue::Func(_) => "<function>".to_string(),
@@ -131,8 +128,6 @@ pub fn val_to_string(v: &DgnValue) -> String {
         DgnValue::NativeMethod(_) => "<native>".to_string(),
     }
 }
-
-
 
 pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
     match obj {
@@ -152,11 +147,10 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     Ok(native_fn(move |args| {
                         let callback = args.get(0).cloned().ok_or(DgnError::new("Expected callback for .then", 0))?;
                         let state = state_arc_clone.clone();
-                        
-                        // Return a NEW Promise representing the chain
+
                         let handle = tokio::spawn(async move {
                             let mut s = state.lock().await;
-                            
+
                             let extracted_handle = match &mut *s {
                                 PromiseState::Resolved(r) => return r.clone(),
                                 PromiseState::Pending(h_arc) => {
@@ -164,7 +158,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                                     h_lock.take()
                                 }
                             };
-                            
+
                             let res = if let Some(h) = extracted_handle {
                                 let r = h.await.map_err(|_| DgnError::new("Promise panicked", 0))?;
                                 *s = PromiseState::Resolved(r.clone());
@@ -172,13 +166,13 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                             } else {
                                 Err(DgnError::new("Promise already consumed", 0))
                             };
-                            
+
                             match res {
                                 Ok(val) => call_dgn_func(callback, vec![val]).await,
                                 Err(e) => Err(e),
                             }
                         });
-                        
+
                         Ok(DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(Arc::new(AsyncMutex::new(Some(handle))))))))
                     }))
                 },
@@ -187,10 +181,10 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     Ok(native_fn(move |args| {
                         let callback = args.get(0).cloned().ok_or(DgnError::new("Expected callback for .catch", 0))?;
                         let state = state_arc_clone.clone();
-                        
+
                         let handle = tokio::spawn(async move {
                             let mut s = state.lock().await;
-                            
+
                             let extracted_handle = match &mut *s {
                                 PromiseState::Resolved(r) => return r.clone(),
                                 PromiseState::Pending(h_arc) => {
@@ -198,7 +192,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                                     h_lock.take()
                                 }
                             };
-                            
+
                             let res = if let Some(h) = extracted_handle {
                                 let r = h.await.map_err(|_| DgnError::new("Promise panicked", 0))?;
                                 *s = PromiseState::Resolved(r.clone());
@@ -206,13 +200,13 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                             } else {
                                 Err(DgnError::new("Promise already consumed", 0))
                             };
-                            
+
                             match res {
-                                Ok(val) => Ok(val), 
+                                Ok(val) => Ok(val),
                                 Err(e) => call_dgn_func(callback, vec![DgnValue::String(e.msg)]).await,
                             }
                         });
-                        
+
                         Ok(DgnValue::Promise(Arc::new(AsyncMutex::new(PromiseState::Pending(Arc::new(AsyncMutex::new(Some(handle))))))))
                     }))
                 },
@@ -262,7 +256,6 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                 "length" => return Ok(DgnValue::Number(m.lock().unwrap().len() as f64)),
                 _ => {}
             }
-            // Not a built-in — look up as a stored data key
             Ok(m.lock().unwrap().get(name).cloned().unwrap_or(DgnValue::Null))
         },
         DgnValue::Instance(inst) => {
@@ -270,17 +263,15 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
             if let Some(v) = inst.lock().unwrap().get(name) {
                 return Ok(v.clone());
             }
-            
 
             let mut cls_ref = inst.lock().unwrap().get("__class__").cloned();
             while let Some(DgnValue::Class(cls_env)) = cls_ref {
                  if let Some(mem) = cls_env.lock().unwrap().get(name) {
-                     
-   
-                    if let DgnValue::Func(f) = mem { 
+
+                    if let DgnValue::Func(f) = mem {
                          let inst_capture = inst.clone();
                          let f_clone = f.clone();
-                     
+
                          return Ok(DgnValue::Func(Arc::new(DgnFunc {
                              name: f.name.clone(), params: f.params.clone(), req_params: f.req_params, body: None,
                              closure: f.closure.clone(),
@@ -295,7 +286,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                              }))
                          })));
                      }
-                     
+
                      return Ok(mem);
                  }
                  cls_ref = cls_env.lock().unwrap().get("__parent_class__");
@@ -304,11 +295,11 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
         },
         DgnValue::List(l) => {
             match name {
-                "push" => Ok(native_method(l, |l, args| { 
+                "push" => Ok(native_method(l, |l, args| {
                     l.lock().unwrap().push(args.get(0).unwrap_or(&DgnValue::Null).clone()); Ok(DgnValue::List(l))
                 })),
-                "pop" => Ok(native_method(l, |l, _| { 
-                    Ok(l.lock().unwrap().pop().unwrap_or(DgnValue::Null)) 
+                "pop" => Ok(native_method(l, |l, _| {
+                    Ok(l.lock().unwrap().pop().unwrap_or(DgnValue::Null))
                 })),
                "insert" => Ok(native_method(l, |l, args| {
                     let idx = if let Some(n) = args.get(0).and_then(|a| a.as_number()) { n as usize } else { 0 };
@@ -332,10 +323,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
                     let old_vec = l.lock().unwrap().clone();
                     let mut new_vec = Vec::new();
-                    
-                    // Grab the current runtime to block on the async function safely
-                    let rt = tokio::runtime::Handle::current(); 
-                    
+
+                    let rt = tokio::runtime::Handle::current();
+
                     for item in old_vec {
                         let val = tokio::task::block_in_place(||rt.block_on(call_dgn_func(func.clone(), vec![item])))?;
                         new_vec.push(val);
@@ -346,11 +336,10 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                         let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
                         let old_vec = l.lock().unwrap().clone();
                         let mut new_vec = Vec::new();
-                        
-                        let rt = tokio::runtime::Handle::current(); // Grab runtime
-                        
+
+                        let rt = tokio::runtime::Handle::current();
+
                         for item in old_vec {
-                            // Block on the async call
                             let res = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item.clone()])))?;
                             if is_truthy(&res) {
                                 new_vec.push(item);
@@ -363,6 +352,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     vec.sort_by(|a, b| {
                         match (a, b) {
                             (DgnValue::Number(n1), DgnValue::Number(n2)) => n1.partial_cmp(n2).unwrap_or(std::cmp::Ordering::Equal),
+                            (DgnValue::Int(n1), DgnValue::Int(n2)) => n1.cmp(n2),
+                            (DgnValue::Int(n1), DgnValue::Number(n2)) => (*n1 as f64).partial_cmp(n2).unwrap_or(std::cmp::Ordering::Equal),
+                            (DgnValue::Number(n1), DgnValue::Int(n2)) => n1.partial_cmp(&(*n2 as f64)).unwrap_or(std::cmp::Ordering::Equal),
                             (DgnValue::String(s1), DgnValue::String(s2)) => s1.cmp(s2),
                             _ => std::cmp::Ordering::Equal
                         }
@@ -387,12 +379,10 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                         return Ok(args.get(1).cloned().unwrap_or(DgnValue::Null));
                     }
                     let mut iter = vec.into_iter();
-                    // Use provided initial value, or default to the first element
                     let mut acc = if args.len() > 1 { args[1].clone() } else { iter.next().unwrap() };
-                    
+
                     let rt = tokio::runtime::Handle::current();
                     for item in iter {
-                        // Instead of block_in_place which signals Tokio to spawn a new thread:
                         acc = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![acc.clone(), item])))?;
                     }
                     Ok(acc)
@@ -450,7 +440,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                         let vec1 = l.lock().unwrap();
                         let vec2 = other_l.lock().unwrap();
                         let mut res = Vec::new();
-                        let len = vec1.len().min(vec2.len()); // Zip up to the shortest list
+                        let len = vec1.len().min(vec2.len());
                         for i in 0..len {
                             let pair = vec![vec1[i].clone(), vec2[i].clone()];
                             res.push(DgnValue::List(Arc::new(Mutex::new(pair))));
@@ -469,7 +459,6 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                         if let DgnValue::Number(n) = item { total += n; is_float = true; }
                         else if let DgnValue::Int(n) = item { total += *n as f64; }
                     }
-                    // Return as integer if no floats were encountered
                     if is_float { Ok(DgnValue::Number(total)) } else { Ok(DgnValue::Int(total as i64)) }
                 })),
 
@@ -486,11 +475,10 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let len = vec.len() as i64;
                     let start = args.get(0).and_then(|a| a.as_int()).unwrap_or(0);
                     let end = args.get(1).and_then(|a| a.as_int()).unwrap_or(len);
-                    
-                    // Support negative indices (e.g., -1 for the last item)
+
                     let start_idx = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
                     let end_idx = if end < 0 { (len + end).max(0) as usize } else { end.min(len) as usize };
-                    
+
                     let mut res = Vec::new();
                     if start_idx <= end_idx {
                         res.extend_from_slice(&vec[start_idx..end_idx]);
@@ -503,7 +491,6 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let mut res = Vec::new();
                     let mut seen = std::collections::HashSet::new();
                     for item in vec.iter() {
-                        // Use stringification for deep-equality matching of nested objects/lists
                         let key = val_to_string(item);
                         if seen.insert(key) {
                             res.push(item.clone());
@@ -516,14 +503,13 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     let func = args.get(0).cloned().ok_or(DgnError::new("Function required", 0))?;
                     let mut vec = l.lock().unwrap().clone();
                     let rt = tokio::runtime::Handle::current();
-                    
-                    // Pre-compute the keys to avoid repeatedly calling the Dragon function during sort
+
                     let mut pairs = Vec::new();
                     for item in vec {
-                        let key = rt.block_on(call_dgn_func(func.clone(), vec![item.clone()]))?;
+                        let key = tokio::task::block_in_place(|| rt.block_on(call_dgn_func(func.clone(), vec![item.clone()])))?;
                         pairs.push((key, item));
                     }
-                    
+
                     pairs.sort_by(|(key_a, _), (key_b, _)| {
                         match (key_a, key_b) {
                             (DgnValue::Number(n1), DgnValue::Number(n2)) => n1.partial_cmp(n2).unwrap_or(std::cmp::Ordering::Equal),
@@ -534,7 +520,7 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                             _ => std::cmp::Ordering::Equal
                         }
                     });
-                    
+
                     let sorted_vec: Vec<DgnValue> = pairs.into_iter().map(|(_, v)| v).collect();
                     *l.lock().unwrap() = sorted_vec;
                     Ok(DgnValue::Null)
@@ -568,7 +554,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                  }))},
                  "starts_with" => { let s=s.clone(); Ok(native_fn(move |args| {
                     let sub = if let Some(DgnValue::String(sb)) = args.get(0) { sb } else { "" };
-                    Ok(DgnValue::Bool(s.starts_with(sub)))
+                    let off = args.get(1).and_then(|a| a.as_number()).map(|n| n as usize).unwrap_or(0);
+                    if off > s.len() || !s.is_char_boundary(off) { return Ok(DgnValue::Bool(false)); }
+                    Ok(DgnValue::Bool(s[off..].starts_with(sub)))
                 }))},
                 "ends_with" => { let s=s.clone(); Ok(native_fn(move |args| {
                     let sub = if let Some(DgnValue::String(sb)) = args.get(0) { sb } else { "" };
@@ -576,7 +564,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                 }))},
                  "index_of" => { let s=s.clone(); Ok(native_fn(move |args| {
                      let sub = if let Some(DgnValue::String(sb)) = args.get(0) { sb } else { "" };
-                     Ok(DgnValue::Number(s.find(sub).map(|i| i as f64).unwrap_or(-1.0)))
+                     let off = args.get(1).and_then(|a| a.as_number()).map(|n| n as usize).unwrap_or(0);
+                     if off > s.len() || !s.is_char_boundary(off) { return Ok(DgnValue::Number(-1.0)); }
+                     Ok(DgnValue::Number(s[off..].find(sub).map(|i| (i + off) as f64).unwrap_or(-1.0)))
                  }))},
                  "substring" => { let s=s.clone(); Ok(native_fn(move |args| {
                      let start = if let Some(n) = args.get(0).and_then(|a| a.as_number()) { n as usize } else { 0 };
@@ -613,10 +603,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
 
             Ok(native_fn(move |args| {
                 let l = lib_ref.lock().unwrap();
-                
-                // 1. Prepare Arguments
+
                 let mut raw_args: Vec<usize> = Vec::new();
-                let mut keep_alive_strs = Vec::new(); // Keeps C-Strings valid in memory
+                let mut keep_alive_strs = Vec::new();
 
                 for arg in args {
                     match arg {
@@ -637,12 +626,9 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                     }
                 }
 
-                // 2. Pad to 8 arguments (The Magic Fix)
-                // This ensures we can call functions with 0 to 8 arguments safely
                 while raw_args.len() < 8 { raw_args.push(0); }
 
                 unsafe {
-                    // Define a generic function pointer that takes 8 usize args
                     type GenericFn = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 
                     let symbol: Symbol<GenericFn> = match l.get(func_name.as_bytes()) {
@@ -650,15 +636,11 @@ pub fn get_attr(obj: DgnValue, name: &str) -> Result<DgnValue, DgnError> {
                         Err(e) => return Err(DgnError::new(&format!("FFI Error: Symbol '{}' not found", func_name.to_str().unwrap()), 0))
                     };
 
-                    // 3. Call the C function
                     let res = symbol(
                         raw_args[0], raw_args[1], raw_args[2], raw_args[3],
                         raw_args[4], raw_args[5], raw_args[6], raw_args[7]
                     );
 
-                    // 4. Return Result
-                    // Heuristic: If it looks like a boolean (0 or 1), return Bool, otherwise Number.
-                    // You can adjust this logic if needed.
                     if res == 0 || res == 1 {
                         Ok(DgnValue::Bool(res != 0))
                     } else {
@@ -721,17 +703,6 @@ pub fn native_fn(f: impl Fn(Vec<DgnValue>) -> Result<DgnValue, DgnError> + Send 
     }))
 }
 
-// pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnValue, DgnError> {
-//     if let DgnValue::Func(f) = func {
-//         if f.is_native {
-//              return (f.native_fn.unwrap())(args);
-//         }
-//         call_dgn_func_impl(f, args, None).await
-//     } else {
-//         Err(DgnError::new("Not a function", 0))
-//     }
-// }
-
 pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnValue, DgnError> {
     if let DgnValue::Func(f) = func {
         if f.is_native {
@@ -745,7 +716,50 @@ pub async fn call_dgn_func(func: DgnValue, args: Vec<DgnValue>) -> Result<DgnVal
 
 #[async_recursion]
 pub async fn call_dgn_func_impl(f: Arc<DgnFunc>, args: Vec<DgnValue>, this_ctx: Option<DgnValue>) -> Result<DgnValue, DgnError> {
-    
+    let mut args = args;
+
+    let named_map = match args.last() {
+        Some(DgnValue::Map(m)) if m.lock().unwrap().contains_key("__named__") => Some(m.clone()),
+        _ => None,
+    };
+    if let Some(m) = named_map {
+        args.pop();
+        let positional = args.len();
+        let fn_name = f.name.as_deref().unwrap_or("<anonymous>").to_string();
+        let mut entries: Vec<(String, DgnValue)> = m.lock().unwrap().iter()
+            .filter(|(k, _)| k.as_str() != "__named__")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut provided: HashSet<usize> = HashSet::new();
+        for (k, v) in entries {
+            let idx = f.params.iter().position(|(n, _)| *n == k);
+            match idx {
+                Some(i) => {
+                    if i < positional {
+                        return Err(DgnError::new(&format!(
+                            "Function '{}' got multiple values for argument '{}'", fn_name, k), 0));
+                    }
+                    while args.len() <= i { args.push(DgnValue::Null); }
+                    args[i] = v;
+                    provided.insert(i);
+                }
+                None => {
+                    let known: Vec<String> = f.params.iter()
+                        .map(|(n, _)| n.trim_start_matches("...").to_string()).collect();
+                    return Err(DgnError::new(&format!(
+                        "Function '{}' has no parameter named '{}' (parameters: {})",
+                        fn_name, k, known.join(", ")), 0));
+                }
+            }
+        }
+        for i in positional..f.req_params {
+            if !provided.contains(&i) {
+                return Err(DgnError::new(&format!(
+                    "Function '{}' is missing required argument '{}'", fn_name, f.params[i].0), 0));
+            }
+        }
+    }
 
     let has_rest = f.params.last().map(|(n, _)| n.starts_with("...")).unwrap_or(false);
     if !has_rest && args.len() < f.req_params {
@@ -753,12 +767,10 @@ pub async fn call_dgn_func_impl(f: Arc<DgnFunc>, args: Vec<DgnValue>, this_ctx: 
         return Err(DgnError::new(&format!("Function '{}' expects at least {} argument(s), but got {}", fn_name, f.req_params, args.len()), 0));
     }
 
-    // Build the call scope directly — no Arc/Mutex needed until we hand it to run()
     let current_path = f.closure.lock().unwrap().current_path.clone();
     let param_count = f.params.len() + if this_ctx.is_some() { 1 } else { 0 } + 1;
     let mut scope_store = HashMap::with_capacity(param_count);
 
-    // Bind parameters directly into the store
     for (i, (param_name, param_type)) in f.params.iter().enumerate() {
         if let Some(rest_name) = param_name.strip_prefix("...") {
             let rest: Vec<DgnValue> = args.get(i..).unwrap_or(&[]).to_vec();
@@ -804,7 +816,6 @@ pub async fn call_dgn_func_impl(f: Arc<DgnFunc>, args: Vec<DgnValue>, this_ctx: 
         scope_store.insert("this".to_string(), th);
     }
 
-    // Wrap once — single Arc+Mutex construction, no double-lock
     let scope = Arc::new(Mutex::new(Env {
         store: scope_store,
         constants: HashSet::new(),
@@ -820,4 +831,3 @@ pub async fn call_dgn_func_impl(f: Arc<DgnFunc>, args: Vec<DgnValue>, this_ctx: 
     }
     Ok(DgnValue::Null)
 }
-

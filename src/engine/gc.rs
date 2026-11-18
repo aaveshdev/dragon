@@ -18,9 +18,8 @@ impl GcState {
 }
 
 pub fn gc_register(val: &DgnValue) {
-    // try_with safely checks if we are running inside an agent's Tokio task
     let _ = GC_STATE.try_with(|state_cell| {
-        let mut state = state_cell.borrow_mut(); // No Mutex lock! Fast!
+        let mut state = state_cell.borrow_mut();
         match val {
             DgnValue::List(l) => {
                 state.objects.push(WeakContainer::List(Arc::downgrade(l)));
@@ -40,22 +39,22 @@ pub fn gc_check_auto(env: Arc<Mutex<Env>>) {
         let state = state_cell.borrow();
         state.allocations >= state.threshold
     }).unwrap_or(false);
-    
+
     if should_collect {
         gc_collect(env);
     }
 }
 
 pub fn gc_collect(root_env: Arc<Mutex<Env>>) -> usize {
-    let mut visited_objs = HashSet::new(); 
-    let mut visited_envs = HashSet::new(); 
-    
+    let mut visited_objs = HashSet::new();
+    let mut visited_envs = HashSet::new();
+
     mark_env(root_env, &mut visited_objs, &mut visited_envs);
-    
+
     GC_STATE.try_with(|state_cell| {
         let mut state = state_cell.borrow_mut();
         let mut reclaimed = 0;
-        
+
         state.objects.retain(|weak| {
             match weak {
                 WeakContainer::List(w) => {
@@ -64,9 +63,9 @@ pub fn gc_collect(root_env: Arc<Mutex<Env>>) -> usize {
                         if !visited_objs.contains(&ptr) {
                             arc.lock().unwrap().clear();
                             reclaimed += 1;
-                            return false; 
+                            return false;
                         }
-                        true 
+                        true
                     } else { false }
                 },
                 WeakContainer::Map(w) => {
@@ -75,14 +74,14 @@ pub fn gc_collect(root_env: Arc<Mutex<Env>>) -> usize {
                         if !visited_objs.contains(&ptr) {
                             arc.lock().unwrap().clear();
                             reclaimed += 1;
-                            return false; 
+                            return false;
                         }
                         true
                     } else { false }
                 }
             }
         });
-        
+
         state.allocations = 0;
         reclaimed
     }).unwrap_or(0)
@@ -90,10 +89,10 @@ pub fn gc_collect(root_env: Arc<Mutex<Env>>) -> usize {
 
 fn mark_env(env: Arc<Mutex<Env>>, visited_objs: &mut HashSet<usize>, visited_envs: &mut HashSet<usize>) {
     let mut curr = Some(env);
-    
+
     while let Some(e_arc) = curr {
         let ptr = Arc::as_ptr(&e_arc) as usize;
-        
+
         if !visited_envs.insert(ptr) {
             break;
         }
@@ -102,7 +101,7 @@ fn mark_env(env: Arc<Mutex<Env>>, visited_objs: &mut HashSet<usize>, visited_env
         for val in e.store.values() {
             mark_val(val, visited_objs, visited_envs);
         }
-        
+
         curr = e.parent.clone();
     }
 }
@@ -132,4 +131,3 @@ fn mark_val(val: &DgnValue, visited_objs: &mut HashSet<usize>, visited_envs: &mu
         _ => {}
     }
 }
-

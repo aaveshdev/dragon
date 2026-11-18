@@ -1,0 +1,447 @@
+import "dragon/core" as *
+import "dragon/runtime" as *
+import "dragon/widgets" as *
+import "dragon/material" as *
+import "dragon/services" as *
+
+func x_call(obj, v) { return func() { obj.pick(v) } }
+func x_call2(fn, v) { return func() { fn(v) } }
+
+func x_opt(o) {
+    t = typeof(o)
+    if (t == "string" or t == "int" or t == "number") { return {value: o, label: str(o), icon: null} }
+    return {value: o.value, label: o.label ?? str(o.value), icon: o.icon}
+}
+
+class Segments extends View {
+    func init(options, selected = null, onChange = null, multi = False, key = null) {
+        super.init(key: key)
+        this.options = options
+        this.selected = selected
+        this.onChange = onChange
+        this.multi = multi
+    }
+    func isOn(v) {
+        if (this.multi) { return this.selected != null and this.selected.contains(v) }
+        return this.selected == v
+    }
+    func pick(v) {
+        if (this.onChange == null) { return }
+        if (not this.multi) {
+            this.onChange(v)
+            return
+        }
+        cur = this.selected == null ? [] : this.selected
+        out = []
+        found = False
+        for c in cur {
+            if (c == v) { found = True } else { out.push(c) }
+        }
+        if (not found) { out.push(v) }
+        this.onChange(out)
+    }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        cells = []
+        i = 0
+        for raw in this.options {
+            o = x_opt(raw)
+            on = this.isOn(o.value)
+            fg = on ? cs.onSecondaryContainer : cs.onSurface
+            kids = []
+            if (on) { kids.push(Icon(Icons.check, size: 16, color: fg)) }
+            else if (o.icon != null) { kids.push(Icon(o.icon, size: 16, color: fg)) }
+            kids.push(Text(o.label, size: 14, color: fg, softWrap: False))
+            if (i > 0) { cells.push(Box(width: 1, color: cs.outline)) }
+            cells.push(Tap(onTap: x_call(this, o.value), child: Box(
+                height: 40, padding: Insets.symmetric(horizontal: 16), color: on ? cs.secondaryContainer : null,
+                alignment: Alignment.center, child: Row(kids, mainSize: "min", gap: 6))))
+            i = i + 1
+        }
+        return Box(height: 40, clipBehavior: "antiAlias",
+            decoration: Look(border: Border.all(color: cs.outline, width: 1), borderRadius: Corners.circular(20)),
+            child: Row(cells, mainSize: "min", cross: "stretch"))
+    }
+}
+
+class NavRail extends View {
+    func init(items, selected = 0, onChange = null, header = null, width = 80, key = null) {
+        super.init(key: key)
+        this.items = items
+        this.selected = selected
+        this.onChange = onChange
+        this.header = header
+        this.width = width
+    }
+    func pick(i) { if (this.onChange != null) { this.onChange(i) } }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        kids = []
+        if (this.header != null) { kids.push(this.header); kids.push(Space(height: 8)) }
+        i = 0
+        for it in this.items {
+            on = i == this.selected
+            kids.push(Tap(onTap: x_call(this, i), child: Box(width: this.width, padding: Insets.symmetric(vertical: 8),
+                child: Col([
+                    Box(width: 56, height: 32, alignment: Alignment.center,
+                        decoration: Look(color: on ? cs.secondaryContainer : null, borderRadius: Corners.circular(16)),
+                        child: Icon(it.icon, size: 24, color: on ? cs.onSecondaryContainer : cs.onSurfaceVariant)),
+                    Text(it.label, size: 12, weight: on ? 700 : 500, color: on ? cs.onSurface : cs.onSurfaceVariant)
+                ], mainSize: "min", gap: 4))))
+            i = i + 1
+        }
+        return Box(width: this.width, color: cs.surface, child: Col(kids, main: "start", cross: "center", mainSize: "max"))
+    }
+}
+
+class Steps extends View {
+    func init(steps, current = 0, onTap = null, key = null) {
+        super.init(key: key)
+        this.steps = steps
+        this.current = current
+        this.onTap = onTap
+    }
+    func pick(i) { if (this.onTap != null) { this.onTap(i) } }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        rows = []
+        i = 0
+        for st in this.steps {
+            done = i < this.current
+            active = i == this.current
+            dot = Box(width: 24, height: 24, alignment: Alignment.center,
+                decoration: Look(color: (done or active) ? cs.primary : cs.outline, shape: "circle"),
+                child: done ? Icon(Icons.check, size: 14, color: cs.onPrimary) : Text(str(i + 1), size: 12, color: cs.onPrimary))
+            body = [Text(st.title, size: 16, weight: active ? 700 : 500, color: (done or active) ? cs.onSurface : cs.onSurfaceVariant)]
+            if (st.subtitle != null) { body.push(Text(st.subtitle, size: 12, color: cs.onSurfaceVariant)) }
+            if (active and st.content != null) { body.push(Space(height: 8)); body.push(st.content) }
+            rows.push(Tap(onTap: x_call(this, i), child: Pad(Insets.symmetric(vertical: 8),
+                child: Row([dot, Grow(Col(body, cross: "start", mainSize: "min", gap: 2))], cross: "start", gap: 12))))
+            i = i + 1
+        }
+        return Col(rows, cross: "stretch", mainSize: "min")
+    }
+}
+
+class TableView extends View {
+    func init(columns, rows, striped = True, onRowTap = null, dense = False, key = null) {
+        super.init(key: key)
+        this.columns = columns
+        this.rows = rows
+        this.striped = striped
+        this.onRowTap = onRowTap
+        this.dense = dense
+    }
+    func pick(i) { if (this.onRowTap != null) { this.onRowTap(i) } }
+    func col(c) {
+        if (typeof(c) == "string") { return {label: c, flex: 2, align: "left"} }
+        return {label: c.label, flex: c.flex ?? 2, align: c.align ?? "left"}
+    }
+    func line(cells, header, bg, cs) {
+        out = []
+        n = len(this.columns)
+        k = 0
+        while (k < n) {
+            c = this.col(this.columns[k])
+            v = k < len(cells) ? cells[k] : ""
+            out.push(Grow(Text(str(v), size: 14, weight: header ? 700 : 400, textAlign: c.align, color: cs.onSurface), flex: c.flex))
+            k = k + 1
+        }
+        return Box(color: bg, padding: Insets.symmetric(horizontal: 12, vertical: this.dense ? 6 : 12),
+            child: Row(out, gap: 8))
+    }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        labels = []
+        for c in this.columns { labels.push(this.col(c).label) }
+        kids = [this.line(labels, True, cs.surfaceVariant, cs)]
+        i = 0
+        for r in this.rows {
+            bg = (this.striped and i % 2 == 1) ? cs.surfaceVariant.withOpacity(0.4) : null
+            row = this.line(r, False, bg, cs)
+            kids.push(this.onRowTap == null ? row : Tap(onTap: x_call(this, i), child: row))
+            i = i + 1
+        }
+        return Col(kids, cross: "stretch", mainSize: "min")
+    }
+}
+
+class Suggest extends LiveView {
+    func init(options, onPick = null, hint = "Search", maxShown = 6, key = null) {
+        super.init(key: key)
+        this.options = options
+        this.onPick = onPick
+        this.hint = hint
+        this.maxShown = maxShown
+    }
+    func createState() { return SuggestState() }
+}
+class SuggestState extends Live {
+    func onInit() {
+        this.text = ""
+        this.ctl = TextController()
+    }
+    func pick(v) {
+        me = this
+        this.ctl.text = v
+        this.update(func() { me.text = "" })
+        if (this.widget.onPick != null) { this.widget.onPick(v) }
+    }
+    func build(ctx) {
+        me = this
+        cs = Theme.of(ctx).colorScheme
+        w = this.widget
+        kids = [Input(controller: this.ctl, hint: w.hint, icon: Icons.search,
+            onChange: func(v) { me.update(func() { me.text = v }) })]
+        q = this.text.lower()
+        if (len(q) > 0) {
+            rows = []
+            for o in w.options {
+                s = str(o)
+                if (len(rows) < w.maxShown and s.lower().index_of(q) >= 0) {
+                    rows.push(Item(title: Text(s), dense: True, onTap: x_call(me, s)))
+                }
+            }
+            if (len(rows) > 0) {
+                kids.push(Box(margin: Insets.only(top: 4), clipBehavior: "antiAlias",
+                    decoration: Look(color: cs.surface, border: Border.all(color: cs.outlineVariant, width: 1),
+                                     borderRadius: Corners.circular(8)),
+                    child: Col(rows, mainSize: "min", cross: "stretch")))
+            }
+        }
+        return Col(kids, mainSize: "min", cross: "stretch")
+    }
+}
+
+class SearchField extends View {
+    func init(hint = "Search", onChange = null, onSubmit = null, controller = null, key = null) {
+        super.init(key: key)
+        this.hint = hint
+        this.onChange = onChange
+        this.onSubmit = onSubmit
+        this.controller = controller
+    }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        return Box(height: 48, padding: Insets.symmetric(horizontal: 16),
+            decoration: Look(color: cs.surfaceVariant, borderRadius: Corners.circular(24)),
+            child: Row([
+                Icon(Icons.search, size: 20, color: cs.onSurfaceVariant),
+                Grow(Input(controller: this.controller, hint: this.hint, onChange: this.onChange, onSubmit: this.onSubmit,
+                    decoration: FieldLook(hintText: this.hint, border: FieldBorder.none, isDense: True)))
+            ], gap: 12))
+    }
+}
+
+class Carousel extends LiveView {
+    func init(items, height = 180, onPage = null, key = null) {
+        super.init(key: key)
+        this.items = items
+        this.height = height
+        this.onPage = onPage
+    }
+    func createState() { return CarouselState() }
+}
+class CarouselState extends Live {
+    func onInit() { this.page = 0 }
+    func build(ctx) {
+        me = this
+        cs = Theme.of(ctx).colorScheme
+        w = this.widget
+        dots = []
+        i = 0
+        while (i < len(w.items)) {
+            dots.push(Box(width: 8, height: 8, margin: Insets.symmetric(horizontal: 3),
+                decoration: Look(color: i == this.page ? cs.primary : cs.outlineVariant, shape: "circle")))
+            i = i + 1
+        }
+        pages = []
+        for it in w.items { pages.push(Space(width: INFINITY, height: w.height, child: it)) }
+        return Col([
+            Box(height: w.height, child: Pager(children: pages, onPageChanged: func(p) {
+                me.update(func() { me.page = p })
+                if (w.onPage != null) { w.onPage(p) }
+            })),
+            Space(height: 8),
+            Row(dots, main: "center", mainSize: "min")
+        ], mainSize: "min", cross: "stretch")
+    }
+}
+
+class ReorderList extends View {
+    func init(items, itemBuilder, onReorder = null, key = null) {
+        super.init(key: key)
+        this.items = items
+        this.itemBuilder = itemBuilder
+        this.onReorder = onReorder
+    }
+    func move(pair) { if (this.onReorder != null) { this.onReorder(pair[0], pair[1]) } }
+    func build(ctx) {
+        rows = []
+        n = len(this.items)
+        i = 0
+        while (i < n) {
+            up = i > 0 ? IconButton(x_call2(this.moveFn(), [i, i - 1]), icon: Icon(Icons.arrow_upward, size: 20)) : Space(width: 48)
+            down = i < n - 1 ? IconButton(x_call2(this.moveFn(), [i, i + 1]), icon: Icon(Icons.arrow_downward, size: 20)) : Space(width: 48)
+            rows.push(Row([Grow(this.itemBuilder(this.items[i], i)), up, down], gap: 0))
+            i = i + 1
+        }
+        return Col(rows, mainSize: "min", cross: "stretch")
+    }
+    func moveFn() {
+        me = this
+        return func(pair) { me.move(pair) }
+    }
+}
+
+class Banner extends View {
+    func init(message, icon = null, actions = null, color = null, key = null) {
+        super.init(key: key)
+        this.message = message
+        this.icon = icon
+        this.actions = actions == null ? [] : actions
+        this.color = color
+    }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        kids = []
+        if (this.icon != null) { kids.push(Icon(this.icon, size: 24, color: cs.onSecondaryContainer)) }
+        kids.push(Grow(Text(this.message, size: 14, color: cs.onSecondaryContainer)))
+        for a in this.actions { kids.push(a) }
+        return Box(padding: Insets.symmetric(horizontal: 16, vertical: 8), color: this.color ?? cs.secondaryContainer,
+            child: Row(kids, gap: 12))
+    }
+}
+
+class Rating extends View {
+    func init(value, onChange = null, max = 5, size = 28, color = null, key = null) {
+        super.init(key: key)
+        this.value = value
+        this.onChange = onChange
+        this.max = max
+        this.size = size
+        this.color = color
+    }
+    func pick(v) { if (this.onChange != null) { this.onChange(v) } }
+    func build(ctx) {
+        c = this.color ?? Colors.amber
+        stars = []
+        i = 1
+        while (i <= this.max) {
+            name = Icons.star_border
+            if (this.value >= i) { name = Icons.star }
+            else if (this.value >= i - 0.5) { name = Icons.star_half }
+            star = Icon(name, size: this.size, color: c)
+            stars.push(this.onChange == null ? star : Tap(onTap: x_call(this, i), child: star))
+            i = i + 1
+        }
+        return Row(stars, mainSize: "min")
+    }
+}
+
+class EmptyState extends View {
+    func init(title, icon = null, message = null, action = null, key = null) {
+        super.init(key: key)
+        this.title = title
+        this.icon = icon
+        this.message = message
+        this.action = action
+    }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        kids = []
+        if (this.icon != null) { kids.push(Icon(this.icon, size: 56, color: cs.outline)); kids.push(Space(height: 12)) }
+        kids.push(Text(this.title, size: 18, bold: True, color: cs.onSurface, align: "center"))
+        if (this.message != null) {
+            kids.push(Space(height: 6))
+            kids.push(Text(this.message, size: 14, color: cs.onSurfaceVariant, align: "center"))
+        }
+        if (this.action != null) { kids.push(Space(height: 16)); kids.push(this.action) }
+        return Pad(32, child: Col(kids, main: "center", mainSize: "min")).centered()
+    }
+}
+
+class Calendar extends LiveView {
+    func init(selected = null, onPick = null, firstWeekday = 1, key = null) {
+        super.init(key: key)
+        this.selected = selected
+        this.onPick = onPick
+        this.firstWeekday = firstWeekday
+    }
+    func createState() { return CalendarState() }
+}
+class CalendarState extends Live {
+    func onInit() {
+        base = this.widget.selected == null ? DateTime.now() : this.widget.selected
+        this.year = base.year
+        this.month = base.month
+    }
+    func shift(n) {
+        m = this.month + n
+        y = this.year
+        if (m < 1) {
+            m = 12
+            y = y - 1
+        }
+        if (m > 12) {
+            m = 1
+            y = y + 1
+        }
+        me = this
+        this.update(func() {
+            me.year = y
+            me.month = m
+        })
+    }
+    func pick(d) {
+        if (this.widget.onPick != null) { this.widget.onPick(d) }
+        this.update()
+    }
+    func shifter(n) {
+        me = this
+        return func() { me.shift(n) }
+    }
+    func build(ctx) {
+        cs = Theme.of(ctx).colorScheme
+        w = this.widget
+        names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        first = DateTime(this.year, this.month, 1)
+        lead = (first.weekday() - w.firstWeekday + 7) % 7
+        total = first.daysInMonth()
+        head = []
+        k = 0
+        while (k < 7) {
+            head.push(Grow(Text(names[(w.firstWeekday - 1 + k) % 7], size: 12, color: cs.onSurfaceVariant, align: "center")))
+            k = k + 1
+        }
+        rows = [Row(head)]
+        day = 1 - lead
+        while (day <= total) {
+            cells = []
+            c = 0
+            while (c < 7) {
+                if (day < 1 or day > total) {
+                    cells.push(Grow(Space(height: 40)))
+                } else {
+                    d = DateTime(this.year, this.month, day)
+                    on = d.isSameDay(w.selected)
+                    cells.push(Grow(Tap(onTap: x_call(this, d), child: Box(height: 40, alignment: Alignment.center,
+                        decoration: Look(color: on ? cs.primary : null, shape: "circle"),
+                        child: Text(str(day), size: 14, color: on ? cs.onPrimary : cs.onSurface)))))
+                }
+                day = day + 1
+                c = c + 1
+            }
+            rows.push(Row(cells))
+        }
+        return Col([
+            Row([
+                IconButton(this.shifter(-1), icon: Icon(Icons.chevron_left)),
+                Grow(Text(months[this.month - 1] + " " + str(this.year), size: 16, bold: True, align: "center")),
+                IconButton(this.shifter(1), icon: Icon(Icons.chevron_right))
+            ]),
+            Col(rows, cross: "stretch", mainSize: "min", gap: 2)
+        ], mainSize: "min", cross: "stretch")
+    }
+}

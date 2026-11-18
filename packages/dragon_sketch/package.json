@@ -1,0 +1,6 @@
+{
+  "name": "dragon_sketch",
+  "version": "1.0.0",
+  "description": "Finger/pen sketch pad widget that also renders the strokes to a PNG (pure Dragon, no native code)",
+  "main": "lib/dragon_sketch.dgn"
+}

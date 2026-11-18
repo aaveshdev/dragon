@@ -1,0 +1,12 @@
+or: calls=1 r=True
+??: calls=1 r=5
+or falls through: calls=2 r=7
+[fin0] caught zero
+[fin1] ret1
+[cleanup] outer got inner
+body1 [f1] [f2] [f3] 
+[in] got b
+[f4] 1
+new not ( ) [ ] { } await and or in . =
+string new ok
+2 ()

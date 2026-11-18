@@ -1,0 +1,16 @@
+import "dragon/ui" as *
+import "dragon/extras" as *
+import "sections" as *
+
+class Gallery extends View {
+    func build(ctx) {
+        return Screen(
+            topBar: TopBar(title: Text("Components")),
+            body: Scroll(child: Col([
+                SegmentsDemo(), StepsDemo(), TableDemo(), SearchDemo(), CarouselDemo(), CalendarDemo(), MiscDemo()
+            ], cross: "stretch").pad(16))
+        )
+    }
+}
+
+func main() { runApp(App(title: "Components", home: Gallery())) }

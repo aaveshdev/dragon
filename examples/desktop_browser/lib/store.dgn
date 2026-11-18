@@ -1,0 +1,339 @@
+import "json"
+import "dragon/ui" as *
+import "package:dragon_web" as *
+import "util" as *
+
+ENGINES = [
+    {id: "google", name: "Google", url: "https://www.google.com/search?q=%s", suggest: "https://suggestqueries.google.com/complete/search?client=firefox&q=%s"},
+    {id: "bing", name: "Bing", url: "https://www.bing.com/search?q=%s", suggest: "https://api.bing.com/osjson.aspx?query=%s"},
+    {id: "duckduckgo", name: "DuckDuckGo", url: "https://duckduckgo.com/?q=%s", suggest: "https://duckduckgo.com/ac/?type=list&q=%s"},
+    {id: "brave", name: "Brave Search", url: "https://search.brave.com/search?q=%s", suggest: "https://search.brave.com/api/suggest?q=%s"},
+    {id: "ecosia", name: "Ecosia", url: "https://www.ecosia.org/search?q=%s", suggest: "https://ac.ecosia.org/autocomplete?type=list&q=%s"},
+    {id: "yahoo", name: "Yahoo", url: "https://search.yahoo.com/search?p=%s", suggest: null},
+    {id: "custom", name: "Custom", url: "", suggest: null}
+]
+
+QUICK_SITES = [
+    {title: "Wikipedia", url: "https://www.wikipedia.org"},
+    {title: "GitHub", url: "https://github.com"},
+    {title: "YouTube", url: "https://www.youtube.com"},
+    {title: "Hacker News", url: "https://news.ycombinator.com"},
+    {title: "OpenStreetMap", url: "https://www.openstreetmap.org"},
+    {title: "MDN", url: "https://developer.mozilla.org"}
+]
+
+PAGES = {
+    "dragon://newtab": {page: "newtab", title: "New tab", icon: "add"},
+    "dragon://history": {page: "history", title: "History", icon: "history"},
+    "dragon://bookmarks": {page: "bookmarks", title: "Bookmarks", icon: "star"},
+    "dragon://downloads": {page: "downloads", title: "Downloads", icon: "file_download"},
+    "dragon://settings": {page: "settings", title: "Settings", icon: "settings"}
+}
+
+DEFAULTS = {
+    engine: "google", customSearch: "", suggestions: True, theme: "system",
+    showBookmarksBar: True, showHome: True, homepage: "dragon://newtab",
+    startup: "restore", zoom: 100
+}
+
+class Settings {
+    func init() {
+        this.v = {}
+        this.version = Signal(0)
+    }
+    func load() {
+        saved = Prefs.get("settings", {})
+        this.v = {}
+        for k in DEFAULTS.keys() { this.v[k] = saved[k] == null ? DEFAULTS[k] : saved[k] }
+    }
+    func set(key, value) {
+        this.v[key] = value
+        Prefs.set("settings", this.v)
+        this.version.setValue(this.version.value + 1)
+    }
+}
+S = Settings()
+
+func engine() {
+    for e in ENGINES { if (e.id == S.v.engine) { return e } }
+    return ENGINES[0]
+}
+
+func searchUrl(q) {
+    e = engine()
+    tpl = e.url
+    if (e.id == "custom") {
+        tpl = S.v.customSearch
+        if (not tpl.contains("%s")) { tpl = ENGINES[0].url }
+    }
+    return tpl.replace("%s", urlEncode(q))
+}
+
+func resolveInput(text) {
+    t = text.trim()
+    if (t == "") { return "" }
+    if (t.starts_with("dragon://")) { return t }
+    if (looksLikeUrl(t)) {
+        if (t.contains("://") or t.starts_with("about:")) { return t }
+        return "https://" + t
+    }
+    return searchUrl(t)
+}
+
+class Browser {
+    func init() {
+        this.tabs = []
+        this.cur = 0
+        this.counter = 0
+        this.bookmarks = []
+        this.history = []
+        this.downloads = []
+        this.recorded = {}
+        this.closed = []
+        this.lastSession = ""
+        this.version = Signal(0)
+    }
+    func bump() { this.version.setValue(this.version.value + 1) }
+
+    func loadPrefs() {
+        this.bookmarks = Prefs.get("bookmarks", [])
+        this.history = Prefs.get("history", [])
+        this.downloads = Prefs.get("downloads", [])
+    }
+    func savePrefs() {
+        Prefs.set("bookmarks", this.bookmarks)
+        Prefs.set("history", this.history)
+        Prefs.set("downloads", this.downloads)
+    }
+
+    func current() { return this.tabs.length == 0 ? null : this.tabs[this.cur] }
+    func info(t) {
+        if (t == null or not t.started) { return null }
+        return Web.state.value.tabs[t.id]
+    }
+    func isInternal(t) { return t != null and t.page != "web" }
+    func shownUrl(t) {
+        if (t == null) { return "" }
+        if (t.page == "newtab") { return "" }
+        if (t.page != "web") { return "dragon://" + t.page }
+        i = this.info(t)
+        return i == null or i.url == null ? "" : i.url
+    }
+    func titleOf(t) {
+        if (t.page != "web") { return PAGES["dragon://" + t.page].title }
+        i = this.info(t)
+        if (i == null) { return "Loading" }
+        if (i.title != null and i.title != "") { return i.title }
+        h = hostOf(i.url)
+        return h == "" ? "New tab" : h
+    }
+
+    func newTab(priv = False, url = "", background = False) {
+        this.counter = this.counter + 1
+        t = {id: "t" + str(this.counter), private: priv, started: False, page: "newtab"}
+        this.tabs.push(t)
+        if (not background) { this.cur = this.tabs.length - 1 }
+        if (url != "") { this.openIn(t, url) }
+        this.bump()
+        return t
+    }
+    func adopt(id, priv) {
+        for t in this.tabs { if (t.id == id) { return } }
+        this.tabs.push({id: id, private: priv, started: True, page: "web"})
+        this.cur = this.tabs.length - 1
+        this.bump()
+    }
+    func openIn(t, url) {
+        if (url == "") { return }
+        if (PAGES[url] != null) {
+            t.page = PAGES[url].page
+            this.bump()
+            return
+        }
+        t.page = "web"
+        if (t.started) { Web.load(t.id, url) }
+        else {
+            t.started = True
+            Web.open(t.id, url, {private: t.private})
+        }
+        this.bump()
+    }
+    func go(url) {
+        t = this.current()
+        if (t == null) { t = this.newTab(False, "") }
+        this.openIn(t, url)
+    }
+    func goNewTab(url) { this.newTab(False, url) }
+    func back() {
+        t = this.current()
+        if (t == null) { return }
+        if (t.page != "web") {
+            if (t.started) { t.page = "web"; this.bump() }
+            return
+        }
+        i = this.info(t)
+        if (i != null and i.canBack) { Web.back(t.id) }
+    }
+    func forward() {
+        t = this.current()
+        i = this.info(t)
+        if (t != null and t.page == "web" and i != null and i.canForward) { Web.forward(t.id) }
+    }
+    func select(i) {
+        if (i >= 0 and i < this.tabs.length) { this.cur = i; this.bump() }
+    }
+    func step(d) {
+        n = this.tabs.length
+        if (n < 2) { return }
+        this.select((this.cur + d + n) % n)
+    }
+    func close(i) {
+        if (i < 0 or i >= this.tabs.length) { return }
+        t = this.tabs[i]
+        if (t.started) {
+            inf = this.info(t)
+            if (not t.private and inf != null and inf.url != null and inf.url != "") {
+                this.closed.push(inf.url)
+                if (this.closed.length > 20) { this.closed.remove_at(0) }
+            }
+            Web.close(t.id)
+        }
+        this.recorded.remove(t.id)
+        this.tabs.remove_at(i)
+        if (this.tabs.length == 0) { this.cur = 0; this.newTab(False, ""); return }
+        if (this.cur >= this.tabs.length) { this.cur = this.tabs.length - 1 }
+        elif (i < this.cur) { this.cur = this.cur - 1 }
+        this.bump()
+    }
+    func closeById(id) {
+        i = 0
+        while (i < this.tabs.length) {
+            if (this.tabs[i].id == id) { this.close(i); return }
+            i = i + 1
+        }
+    }
+    func closeOthers(i) {
+        keep = []
+        k = 0
+        for t in this.tabs {
+            if (k == i) { keep.push(t) }
+            elif (t.started) { Web.close(t.id) }
+            k = k + 1
+        }
+        this.tabs = keep
+        this.cur = 0
+        this.bump()
+    }
+    func reopen() {
+        if (this.closed.length == 0) { return }
+        u = this.closed[this.closed.length - 1]
+        this.closed.remove_at(this.closed.length - 1)
+        this.newTab(False, u)
+    }
+    func duplicate(i) {
+        t = this.tabs[i]
+        u = this.shownUrl(t)
+        this.newTab(t.private, u == "" ? "" : u)
+    }
+
+    func bookmarkIndex(url) {
+        i = 0
+        while (i < this.bookmarks.length) {
+            if (this.bookmarks[i].url == url) { return i }
+            i = i + 1
+        }
+        return -1
+    }
+    func isBookmarked(url) { return url != null and url != "" and this.bookmarkIndex(url) >= 0 }
+    func toggleBookmark(url, title) {
+        if (url == null or url == "") { return False }
+        i = this.bookmarkIndex(url)
+        if (i >= 0) { this.bookmarks.remove_at(i) }
+        else { this.bookmarks.push({url: url, title: (title == null or title == "") ? hostOf(url) : title}) }
+        this.savePrefs()
+        this.bump()
+        return i < 0
+    }
+    func renameBookmark(url, title) {
+        i = this.bookmarkIndex(url)
+        if (i >= 0) { this.bookmarks[i]["title"] = title; this.savePrefs(); this.bump() }
+    }
+
+    func record(url, title) {
+        if (this.history.length > 0 and this.history[0].url == url) {
+            this.history[0]["title"] = title
+        } else {
+            this.history.insert(0, {url: url, title: title, t: now_ms()})
+            if (this.history.length > 2000) { this.history.pop() }
+        }
+    }
+    func clearHistory() {
+        this.history = []
+        this.savePrefs()
+        this.bump()
+    }
+    func removeHistory(url) {
+        this.history = this.history.filter(func(h) { return h.url != url })
+        this.savePrefs()
+        this.bump()
+    }
+
+    func addDownload(e) {
+        this.downloads.insert(0, {name: e.name, url: e.url == null ? "" : e.url, t: now_ms(), ok: e.ok})
+        if (this.downloads.length > 200) { this.downloads.pop() }
+        this.savePrefs()
+        this.bump()
+    }
+
+    func onWebState() {
+        st = Web.state.value
+        changed = False
+        for t in this.tabs {
+            if (not t.started) { continue }
+            i = st.tabs[t.id]
+            if (i == null or t.private) { continue }
+            u = i.url
+            if (u == null or u == "" or u == "about:blank") { continue }
+            if (not i.loading and this.recorded[t.id] != u) {
+                this.recorded[t.id] = u
+                this.record(u, i.title == null ? "" : i.title)
+                changed = True
+            } elif (this.recorded[t.id] == u and this.history.length > 0 and this.history[0].url == u and i.title != null and i.title != "" and this.history[0].title != i.title) {
+                this.history[0]["title"] = i.title
+                changed = True
+            }
+        }
+        if (changed) { this.savePrefs() }
+        this.saveSession()
+        this.bump()
+    }
+
+    func saveSession() {
+        urls = []
+        st = Web.state.value
+        for t in this.tabs {
+            if (t.private) { continue }
+            if (t.page != "web") { urls.push("dragon://" + t.page); continue }
+            i = st.tabs[t.id]
+            if (t.started and i != null and i.url != null and i.url != "") { urls.push(i.url) }
+        }
+        sig = json.encode(urls)
+        if (sig != this.lastSession) {
+            this.lastSession = sig
+            Prefs.set("session", urls)
+        }
+    }
+    func restore() {
+        urls = Prefs.get("session", [])
+        if (S.v.startup == "restore" and urls.length > 0) {
+            for u in urls { this.newTab(False, u) }
+            this.cur = 0
+        } elif (S.v.startup == "page" and S.v.homepage != "") {
+            this.newTab(False, S.v.homepage)
+        } else {
+            this.newTab(False, "")
+        }
+        this.bump()
+    }
+}
+B = Browser()

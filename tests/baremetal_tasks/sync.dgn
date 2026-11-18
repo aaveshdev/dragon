@@ -1,0 +1,57 @@
+import task
+
+count = [0]
+m = task.mutex()
+
+func racy() {
+    i = 0
+    while (i < 200) {
+        v = count[0]
+        task.pause()
+        count[0] = v + 1
+        i = i + 1
+    }
+}
+func safe() {
+    i = 0
+    while (i < 200) {
+        task.lock(m)
+        v = count[0]
+        task.pause()
+        count[0] = v + 1
+        task.unlock(m)
+        i = i + 1
+    }
+}
+
+func run3(f) {
+    count[0] = 0
+    ids = [task.spawn(f), task.spawn(f), task.spawn(f)]
+    for id in ids { task.wait(id) }
+    return count[0]
+}
+
+func boom() { raise "inside" }
+
+func tiny(k) {
+    task.sleep(20)
+    done[0] = done[0] + 1
+}
+done = [0]
+
+func main() {
+    r = run3(racy)
+    showln("racy lost updates: " + str(r < 600))
+    showln("locked total: " + str(run3(safe)))
+
+    try { task.atomic(boom) } catch (e) { showln("atomic released after: " + str(e)) }
+    try { task.locked(m, boom) } catch (e) { showln("locked released after: " + str(e)) }
+    showln("mutex free again: " + str(task.locked(m, func() { return "yes" })))
+
+    ids = []
+    k = 0
+    while (k < 40) { ids.push(task.spawn(tiny, k, 16)); k = k + 1 }
+    for id in ids { task.wait(id) }
+    showln("40 tasks done: " + str(done[0]) + " left=" + str(task.count()))
+}
+main()

@@ -4,11 +4,11 @@ version = "1.0.0"
 edition = "2021"
 
 [profile.release]
-opt-level = "z"     # Optimize for size
-lto = true          # Link Time Optimization (removes unused code)
-codegen-units = 1   # Slower compile, but smaller binary
-panic = "abort"     # Removes heavy stack unwinding code
-strip = true        # Automatically strip debug symbols (Crucial!)
+opt-level = "z"     # optimise for size
+lto = true          # link-time optimisation
+codegen-units = 1   # slower build, smaller binary
+panic = "abort"     # no unwinding tables
+strip = true        # strip debug symbols
 
 
 # The DLL Template (built as dragon_lib.dll / libdragon_lib.so)
@@ -26,10 +26,18 @@ crate-type = ["cdylib", "rlib"]
 name = "dragon"
 path = "src/main.rs"
 
+[features]
+default = []
+# Old hand-written JNI entry points in lib.rs (kept for reference, not used by `dragon create`).
+legacy_android = ["dep:jni"]
+# Type-check the Android JNI glue (src/ui_host.rs) on the desktop.
+jni-glue = ["dep:jni"]
+
 [build-dependencies]
 chrono = "0.4"
 
 [dependencies]
+jni = { version = "0.21", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
@@ -79,6 +87,7 @@ pbkdf2 = "0.12"
 openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 ureq = { version = "2.9", default-features = false, features = ["json", "tls"] }
 tiny_http = "0.12"
 

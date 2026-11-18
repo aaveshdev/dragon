@@ -1,0 +1,365 @@
+import "json"
+import "dragon/ui" as *
+import "package:dragon_web" as *
+import "util" as *
+import "store" as *
+import "widgets" as *
+import "pages" as *
+
+class Shell extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return ShellState() }
+}
+
+class ShellState extends Live {
+    func onInit() {
+        me = this
+        this.editing = False
+        this.focusSeq = 0
+        this.wantFocus = False
+        this.shown = ""
+        this.ctl = TextController()
+        this.finding = False
+        this.findCtl = TextController()
+        this.local = []
+        this.remote = []
+        this.query = ""
+        this.seq = 0
+        this.onChange = func() { me.sync() }
+        B.version.addListener(this.onChange)
+        S.version.addListener(this.onChange)
+        Web.state.addListener(this.onChange)
+        AppEvents.addBackHandler(func() { return me.onBack() })
+        Web.onEvent = func(e) { me.onEvent(e) }
+        Web.start(120)
+        this.sync()
+    }
+    func onExit() {
+        B.version.removeListener(this.onChange)
+        S.version.removeListener(this.onChange)
+        Web.state.removeListener(this.onChange)
+    }
+
+    func sync() {
+        me = this
+        t = B.current()
+        u = B.shownUrl(t)
+        if (not this.editing and u != this.shown) {
+            this.shown = u
+            this.ctl.setText(u)
+        }
+        this.update(func() { })
+    }
+
+    func focusAddress() {
+        me = this
+        this.update(func() {
+            me.editing = True
+            me.wantFocus = True
+            me.focusSeq = me.focusSeq + 1
+        })
+    }
+    func stopEdit() {
+        me = this
+        t = B.current()
+        this.editing = False
+        this.shown = ""
+        this.update(func() { me.wantFocus = False; me.local = []; me.remote = []; me.query = "" })
+        this.sync()
+    }
+    func submit(text) {
+        url = resolveInput(text)
+        this.stopEdit()
+        if (url != "") { B.go(url) }
+    }
+    func pick(value) {
+        this.submit(value)
+    }
+    func onType(v) {
+        me = this
+        this.editing = True
+        q = v.trim()
+        low = q.lower()
+        local = []
+        if (q != "") {
+            for b in B.bookmarks {
+                if (local.length < 3 and (b.title.lower().contains(low) or b.url.lower().contains(low))) { local.push({kind: "bookmark", title: b.title, url: b.url}) }
+            }
+            for h in B.history {
+                dup = False
+                for l in local { if (l.url == h.url) { dup = True } }
+                if (not dup and local.length < 5 and (h.title.lower().contains(low) or h.url.lower().contains(low))) { local.push({kind: "history", title: h.title, url: h.url}) }
+            }
+        }
+        this.seq = this.seq + 1
+        mySeq = this.seq
+        this.update(func() { me.query = q; me.local = local; if (q == "") { me.remote = [] } })
+        t = B.current()
+        e = engine()
+        if (q == "" or not S.v.suggestions or e.suggest == null or (t != null and t.private)) { return }
+        if (looksLikeUrl(q)) { return }
+        Http.get(e.suggest.replace("%s", urlEncode(q)), func(r) {
+            if (mySeq != me.seq or not r.ok) { return }
+            list = parseSuggestions(r.body)
+            me.update(func() { me.remote = list })
+        }, null, 6000)
+    }
+
+    func onBack() {
+        if (this.finding) { this.closeFind(); return True }
+        if (this.editing) { this.stopEdit(); return True }
+        return False
+    }
+
+    func openFind() {
+        t = B.current()
+        if (t == null or t.page != "web" or not t.started) { return }
+        me = this
+        this.findCtl.setText("")
+        this.update(func() { me.finding = True })
+    }
+    func closeFind() {
+        t = B.current()
+        if (t != null and t.started) { Web.findClear(t.id) }
+        me = this
+        this.update(func() { me.finding = False })
+    }
+    func findNext(fwd) {
+        t = B.current()
+        if (t != null and t.started and this.findCtl.text != "") { Web.findNext(t.id, fwd) }
+    }
+
+    func zoomBy(d) {
+        t = B.current()
+        i = B.info(t)
+        if (t == null or i == null or t.page != "web") { return }
+        cur = i.zoom == null ? 1.0 : i.zoom
+        z = d == 0 ? 1.0 : clampNum(floor_int((cur + d) * 100 + 0.5) / 100.0, 0.25, 5.0)
+        Web.zoom(t.id, z)
+    }
+
+    func toggleBookmark() {
+        t = B.current()
+        if (t == null or t.page != "web") { return }
+        i = B.info(t)
+        if (i == null or i.url == null or i.url == "") { return }
+        added = B.toggleBookmark(i.url, i.title)
+        Toast.show(added ? "Bookmark added" : "Bookmark removed")
+    }
+
+    func onEvent(e) {
+        k = e.type
+        if (k == "newtab") { B.adopt(e.tab, e.private == True) }
+        elif (k == "closed") { B.closeById(e.tab) }
+        elif (k == "download") {
+            B.addDownload(e)
+            Toast.show(e.ok ? "Downloaded " + e.name : (e.name == null ? "Download failed" : e.name))
+        }
+        elif (k == "crashed") { Toast.show("The page crashed and was reloaded") }
+        elif (k == "shortcut") { this.shortcut(e.name) }
+    }
+
+    func shortcut(n) {
+        t = B.current()
+        if (n == "newtab") { B.newTab(False, ""); this.focusAddress() }
+        elif (n == "privatetab") { B.newTab(True, ""); this.focusAddress() }
+        elif (n == "closetab") { B.close(B.cur) }
+        elif (n == "reopentab") { B.reopen() }
+        elif (n == "nexttab") { B.step(1) }
+        elif (n == "prevtab") { B.step(0 - 1) }
+        elif (n == "focusaddress") { this.focusAddress() }
+        elif (n == "find") { this.openFind() }
+        elif (n == "findnext") { this.findNext(True) }
+        elif (n == "reload") { if (t != null and t.started and t.page == "web") { Web.reload(t.id) } }
+        elif (n == "bookmark") { this.toggleBookmark() }
+        elif (n == "history") { B.goNewTab("dragon://history") }
+        elif (n == "downloads") { B.goNewTab("dragon://downloads") }
+        elif (n == "bookmarks") { B.goNewTab("dragon://bookmarks") }
+        elif (n == "back") { B.back() }
+        elif (n == "forward") { B.forward() }
+        elif (n == "home") { B.go(S.v.homepage) }
+        elif (n == "zoomin") { this.zoomBy(0.1) }
+        elif (n == "zoomout") { this.zoomBy(0 - 0.1) }
+        elif (n == "zoomreset") { this.zoomBy(0) }
+        elif (n == "devtools") { if (t != null and t.started and t.page == "web") { Web.devtools(t.id) } }
+        elif (n == "cleardata") { showClearDialog() }
+        elif (n.starts_with("tab")) {
+            idx = int(n.substring(3, len(n))) - 1
+            if (idx == 8) { idx = B.tabs.length - 1 }
+            B.select(idx)
+        }
+    }
+
+    func menuAction(v) {
+        t = B.current()
+        if (v == "newtab") { B.newTab(False, ""); this.focusAddress() }
+        elif (v == "private") { B.newTab(True, ""); this.focusAddress() }
+        elif (v == "history") { B.goNewTab("dragon://history") }
+        elif (v == "bookmarks") { B.goNewTab("dragon://bookmarks") }
+        elif (v == "downloads") { B.goNewTab("dragon://downloads") }
+        elif (v == "zoomin") { this.zoomBy(0.1) }
+        elif (v == "zoomout") { this.zoomBy(0 - 0.1) }
+        elif (v == "zoomreset") { this.zoomBy(0) }
+        elif (v == "find") { this.openFind() }
+        elif (v == "print") { if (t != null and t.started and t.page == "web") { Web.print(t.id) } }
+        elif (v == "devtools") { if (t != null and t.started and t.page == "web") { Web.devtools(t.id) } }
+        elif (v == "settings") { B.goNewTab("dragon://settings") }
+        elif (v == "clear") { showClearDialog() }
+        elif (v == "reopen") { B.reopen() }
+    }
+
+    func toolbar(context, cs, t, i) {
+        me = this
+        web = t != null and t.page == "web"
+        canBack = (i != null and i.canBack and web) or (t != null and t.page != "web" and t.started)
+        canFwd = web and i != null and i.canForward
+        loading = web and i != null and i.loading
+        url = B.shownUrl(t)
+        marked = B.isBookmarked(url)
+        secure = web and i != null and i.secure
+        lockIcon = Icons.search
+        if (web and i != null) { lockIcon = secure ? Icons.lock : Icons.info_outline }
+        elif (t != null and t.page != "web" and t.page != "newtab") { lockIcon = Icons.language }
+        lockColor = web and i != null and not secure and url != "" ? cs.error : cs.onSurfaceVariant
+
+        omni = Box(height: 36, padding: Insets.fromLTRB(12, 0, 4, 0),
+            decoration: Look(color: this.editing ? cs.surface : cs.surfaceVariant.withOpacity(0.7), borderRadius: Corners.circular(18),
+                border: Border.all(color: this.editing ? cs.primary : Colors.transparent, width: 2)),
+            child: Row(children: [
+                Icon(lockIcon, size: 16, color: lockColor),
+                Space(width: 8),
+                Grow(child: Input(key: "omni" + str(this.focusSeq), controller: this.ctl, autofocus: this.wantFocus,
+                    textInputAction: "go",
+                    decoration: FieldLook(hintText: "Search " + engine().name + " or type a URL", isDense: True, border: FieldBorder.none),
+                    onChange: func(v) { me.onType(v) }, onSubmit: func(v) { me.submit(v) }, onTap: func() { if (not me.editing) { me.update(func() { me.editing = True }) } })),
+                Show(visible: web and url != "", child: Glyph(marked ? Icons.star : Icons.star_border, func() { me.toggleBookmark() }, size: 18))
+            ]))
+
+        menu = Menu(icon: Icon(Icons.more_vert, size: 20), itemBuilder: func(c) {
+            z = i == null or i.zoom == null ? 100 : floor_int(i.zoom * 100 + 0.5)
+            return [
+                MenuItem(value: "newtab", child: MenuRow(Icons.add, "New tab", "Ctrl+T")),
+                MenuItem(value: "private", child: MenuRow(Icons.vpn_lock, "New private tab", "Ctrl+Shift+N")),
+                MenuItem(value: "reopen", child: MenuRow(Icons.undo, "Reopen closed tab", "Ctrl+Shift+T"), enabled: B.closed.length > 0),
+                MenuRule(),
+                MenuItem(value: "history", child: MenuRow(Icons.history, "History", "Ctrl+H")),
+                MenuItem(value: "bookmarks", child: MenuRow(Icons.star_border, "Bookmarks", "Ctrl+Shift+O")),
+                MenuItem(value: "downloads", child: MenuRow(Icons.file_download, "Downloads", "Ctrl+J")),
+                MenuRule(),
+                MenuItem(value: "zoomin", child: MenuRow(Icons.zoom_in, "Zoom in", str(z) + "%"), enabled: web),
+                MenuItem(value: "zoomout", child: MenuRow(Icons.zoom_out, "Zoom out", "Ctrl+-"), enabled: web),
+                MenuItem(value: "zoomreset", child: MenuRow(Icons.restart_alt, "Reset zoom", "Ctrl+0"), enabled: web),
+                MenuRule(),
+                MenuItem(value: "find", child: MenuRow(Icons.find_in_page, "Find in page", "Ctrl+F"), enabled: web),
+                MenuItem(value: "print", child: MenuRow(Icons.print, "Print", "Ctrl+P"), enabled: web),
+                MenuItem(value: "devtools", child: MenuRow(Icons.code, "Developer tools", "F12"), enabled: web),
+                MenuRule(),
+                MenuItem(value: "clear", child: MenuRow(Icons.delete_outline, "Clear browsing data", "Ctrl+Shift+Del")),
+                MenuItem(value: "settings", child: MenuRow(Icons.settings, "Settings", ""))
+            ]
+        }, onSelected: func(v) { me.menuAction(v) })
+
+        priv = t != null and t.private
+        return Box(color: priv ? cs.primaryContainer.withOpacity(0.35) : cs.surface, height: 48, padding: Insets.symmetric(horizontal: 8),
+            child: Row(children: [
+                Glyph(Icons.arrow_back, func() { B.back() }, enabled: canBack),
+                Glyph(Icons.arrow_forward, func() { B.forward() }, enabled: canFwd),
+                Glyph(loading ? Icons.close : Icons.refresh, func() {
+                    if (loading) { Web.stop(t.id) } else { Web.reload(t.id) }
+                }, enabled: web and t.started),
+                S.v.showHome ? Glyph(Icons.home, func() { B.go(S.v.homepage) }) : Space(width: 0),
+                Space(width: 6),
+                Grow(child: omni),
+                Space(width: 6),
+                Glyph(Icons.file_download, func() { B.goNewTab("dragon://downloads") }, enabled: True),
+                menu
+            ]))
+    }
+
+    func content(context, cs, t, i) {
+        if (t == null) { return Space(height: 0) }
+        if (t.page == "newtab") { return NewTabPage(t.private, key: "nt" + t.id) }
+        if (t.page == "history") { return HistoryPage(key: "hist") }
+        if (t.page == "bookmarks") { return BookmarksPage(key: "bm") }
+        if (t.page == "downloads") { return DownloadsPage(key: "dl") }
+        if (t.page == "settings") { return SettingsPage(key: "st") }
+        if (i == null) { return Center(child: Spinner()) }
+        return WebView(tab: t.id)
+    }
+
+    func build(context) {
+        cs = Theme.of(context).colorScheme
+        me = this
+        t = B.current()
+        i = B.info(t)
+        progress = Space(height: 2)
+        if (i != null and i.loading and t.page == "web") {
+            progress = ProgressBar(value: i.progress / 100.0, minHeight: 2)
+        }
+        body = this.content(context, cs, t, i)
+        showSug = this.editing and this.query != ""
+        if (showSug) {
+            body = Place(alignment: Alignment.topLeft, child: Suggestions(this.local, this.remote, func(v) { me.pick(v) }, this.query, engine().name).pad(Insets.only(left: 64)))
+        }
+        findRow = Space(height: 0)
+        if (this.finding) {
+            fi = i == null ? 0 : i.findCount
+            findRow = Row(main: "end", children: [FindBar(this.findCtl,
+                func(v) { me.update(func() { }); if (t != null and t.started) { Web.find(t.id, v) } },
+                func() { me.findNext(True) }, func() { me.findNext(False) }, func() { me.closeFind() }, fi, 0), Space(width: 24)])
+        }
+        parts = [TabStrip(), this.toolbar(context, cs, t, i)]
+        if (S.v.showBookmarksBar) { parts.push(BookmarksBar()) }
+        parts.push(Rule(height: 1))
+        parts.push(progress)
+        parts.push(findRow)
+        parts.push(Grow(child: body))
+        return Screen(backgroundColor: cs.background, body: Col(cross: "stretch", children: parts))
+    }
+}
+
+func parseSuggestions(body) {
+    out = []
+    data = null
+    try { data = json.decode(body) } catch (e) { return out }
+    if (data == null) { return out }
+    list = null
+    if (typeof(data) == "list" and data.length > 1 and typeof(data[1]) == "list") { list = data[1] }
+    elif (typeof(data) == "list") { list = data }
+    if (list == null) { return out }
+    for s in list {
+        if (typeof(s) == "string" and s != "" and out.length < 6) { out.push(s) }
+        elif (typeof(s) == "map" and s.phrase != null and out.length < 6) { out.push(s.phrase) }
+    }
+    return out
+}
+
+class BrowserApp extends LiveView {
+    func init(key = null) { super.init(key: key) }
+    func createState() { return BrowserAppState() }
+}
+
+class BrowserAppState extends Live {
+    func onInit() {
+        S.load()
+        B.loadPrefs()
+        Web.configure({})
+        B.restore()
+        Web.state.addListener(func() { B.onWebState() })
+        Web.refresh()
+    }
+    func build(context) {
+        seed = Color(0xFF1A73E8)
+        return NotifierBuilder(listenable: S.version, builder: func(c, child) {
+            return App(title: "Ember", debugShowCheckedModeBanner: False,
+                theme: ThemeSpec(brightness: "light", primarySwatch: seed),
+                darkTheme: ThemeSpec(brightness: "dark", primarySwatch: seed),
+                themeMode: S.v.theme,
+                home: Shell())
+        })
+    }
+}
+
+func main() {
+    runApp(BrowserApp())
+}
